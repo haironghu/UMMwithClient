@@ -1,0 +1,5 @@
+# umm — 元数据服务配置
+# 启动方式: ./ummd -c config/ummd.yaml
+
+listen_addr: "0.0.0.0"
+listen_port: 20001

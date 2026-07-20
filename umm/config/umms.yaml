@@ -1,0 +1,12 @@
+# umms — 内存服务配置
+# 启动方式: ./umms -c config/umms.yaml
+
+node_id: 0
+listen_addr: "0.0.0.0"
+listen_port: 20002
+memory_size: 67108864
+base_gpa: 0
+
+# 多 SSD 设备列表（格式: path:size,path:size,...）
+# 支持大小后缀: G(GB), M(MB), K(KB)
+ssd_devices: "/tmp/umm_ssd/dev0.raw:64M,/tmp/umm_ssd/dev1.raw:64M,/tmp/umm_ssd/dev2.raw:128M"
