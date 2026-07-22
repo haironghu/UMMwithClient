@@ -46,11 +46,19 @@ static int ssd_transport_get(void *ctx, gpa_t gpa, uint64_t len, void *out_buf)
     int rc = stx->mem_vtbl->map_device(stx->mem_ctx, UMM_TIER_SSD,
                                         gpa_to_node(gpa), gpa_to_offset(gpa),
                                         len, &ptr);
-    if (rc != UMM_OK)
-        return rc;
+    if (rc == UMM_OK) {
+        /* 文件后端：mmap 指针，memcpy 通路 */
+        memcpy(out_buf, ptr, (size_t)len);
+        return UMM_OK;
+    }
 
-    memcpy(out_buf, ptr, (size_t)len);
-    return UMM_OK;
+    /* 块设备后端：无 mmap，回退到主机 I/O 通路（pread） */
+    if (stx->mem_vtbl->ssd_read) {
+        return stx->mem_vtbl->ssd_read(stx->mem_ctx, UMM_TIER_SSD,
+                                       gpa_to_node(gpa), gpa_to_offset(gpa),
+                                       len, out_buf);
+    }
+    return rc;
 }
 
 static int ssd_transport_put(void *ctx, gpa_t gpa, uint64_t len,
@@ -62,11 +70,19 @@ static int ssd_transport_put(void *ctx, gpa_t gpa, uint64_t len,
     int rc = stx->mem_vtbl->map_device(stx->mem_ctx, UMM_TIER_SSD,
                                         gpa_to_node(gpa), gpa_to_offset(gpa),
                                         len, &ptr);
-    if (rc != UMM_OK)
-        return rc;
+    if (rc == UMM_OK) {
+        /* 文件后端：mmap 指针，memcpy 通路 */
+        memcpy(ptr, buf, (size_t)len);
+        return UMM_OK;
+    }
 
-    memcpy(ptr, buf, (size_t)len);
-    return UMM_OK;
+    /* libnvm 后端：无 mmap，回退到主机 I/O 通路（ssd_pool_pwrite） */
+    if (stx->mem_vtbl->ssd_write) {
+        return stx->mem_vtbl->ssd_write(stx->mem_ctx, UMM_TIER_SSD,
+                                        gpa_to_node(gpa), gpa_to_offset(gpa),
+                                        len, buf);
+    }
+    return rc;
 }
 
 /* ------------------------------------------------------------------------ */

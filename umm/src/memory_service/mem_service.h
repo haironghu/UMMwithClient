@@ -26,6 +26,16 @@ struct MemoryServiceVtbl {
                       uint64_t offset, uint64_t size, void **out_ptr);
     int (*unmap_device)(void *ctx, tier_id_t tier, node_id_t node,
                         uint64_t offset, uint64_t size);
+
+    /* --- optional: SSD 块设备后端的主机 I/O 回退通路 ---
+     * 当 SSD tier 由真实块设备（无 mmap）纳管时，map_device 返回失败，
+     * transport 层应改用此接口（pread/pwrite 语义）。
+     * offset 语义与 map_device 相同（tier 全局偏移，含 base_offset）。
+     * 文件后端（mmap 可用）或未实现时置 NULL。 */
+    int (*ssd_read)(void *ctx, tier_id_t tier, node_id_t node,
+                    uint64_t offset, uint64_t len, void *buf);
+    int (*ssd_write)(void *ctx, tier_id_t tier, node_id_t node,
+                     uint64_t offset, uint64_t len, const void *buf);
 };
 
 #endif

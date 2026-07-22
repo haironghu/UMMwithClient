@@ -48,6 +48,26 @@ void*       ssd_backend_get_ptr(SsdBackend *sb, uint64_t offset);
 int         ssd_backend_sync(SsdBackend *sb, uint64_t offset, uint64_t size);
 int         ssd_backend_recover(SsdBackend *sb);
 
+/* ------------------------------------------------------------------------
+ * 后端类型（ssd_backend_create 按路径自动分派）：
+ *   - 常规文件（*.raw 等）：ftruncate + mmap 模拟盘（测试/开发）
+ *   - libnvm:<ctrl>@<ns>：libnvm 用户态 NVMe 驱动（生产路径）
+ *
+ * 注意：不支持内核块设备（/dev/nvmeXnY）直写——避免误写系统盘/数据盘
+ * 的风险；真实硬件必须经过 libnvm 接管后接入。
+ * ---------------------------------------------------------------------- */
+
+uint64_t ssd_backend_capacity(const SsdBackend *sb);
+
+/* 单次 I/O 上限（字节）：0 = 不限制（文件后端）；
+ * libnvm 后端为 disk_info.max_data_size（并发引擎按此做分段/队列调优） */
+uint64_t ssd_backend_max_io(const SsdBackend *sb);
+
+/** 主机侧 I/O（pread/pwrite）。文件后端与块设备后端均可用；
+ *  块设备后端无 mmap，这是其唯一的主机数据通路。 */
+int      ssd_backend_pread (SsdBackend *sb, uint64_t offset, uint64_t len, void *buf);
+int      ssd_backend_pwrite(SsdBackend *sb, uint64_t offset, uint64_t len, const void *buf);
+
 /** ssd_pool_create — Create an empty SSD pool. */
 SsdPool* ssd_pool_create(void);
 
@@ -102,11 +122,19 @@ int ssd_pool_translate(SsdPool *pool, uint64_t voffset,
  * ssd_pool_get_ptr — Get direct memory pointer for a virtual offset.
  *
  * Internally translates voffset → (device, poffset) → mmap_base + poffset.
+ * 块设备后端无 mmap，返回 NULL（调用方应改用 ssd_pool_pread/pwrite）。
  */
 void* ssd_pool_get_ptr(SsdPool *pool, uint64_t voffset);
 
 /** ssd_pool_sync — msync a virtual range to disk. */
 int ssd_pool_sync(SsdPool *pool, uint64_t voffset, uint64_t size);
+
+/**
+ * 池级主机 I/O：按虚拟偏移 pread/pwrite，自动跨设备分段。
+ * 用于块设备后端（无 mmap）的 CPU 数据通路。
+ */
+int ssd_pool_pread (SsdPool *pool, uint64_t voffset, uint64_t len, void *buf);
+int ssd_pool_pwrite(SsdPool *pool, uint64_t voffset, uint64_t len, const void *buf);
 
 #ifdef __cplusplus
 }

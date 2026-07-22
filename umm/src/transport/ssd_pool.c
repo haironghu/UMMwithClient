@@ -27,15 +27,19 @@
 #define SSD_PAGE_SIZE   4096
 #define SSD_BITS_PER_U64 64
 
+#include "ssd_backend_libnvm.h"
+
 struct SsdBackend {
     char       *device_path;    /* path to device file */
     int         fd;             /* device file descriptor */
-    void       *mmap_base;      /* mmap base address */
+    void       *mmap_base;      /* mmap base address (文件后端; libnvm 为 MAP_FAILED) */
     uint64_t    capacity;       /* total capacity (bytes) */
     uint64_t    total_pages;    /* capacity / page_size */
     uint64_t    free_pages;     /* number of free pages */
     uint64_t   *bitmap;         /* allocation bitmap */
     uint64_t    bitmap_words;   /* number of uint64_t in bitmap */
+    int         is_libnvm;      /* 1 = libnvm userspace NVMe backend */
+    SsdLibnvmBackend *libnvm;   /* libnvm handle (is_libnvm only) */
     pthread_mutex_t lock;
 };
 
@@ -91,23 +95,55 @@ static uint64_t bitmap_find_free(uint64_t *bm, uint64_t total_pages,
 
 SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
 {
-    if (!device_path || capacity == 0)
+    if (!device_path)
         return NULL;
 
-    /* Align capacity to page boundary */
-    capacity = (capacity + SSD_PAGE_SIZE - 1) & ~(uint64_t)(SSD_PAGE_SIZE - 1);
+    if (capacity == 0) {
+        umm_log_error(
+                      "ssd_backend: explicit capacity required (path=%s)",
+                      device_path);
+        return NULL;
+    }
 
     SsdBackend *sb = calloc(1, sizeof(SsdBackend));
     if (!sb)
         return NULL;
 
     sb->device_path = strdup(device_path);
-    sb->capacity    = capacity;
-    sb->total_pages = capacity / SSD_PAGE_SIZE;
-    sb->free_pages  = sb->total_pages;
     sb->fd          = -1;
     sb->mmap_base   = MAP_FAILED;
     pthread_mutex_init(&sb->lock, NULL);
+
+    /* ---- libnvm 路径："libnvm:<ctrl>@<ns>"，用户态 NVMe 库驱动 ---- */
+    if (strncmp(device_path, "libnvm:", 7) == 0) {
+        if (capacity == 0) {
+            /* libnvm disk_info 暂无总容量字段，必须显式配置 */
+            umm_log_error(
+                          "ssd_backend: libnvm backend requires explicit "
+                          "capacity (path=%s)", device_path);
+            goto fail;
+        }
+        capacity &= ~(uint64_t)(SSD_PAGE_SIZE - 1);
+        if (ssd_libnvm_open(device_path + 7, &sb->libnvm) != UMM_OK)
+            goto fail;
+        sb->is_libnvm   = 1;
+        sb->capacity    = capacity;
+        sb->total_pages = capacity / SSD_PAGE_SIZE;
+        sb->free_pages  = sb->total_pages;
+        umm_log_info(
+                     "ssd_backend: libnvm device=%s, managed=%lu MB",
+                     device_path,
+                     (unsigned long)(capacity / 1024 / 1024));
+        goto init_bitmap;
+    }
+
+    /* ---- 文件路径（原有模拟逻辑）---- */
+    /* Align capacity to page boundary */
+    capacity = (capacity + SSD_PAGE_SIZE - 1) & ~(uint64_t)(SSD_PAGE_SIZE - 1);
+
+    sb->capacity    = capacity;
+    sb->total_pages = capacity / SSD_PAGE_SIZE;
+    sb->free_pages  = sb->total_pages;
 
     /* Auto-create parent directory if needed */
     char *dir = strdup(device_path);
@@ -121,7 +157,7 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
     /* Create or open the device file */
     sb->fd = open(device_path, O_RDWR | O_CREAT, 0644);
     if (sb->fd < 0) {
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: open(%s) failed: %s",
                       device_path, strerror(errno));
         goto fail;
@@ -129,7 +165,7 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
 
     /* Size the file (sparse) */
     if (ftruncate(sb->fd, (off_t)capacity) != 0) {
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: ftruncate(%s, %lu) failed: %s",
                       device_path, (unsigned long)capacity, strerror(errno));
         goto fail;
@@ -139,33 +175,34 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
     sb->mmap_base = mmap(NULL, (size_t)capacity, PROT_READ | PROT_WRITE,
                          MAP_SHARED, sb->fd, 0);
     if (sb->mmap_base == MAP_FAILED) {
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: mmap(%s, %lu) failed: %s",
                       device_path, (unsigned long)capacity, strerror(errno));
         goto fail;
     }
 
-    /* Allocate bitmap */
-    sb->bitmap_words = (sb->total_pages + SSD_BITS_PER_U64 - 1)
-                       / SSD_BITS_PER_U64;
-    sb->bitmap = calloc(sb->bitmap_words, sizeof(uint64_t));
-    if (!sb->bitmap) {
-        umm_log_error(__FILE__, __LINE__,
-                      "ssd_backend: bitmap alloc failed");
-        goto fail;
-    }
-
-    umm_log_info(__FILE__, __LINE__,
-                 "ssd_backend: created device=%s, capacity=%lu MB, "
+    umm_log_info(
+                 "ssd_backend: created file device=%s, capacity=%lu MB, "
                  "pages=%lu, mmap=%p",
                  device_path,
                  (unsigned long)(capacity / (1024 * 1024)),
                  (unsigned long)sb->total_pages,
                  sb->mmap_base);
+
+init_bitmap:
+    /* Allocate bitmap */
+    sb->bitmap_words = (sb->total_pages + SSD_BITS_PER_U64 - 1)
+                       / SSD_BITS_PER_U64;
+    sb->bitmap = calloc(sb->bitmap_words, sizeof(uint64_t));
+    if (!sb->bitmap) {
+        umm_log_error(
+                      "ssd_backend: bitmap alloc failed");
+        goto fail;
+    }
     return sb;
 
 fail:
-    umm_log_error(__FILE__, __LINE__,
+    umm_log_error(
                   "ssd_backend_create FAILED: errno=%d (%s), device=%s, "
                   "capacity=%lu",
                   errno, strerror(errno),
@@ -197,8 +234,10 @@ void ssd_backend_destroy(SsdBackend *sb)
     }
     if (sb->fd >= 0)
         close(sb->fd);
+    if (sb->libnvm)
+        ssd_libnvm_close(sb->libnvm);
 
-    umm_log_info(__FILE__, __LINE__,
+    umm_log_info(
                  "ssd_backend: destroyed device=%s, used=%lu/%lu pages",
                  sb->device_path ? sb->device_path : "?",
                  (unsigned long)(sb->total_pages - sb->free_pages),
@@ -227,7 +266,7 @@ int ssd_backend_alloc(SsdBackend *sb, uint64_t size, uint64_t *out_offset)
 
     if (sb->free_pages < npages) {
         pthread_mutex_unlock(&sb->lock);
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: out of space (need %lu pages, "
                       "free %lu)",
                       (unsigned long)npages,
@@ -238,7 +277,7 @@ int ssd_backend_alloc(SsdBackend *sb, uint64_t size, uint64_t *out_offset)
     uint64_t page = bitmap_find_free(sb->bitmap, sb->total_pages, 0, npages);
     if (page >= sb->total_pages) {
         pthread_mutex_unlock(&sb->lock);
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: no contiguous %lu-page region",
                       (unsigned long)npages);
         return UMM_E_NO_MEMORY;
@@ -253,7 +292,7 @@ int ssd_backend_alloc(SsdBackend *sb, uint64_t size, uint64_t *out_offset)
 
     pthread_mutex_unlock(&sb->lock);
 
-    umm_log_debug(__FILE__, __LINE__,
+    umm_log_debug(
                   "ssd_backend: allocated %lu pages at offset %lu "
                   "(free=%lu/%lu)",
                   (unsigned long)npages, (unsigned long)*out_offset,
@@ -289,7 +328,7 @@ void ssd_backend_free(SsdBackend *sb, uint64_t offset, uint64_t size)
 
     pthread_mutex_unlock(&sb->lock);
 
-    umm_log_debug(__FILE__, __LINE__,
+    umm_log_debug(
                   "ssd_backend: freed %lu pages at offset %lu "
                   "(free=%lu/%lu)",
                   (unsigned long)npages, (unsigned long)offset,
@@ -327,9 +366,89 @@ int ssd_backend_sync(SsdBackend *sb, uint64_t offset, uint64_t size)
 
     int rc = msync((uint8_t *)sb->mmap_base + offset, (size_t)size, MS_SYNC);
     if (rc != 0) {
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_backend: msync failed: %s", strerror(errno));
         return UMM_E_TRANSPORT_ERROR;
+    }
+    return UMM_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* 块设备辅助接口与主机侧 I/O（pread/pwrite）                                  */
+/* ------------------------------------------------------------------------ */
+
+uint64_t ssd_backend_capacity(const SsdBackend *sb)
+{
+    return sb ? sb->capacity : 0;
+}
+
+uint64_t ssd_backend_max_io(const SsdBackend *sb)
+{
+    if (!sb)
+        return 0;
+    /* 文件后端无单次上限（pread/pwrite 全量循环）；libnvm 为 disk_info 值 */
+    return sb->is_libnvm ? ssd_libnvm_max_io(sb->libnvm) : 0;
+}
+
+/* 全量 pread：处理短读与 EINTR，直到读满 len 或出错 */
+int ssd_backend_pread(SsdBackend *sb, uint64_t offset, uint64_t len, void *buf)
+{
+    if (!sb || (!buf && len > 0))
+        return UMM_E_INVALID_ARG;
+    if (offset + len > sb->capacity)
+        return UMM_E_INVALID_ARG;  /* 越界 */
+
+    if (sb->is_libnvm)
+        return ssd_libnvm_read(sb->libnvm, offset, len, buf);
+
+    uint8_t *p = (uint8_t *)buf;
+    uint64_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(sb->fd, p + done, (size_t)(len - done),
+                          (off_t)(offset + done));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            umm_log_error(
+                          "ssd_backend: pread(%s, off=%lu) failed: %s",
+                          sb->device_path, (unsigned long)(offset + done),
+                          strerror(errno));
+            return UMM_E_IO;
+        }
+        if (n == 0)
+            return UMM_E_IO;            /* EOF：不应发生（已做边界检查） */
+        done += (uint64_t)n;
+    }
+    return UMM_OK;
+}
+
+/* 全量 pwrite：处理短写与 EINTR */
+int ssd_backend_pwrite(SsdBackend *sb, uint64_t offset, uint64_t len,
+                       const void *buf)
+{
+    if (!sb || (!buf && len > 0))
+        return UMM_E_INVALID_ARG;
+    if (offset + len > sb->capacity)
+        return UMM_E_INVALID_ARG;  /* 越界 */
+
+    if (sb->is_libnvm)
+        return ssd_libnvm_write(sb->libnvm, offset, len, buf);
+
+    const uint8_t *p = (const uint8_t *)buf;
+    uint64_t done = 0;
+    while (done < len) {
+        ssize_t n = pwrite(sb->fd, p + done, (size_t)(len - done),
+                           (off_t)(offset + done));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            umm_log_error(
+                          "ssd_backend: pwrite(%s, off=%lu) failed: %s",
+                          sb->device_path, (unsigned long)(offset + done),
+                          strerror(errno));
+            return UMM_E_IO;
+        }
+        done += (uint64_t)n;
     }
     return UMM_OK;
 }
@@ -356,7 +475,7 @@ int ssd_backend_recover(SsdBackend *sb)
 
     pthread_mutex_unlock(&sb->lock);
 
-    umm_log_info(__FILE__, __LINE__,
+    umm_log_info(
                  "ssd_backend: recovered device=%s, all %lu pages free",
                  sb->device_path ? sb->device_path : "?",
                  (unsigned long)sb->total_pages);
@@ -457,7 +576,7 @@ void ssd_pool_destroy(SsdPool *pool)
     }
     free(pool->bitmap);
 
-    umm_log_info(__FILE__, __LINE__,
+    umm_log_info(
                  "ssd_pool: destroyed %u devices, total=%lu MB",
                  pool->num_devices,
                  (unsigned long)(pool->total_capacity / (1024 * 1024)));
@@ -473,14 +592,17 @@ void ssd_pool_destroy(SsdPool *pool)
 
 int ssd_pool_add_device(SsdPool *pool, const char *device_path, uint64_t capacity)
 {
-    if (!pool || !device_path || capacity == 0)
+    if (!pool || !device_path)
         return UMM_E_INVALID_ARG;
     if (pool->num_devices >= SSD_POOL_MAX_DEVICES)
         return UMM_E_NO_MEMORY;
 
-    /* Align capacity */
-    capacity = (capacity + SSD_POOL_PAGE_SIZE - 1)
-               & ~(uint64_t)(SSD_POOL_PAGE_SIZE - 1);
+    /* 块设备允许 capacity=0（=整盘），实际容量以后端探测为准；
+     * 文件后端必须显式给容量（backend_create 内部校验） */
+    if (capacity > 0) {
+        capacity = (capacity + SSD_POOL_PAGE_SIZE - 1)
+                   & ~(uint64_t)(SSD_POOL_PAGE_SIZE - 1);
+    }
 
     pthread_mutex_lock(&pool->lock);
 
@@ -491,9 +613,17 @@ int ssd_pool_add_device(SsdPool *pool, const char *device_path, uint64_t capacit
     SsdBackend *sb = ssd_backend_create(device_path, capacity);
     if (!sb) {
         pthread_mutex_unlock(&pool->lock);
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_pool: failed to create backend for %s", device_path);
         return UMM_E_TRANSPORT_ERROR;
+    }
+
+    /* 以后端实际纳管容量为准（块设备可能做了整盘探测/页对齐截断） */
+    capacity = ssd_backend_capacity(sb);
+    if (capacity == 0) {
+        ssd_backend_destroy(sb);
+        pthread_mutex_unlock(&pool->lock);
+        return UMM_E_INVALID_ARG;
     }
 
     pool->devices[idx].backend      = sb;
@@ -530,7 +660,7 @@ int ssd_pool_add_device(SsdPool *pool, const char *device_path, uint64_t capacit
 
     pthread_mutex_unlock(&pool->lock);
 
-    umm_log_info(__FILE__, __LINE__,
+    umm_log_info(
                  "ssd_pool: added device[%u] %s, capacity=%lu MB, "
                  "virtual_base=0x%lx, total_pool=%lu MB",
                  idx, device_path,
@@ -569,7 +699,7 @@ int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset)
 
     if (pool->free_pages < npages) {
         pthread_mutex_unlock(&pool->lock);
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_pool: out of space (need %lu pages, free %lu)",
                       (unsigned long)npages, (unsigned long)pool->free_pages);
         return UMM_E_NO_MEMORY;
@@ -578,7 +708,7 @@ int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset)
     uint64_t page = bm_find_free(pool->bitmap, pool->total_pages, 0, npages);
     if (page >= pool->total_pages) {
         pthread_mutex_unlock(&pool->lock);
-        umm_log_error(__FILE__, __LINE__,
+        umm_log_error(
                       "ssd_pool: no contiguous %lu-page region",
                       (unsigned long)npages);
         return UMM_E_NO_MEMORY;
@@ -592,7 +722,7 @@ int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset)
 
     pthread_mutex_unlock(&pool->lock);
 
-    umm_log_debug(__FILE__, __LINE__,
+    umm_log_debug(
                   "ssd_pool: allocated %lu pages at voffset=0x%lx "
                   "(free=%lu/%lu)",
                   (unsigned long)npages, (unsigned long)*out_voffset,
@@ -627,7 +757,7 @@ void ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size)
 
     pthread_mutex_unlock(&pool->lock);
 
-    umm_log_debug(__FILE__, __LINE__,
+    umm_log_debug(
                   "ssd_pool: freed %lu pages at voffset=0x%lx "
                   "(free=%lu/%lu)",
                   (unsigned long)npages, (unsigned long)voffset,
@@ -709,4 +839,58 @@ int ssd_pool_sync(SsdPool *pool, uint64_t voffset, uint64_t size)
         voffset += chunk;
     }
     return UMM_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ssd_pool_pread / ssd_pool_pwrite — 池级主机 I/O（跨设备分段）              */
+/* ------------------------------------------------------------------------ */
+
+static int ssd_pool_io(SsdPool *pool, uint64_t voffset, uint64_t len,
+                       void *buf, int is_write)
+{
+    if (!pool || (!buf && len > 0))
+        return UMM_E_INVALID_ARG;
+    if (voffset + len > pool->total_capacity)
+        return UMM_E_INVALID_ARG;   /* 越界 */
+
+    uint8_t *p   = (uint8_t *)buf;
+    uint64_t end = voffset + len;
+    uint64_t cur = voffset;
+    uint64_t done = 0;
+
+    while (cur < end) {
+        uint32_t dev_idx;
+        uint64_t poff;
+        int rc = ssd_pool_translate(pool, cur, &dev_idx, &poff);
+        if (rc != UMM_OK)
+            return rc;
+
+        /* 本设备内可连续读写的长度 */
+        uint64_t dev_end = pool->devices[dev_idx].virtual_base
+                         + pool->devices[dev_idx].capacity;
+        uint64_t chunk = end - cur;
+        if (cur + chunk > dev_end)
+            chunk = dev_end - cur;
+
+        SsdBackend *sb = pool->devices[dev_idx].backend;
+        rc = is_write ? ssd_backend_pwrite(sb, poff, chunk, p + done)
+                      : ssd_backend_pread (sb, poff, chunk, p + done);
+        if (rc != UMM_OK)
+            return rc;
+
+        cur  += chunk;
+        done += chunk;
+    }
+    return UMM_OK;
+}
+
+int ssd_pool_pread(SsdPool *pool, uint64_t voffset, uint64_t len, void *buf)
+{
+    return ssd_pool_io(pool, voffset, len, buf, 0);
+}
+
+int ssd_pool_pwrite(SsdPool *pool, uint64_t voffset, uint64_t len,
+                    const void *buf)
+{
+    return ssd_pool_io(pool, voffset, len, (void *)buf, 1);
 }

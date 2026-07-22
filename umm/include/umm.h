@@ -176,6 +176,11 @@ int umm_free(ChunkDescriptor *desc);
 int umm_register_storage_tier(tier_id_t tier, const char *device_path,
                                 uint64_t capacity);
 
+/* 查询存储拓扑：direct 模式查本地 mem_service；RPC 模式查 ummD。
+ * 注意布局：resources 可能按 tier 稀疏存放，遍历应取 [0,UMM_NUM_TIERS)
+ * 全部槽位并过滤 online，而非仅遍历前 num_resources 项。 */
+int umm_get_topology(StorageTopology *out);
+
 /* Data I/O */
 int umm_read (const ChunkDescriptor *desc, uint64_t offset, uint64_t len, void *out_buf);
 int umm_write(const ChunkDescriptor *desc, uint64_t offset, uint64_t len, const void *buf);

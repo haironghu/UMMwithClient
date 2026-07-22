@@ -4,7 +4,7 @@
 
 CC      = gcc
 CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -pthread -I./include -I./src
-LDFLAGS = -pthread
+LDFLAGS = -pthread -ldl
 AR      = ar
 ARFLAGS = rcs
 
@@ -34,6 +34,7 @@ TRANSPORT_SRC := \
     transport_local.c \
     transport_ssd.c \
     ssd_pool.c \
+    ssd_backend_libnvm.c \
     tier_router.c
 
 METADATA_SRC := \
@@ -81,9 +82,9 @@ ALL_OBJ := \
 # Phony targets
 # ========================================================================
 
-.PHONY: all dirs server client test clean
+.PHONY: all dirs server client test clean shared
 
-all: dirs server client test tools
+all: dirs server client test tools shared
 
 dirs: $(BUILD_DIR) $(BIN_DIR)
 
@@ -147,6 +148,7 @@ UMMS_OBJ := \
     $(MEMORY_OBJ) \
     $(METADATA_OBJ) \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/transport_ssd.o
 
 $(BIN_DIR)/ummd: $(BIN_DIR)/ummd.c $(UMMD_OBJ) | dirs
@@ -186,6 +188,43 @@ $(BUILD_DIR)/libumm.a: $(LIBUMM_OBJ) | dirs
 	@echo "  AR      $@"
 
 # ========================================================================
+# Shared library: build/libumm.so（Python client / ctypes 依赖）
+# ========================================================================
+
+PIC_DIR := build_pic
+PIC_OBJ := $(patsubst $(BUILD_DIR)/%.o,$(PIC_DIR)/%.o,$(LIBUMM_OBJ))
+
+$(PIC_DIR):
+	@mkdir -p $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/common/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/protocol/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/transport/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/metadata_service/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/memory_service/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/client_lib/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/%.o: $(SRC_DIR)/cis/%.c | $(PIC_DIR)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(BUILD_DIR)/libumm.so: $(PIC_OBJ) | dirs
+	$(CC) -shared -fPIC $^ -o $@ $(LDFLAGS)
+	@echo "  LD      $@"
+
+shared: $(BUILD_DIR)/libumm.so
+
+# ========================================================================
 # Test binaries
 # ========================================================================
 
@@ -198,6 +237,7 @@ TEST_TRANSPORT_OBJ := \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/mem_service_direct.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/bitmap_allocator.o \
     $(BUILD_DIR)/error_codes.o \
@@ -217,6 +257,7 @@ TEST_INTEGRATION_OBJ := \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/tier_router.o \
     $(BUILD_DIR)/meta_service_direct.o \
     $(BUILD_DIR)/meta_hash_table.o \
@@ -258,6 +299,7 @@ $(BIN_DIR)/test_cxl: $(TEST_DIR)/test_cxl.c $(TEST_CXL_OBJ) | dirs
 TEST_TIER_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/tier_router.o \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/umm_transport.o \
@@ -299,12 +341,23 @@ $(BIN_DIR)/test_rw: $(TEST_DIR)/test_rw.c $(TEST_TIER_OBJ) | dirs
 $(BIN_DIR)/test_p0_concurrent: $(TEST_DIR)/test_p0_concurrent.c $(TEST_TIER_OBJ) | dirs
 	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
 
+$(BIN_DIR)/test_ssd_pool_io: $(TEST_DIR)/test_ssd_pool_io.c $(TEST_TIER_OBJ) | dirs
+	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
+
+# libnvm 桩库（文件模拟控制器）+ 接入测试
+$(BIN_DIR)/libnvm_host.so: $(TEST_DIR)/stub_libnvm_host.c | dirs
+	$(CC) $(CFLAGS) -shared -fPIC $< -o $@
+
+$(BIN_DIR)/test_ssd_libnvm: $(TEST_DIR)/test_ssd_libnvm.c $(TEST_TIER_OBJ) $(BIN_DIR)/libnvm_host.so | dirs
+	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
+
 test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
       $(BIN_DIR)/test_metadata $(BIN_DIR)/test_integration \
       $(BIN_DIR)/test_cross_node $(BIN_DIR)/test_cxl $(BIN_DIR)/test_tier \
       $(BIN_DIR)/test_ssd_dist $(BIN_DIR)/test_ssd_simple_dist \
       $(BIN_DIR)/test_ssd_multi_device $(BIN_DIR)/test_rw \
-      $(BIN_DIR)/test_p0_concurrent
+      $(BIN_DIR)/test_p0_concurrent $(BIN_DIR)/test_ssd_pool_io \
+      $(BIN_DIR)/test_ssd_libnvm
 	@echo ""
 	@echo "========================================"
 	@echo "Running test suite..."
@@ -334,6 +387,13 @@ test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
 	@echo ""
 	@$(BIN_DIR)/test_p0_concurrent
 	@echo ""
+	@$(BIN_DIR)/test_ssd_pool_io
+	@echo ""
+	@cd $(BIN_DIR) && env -u UMM_TEST_LIBNVM_CTRL -u UMM_TEST_LIBNVM_OFF \
+	      -u UMM_TEST_LIBNVM_INITONLY \
+	      UMM_LIBNVM_PATH=$(abspath $(BIN_DIR)/libnvm_host.so) \
+	      ./test_ssd_libnvm
+	@echo ""
 	@echo "========================================"
 	@echo "All tests completed."
 	@echo "========================================"
@@ -343,6 +403,6 @@ test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
 # ========================================================================
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(PIC_DIR)
 	rm -f $(BIN_DIR)/test_* $(BIN_DIR)/ummd $(BIN_DIR)/umms \
-	       $(BIN_DIR)/ssd_sim_test
+	       $(BIN_DIR)/ssd_sim_test $(BIN_DIR)/libnvm_host.so

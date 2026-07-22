@@ -266,6 +266,37 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
         return UMM_E_INVALID_ARG;
     if (!tier_is_valid(res->tier))
         return UMM_E_INVALID_ARG;
+
+    /* ---- SSD：解析设备路径 ----
+     * 仅支持两类后端：
+     *   libnvm:<ctrl>@<ns>  —— libnvm 用户态驱动（真实硬件，原样使用）
+     *   文件/目录          —— 模拟盘（*.raw 原样；目录 → dir/pool.raw）
+     * 内核块设备（/dev/nvmeXnY）不再支持：规避误写系统盘/数据盘风险。
+     * 容量一律必须显式配置。 */
+    char     ssd_resolved[288] = {0};
+    uint64_t eff_capacity = res->capacity;
+    if (res->tier == UMM_TIER_SSD && res->device_path[0] != '\0') {
+        if (strncmp(res->device_path, "libnvm:", 7) == 0) {
+            snprintf(ssd_resolved, sizeof(ssd_resolved), "%s",
+                     res->device_path);
+        } else {
+            size_t dplen = strlen(res->device_path);
+            int is_file = (dplen > 4 &&
+                           strcmp(res->device_path + dplen - 4, ".raw") == 0);
+            if (is_file)
+                snprintf(ssd_resolved, sizeof(ssd_resolved), "%s",
+                         res->device_path);
+            else
+                snprintf(ssd_resolved, sizeof(ssd_resolved), "%s/pool.raw",
+                         res->device_path);
+        }
+        if (eff_capacity == 0) {
+            umm_log_error("memsvc: SSD backend requires explicit "
+                          "capacity (path=%s)", res->device_path);
+            return UMM_E_INVALID_ARG;
+        }
+    }
+
     if (res->capacity == 0)
         return UMM_E_INVALID_ARG;
 
@@ -278,15 +309,15 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
 
     /* First-time registration: initialize tier */
     if (!t->online) {
-        t->total_size  = res->capacity;
+        t->total_size  = (tier == UMM_TIER_SSD) ? eff_capacity : res->capacity;
         t->base_offset = res->base_offset;
         t->online      = 1;
         t->mmap_base   = NULL;
         t->mmap_fd     = -1;
         t->ssd_pool    = NULL;
 
-        /* Create bitmap allocator */
-        t->allocator = ba_create(res->capacity, MEMSVC_DEFAULT_PAGE_SIZE);
+        /* Create bitmap allocator（SSD 用探测后的有效容量） */
+        t->allocator = ba_create(t->total_size, MEMSVC_DEFAULT_PAGE_SIZE);
         if (!t->allocator) {
             t->online = 0;
             pthread_mutex_unlock(&m->lock);
@@ -310,10 +341,8 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
                      t->device_path[0] ? t->device_path : "(mock)");
 
     } else if (tier == UMM_TIER_SSD) {
-        /* SSD: create backend (device_path may be file or dir) */
+        /* SSD: create backend (file / dir / libnvm) */
         if (t->device_path[0] != '\0') {
-            const char *dev = t->device_path;
-
             /* Create pool on first registration, add device on subsequent */
             if (!t->ssd_pool) {
                 t->ssd_pool = ssd_pool_create();
@@ -326,18 +355,9 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
                 }
             }
 
-            /* Resolve device path (directory → dir/pool.raw, file → as-is) */
-            size_t dplen = strlen(dev);
-            int is_file = (dplen > 4 && strcmp(dev + dplen - 4, ".raw") == 0);
-            char resolved[288];
-            if (is_file) {
-                strncpy(resolved, dev, sizeof(resolved) - 1);
-                resolved[sizeof(resolved) - 1] = '\0';
-            } else {
-                snprintf(resolved, sizeof(resolved), "%s/pool.raw", dev);
-            }
-
-            int rc = ssd_pool_add_device(t->ssd_pool, resolved, t->total_size);
+            /* 使用注册入口预解析好的路径（块设备原样 / 文件 / 目录） */
+            int rc = ssd_pool_add_device(t->ssd_pool, ssd_resolved,
+                                         eff_capacity);
             if (rc != UMM_OK) {
                 if (ssd_pool_num_devices(t->ssd_pool) == 0) {
                     ssd_pool_destroy(t->ssd_pool);
@@ -514,6 +534,55 @@ static int memsvc_get_stats(void *ctx, uint64_t *total, uint64_t *used,
  * Static vtable instance
  * ======================================================================== */
 
+/* ========================================================================
+ * 可选接口：SSD 块设备后端的主机 I/O 回退通路（pread/pwrite 语义）
+ * 当 SSD tier 由真实块设备纳管（无 mmap）时，transport 经此读写。
+ * ======================================================================== */
+
+static int memsvc_ssd_io(void *ctx, tier_id_t tier, node_id_t node,
+                         uint64_t offset, uint64_t len, void *buf,
+                         int is_write)
+{
+    (void)node;
+    if (!ctx || (!buf && len > 0))
+        return UMM_E_INVALID_ARG;
+    if (tier != UMM_TIER_SSD)
+        return UMM_E_INVALID_ARG;
+
+    MemServiceCtx *m = (MemServiceCtx *)ctx;
+
+    /* 锁内仅解析 pool 指针与基址（注册后不变），I/O 移到锁外——
+     * 同步 nvm_host_read/write 长达数十~数百 us，持锁会把所有并发
+     * SSD 读写串行化（真机实测并发 0.88x 的根因之一） */
+    pthread_mutex_lock(&m->lock);
+
+    TierMemCtx *t = &m->tiers[tier];
+    if (!t->online || !t->ssd_pool) {
+        pthread_mutex_unlock(&m->lock);
+        return UMM_E_NOT_INITIALIZED;
+    }
+
+    SsdPool *pool = t->ssd_pool;
+    uint64_t voff = offset - t->base_offset;   /* 与 map_device 同一语义 */
+
+    pthread_mutex_unlock(&m->lock);
+
+    return is_write ? ssd_pool_pwrite(pool, voff, len, buf)
+                    : ssd_pool_pread (pool, voff, len, buf);
+}
+
+static int memsvc_ssd_read(void *ctx, tier_id_t tier, node_id_t node,
+                           uint64_t offset, uint64_t len, void *buf)
+{
+    return memsvc_ssd_io(ctx, tier, node, offset, len, buf, 0);
+}
+
+static int memsvc_ssd_write(void *ctx, tier_id_t tier, node_id_t node,
+                            uint64_t offset, uint64_t len, const void *buf)
+{
+    return memsvc_ssd_io(ctx, tier, node, offset, len, (void *)buf, 1);
+}
+
 static MemoryServiceVtbl g_direct_vtbl = {
     .alloc_local       = memsvc_alloc_local,
     .free_local        = memsvc_free_local,
@@ -525,6 +594,8 @@ static MemoryServiceVtbl g_direct_vtbl = {
     .get_topology      = memsvc_get_topology,
     .map_device        = memsvc_map_device,
     .unmap_device      = memsvc_unmap_device,
+    .ssd_read          = memsvc_ssd_read,
+    .ssd_write         = memsvc_ssd_write,
 };
 
 /* ========================================================================

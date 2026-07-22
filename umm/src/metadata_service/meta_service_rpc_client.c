@@ -440,3 +440,36 @@ int meta_rpc_get_storage_topology(MetaRpcClient *c, node_id_t node,
     pthread_mutex_unlock(&c->lock);
     return rc;
 }
+
+/* ------------------------------------------------------------------ */
+/* Storage resource registration (status-only response)                */
+/* ------------------------------------------------------------------ */
+int meta_rpc_register_storage_resource(MetaRpcClient *c, node_id_t node,
+                                        const StorageResource *res)
+{
+    if (!c || !res)
+        return UMM_E_INVALID_ARG;
+
+    pthread_mutex_lock(&c->lock);
+
+    UmmProtoBody req_body;
+    int rc = meta_pack_register_storage_resource(node, res, &req_body);
+    if (rc != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return rc;
+    }
+
+    UmmProtoBody resp_body;
+    rc = do_rpc(c, META_OP_REGISTER_STORAGE_RESOURCE, &req_body, &resp_body);
+    if (rc != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return rc;
+    }
+
+    /* status-only 响应体: i32 */
+    size_t p = 0;
+    int32_t status = proto_read_i32(resp_body.data, &p);
+
+    pthread_mutex_unlock(&c->lock);
+    return status;
+}

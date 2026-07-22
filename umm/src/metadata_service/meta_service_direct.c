@@ -327,7 +327,16 @@ static int impl_get_storage_topology(void *ctx_, node_id_t node,
 
     for (uint32_t i = 0; i < ctx->num_topologies; i++) {
         if (ctx->topologies[i].node_id == node) {
-            *out = ctx->topologies[i];
+            /* 内部按 tier 稀疏存放，对外返回紧凑数组——
+             * 线协议 pack 从 resources[0] 连续取 num_resources 项，
+             * 稀疏布局会导致空槽上线、真实资源丢失 */
+            StorageTopology *src = &ctx->topologies[i];
+            memset(out, 0, sizeof(*out));
+            out->node_id = src->node_id;
+            for (int t = 0; t < UMM_NUM_TIERS; t++) {
+                if (src->resources[t].online)
+                    out->resources[out->num_resources++] = src->resources[t];
+            }
             pthread_rwlock_unlock(&ctx->lock);
 
             umm_log_info("ummd: GET_TOPOLOGY node=%u -> found %u resources",

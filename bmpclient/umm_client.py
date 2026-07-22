@@ -145,6 +145,13 @@ class UMMLib:
         ]
         lib.umm_alloc_tiered.restype = ctypes.c_int
 
+        lib.umm_register_storage_tier.argtypes = [
+            ctypes.c_uint8,
+            ctypes.c_char_p,
+            ctypes.c_uint64,
+        ]
+        lib.umm_register_storage_tier.restype = ctypes.c_int
+
         # umm_alloc_on_device 是较新版本 libumm 才导出的符号；
         # 对缺失该符号的旧库做可选绑定（调用时才报错，不影响其他 API）
         self._fn_alloc_on_device = getattr(lib, "umm_alloc_on_device", None)
@@ -218,6 +225,23 @@ class UMMLib:
                 f"umm_alloc_tiered({size}, tier={tier}) failed: rc={rc} ({self.errstr(rc)})"
             )
         return desc
+
+    def register_storage_tier(self, tier: int, device_path: str,
+                              capacity: int) -> None:
+        """注册 tier 存储设备（direct: 本地池; rpc: 上报 ummD + 本地数据面）。
+
+        RPC 模式下应在 init 之后、任何数据 I/O 之前调用（tier router
+        会整体重建）。libnvm 设备需在进程环境中先设好
+        UMM_LIBNVM_PATH / LD_LIBRARY_PATH。
+        """
+        rc = self._lib.umm_register_storage_tier(
+            tier, device_path.encode("utf-8"), capacity
+        )
+        if rc != UMM_OK:
+            raise RuntimeError(
+                f"umm_register_storage_tier(tier={tier}, dev={device_path}) "
+                f"failed: rc={rc} ({self.errstr(rc)})"
+            )
 
     def alloc_on_device(self, size: int, tier: int, device_idx: int) -> ChunkDescriptor:
         if self._fn_alloc_on_device is None:

@@ -1,5 +1,8 @@
 # bmpclient — UMM 客户端
 
+> **首次部署请读 → [docs/00_端到端搭建指南.md](docs/00_端到端搭建指南.md)**
+> 架构文档索引：docs/01（本层）· 02（umm层）· 03（管控面）· 04（数据面）· R6（并发遗留问题）
+
 `bmpclient` 是 UMM 的 Python 客户端库，通过 `ctypes` 加载 `libumm.so`，将 UMM 的 C API 封装为 Pythonic 接口，提供从大块 Chunk 申请到细粒度 `Block` 分配、再到跨 SSD 设备定长存储的内存管理能力。
 
 ## 架构概述

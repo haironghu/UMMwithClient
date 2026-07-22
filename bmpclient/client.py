@@ -21,14 +21,18 @@ class UMMServiceClient:
 
     def __init__(self, meta_addr: str, mem_addr: str, node_id: int = 0,
                  ssd_device: str = "",
-                 ssd_devices: List[Tuple[str, int]] = None):
+                 ssd_devices: List[Tuple[str, int]] = None,
+                 tier_aware: bool = False):
         """
         :param ssd_device:  兼容旧版：单个 SSD 设备路径（如 "/tmp/ssd.raw"）
         :param ssd_devices: 新版多设备列表：[(path, size_bytes), ...]
+        :param tier_aware:  True 时启用 tier 路由模式（transport 置空），
+                            SSD tier 数据面走 tier_router → transport_ssd；
+                            False 保持 legacy mock transport（仅 dram/CXL）
         """
         self.lib = UMMLib()
         cfg = UMMConfig()
-        cfg.transport = b"mock"
+        cfg.transport = b"" if tier_aware else b"mock"
         cfg.consistency_model = b"hardware"
         cfg.memory_size = 64 * 1024 * 1024
         cfg.meta_server_addr = meta_addr.encode("utf-8")
@@ -74,6 +78,17 @@ class UMMServiceClient:
                 raise ValueError("device_idx 仅在 media_type='ssd' 时支持")
             return self.lib.alloc(size)
 
+    def enable_ssd(self, device_path: str, capacity: int) -> None:
+        """注册 SSD tier 存储设备（需 tier_aware=True 构造）。
+
+        RPC 模式下：上报 ummD 全局拓扑 + 在 client 进程本地建立
+        SSD 数据面（tier_router → transport_ssd → 设备）。
+        必须在 init 之后、任何数据 I/O 之前调用。
+        文件设备例 "/tmp/ssd.raw"；libnvm 设备例
+        "libnvm:/dev/libnvm_helper0@1+0x40000000"（带窗口基址）。
+        """
+        self.lib.register_storage_tier(UMM_TIER_SSD, device_path, capacity)
+
     def get_topology(self) -> StorageTopology:
         """查询当前管理的存储拓扑（CXL + 每个 SSD 设备）。"""
         return self.lib.get_topology()
@@ -98,11 +113,15 @@ class UMMServiceClient:
         """
         返回当前管理的设备列表，每条记录包含：
         tier, device_path, capacity, base_offset, online
+
+        布局兼容：ummD 按 tier 稀疏存放、mem_service 返回紧凑数组，
+        因此遍历全部槽位并过滤 online，而非仅取前 num_resources 项。
         """
         topo = self.get_topology()
         devices = []
-        for i in range(topo.num_resources):
-            res = topo.resources[i]
+        for res in topo.resources:
+            if not res.online:
+                continue
             devices.append(
                 {
                     "tier": res.tier,

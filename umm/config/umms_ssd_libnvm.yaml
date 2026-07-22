@@ -1,0 +1,24 @@
+# umms — 内存服务配置（真实 SSD tier，libnvm 用户态 NVMe 驱动）
+# ======================================================================
+# 启动方式:
+#   export UMM_LIBNVM_PATH=/home/l00835206/code/NPU_Direct_Storage/build/lib/libnvm_host.so
+#   export LD_LIBRARY_PATH=<libruntime_common.so 等传递依赖所在目录>:$LD_LIBRARY_PATH
+#   ./umms -c config/umms_ssd_libnvm.yaml
+#
+# 数据安全（务必阅读）:
+#   设备路径必须带 "+<base_off>" 窗口后缀！窗口外的盘区域（含 LBA0）
+#   不会被触碰。下例窗口 = [1GB, 1GB+16GB)。
+#   调整窗口时同步修改 base_off 与 size（size = 窗口大小）。
+
+node_id: 0
+listen_addr: "0.0.0.0"
+listen_port: 20002
+memory_size: 134217728        # 128MB —— CXL/DRAM 模拟层容量
+base_gpa: 0
+
+# SSD 设备列表（格式: "path:size,path:size,..."，后缀 G/M/K）
+# libnvm 路径约定: libnvm:<ctrl>[@ns][+<base_off>]
+#   ns       缺省 1
+#   base_off 窗口基址（支持 0x 十六进制），落盘偏移 = base_off + 窗口内偏移
+#   size     窗口容量（libnvm disk_info 暂无总容量字段，必须显式给出）
+ssd_devices: "libnvm:/dev/libnvm_helper0@1+0x40000000:16G"

@@ -87,6 +87,8 @@ extern int mem_rpc_free(MemRpcClient *c, uint64_t offset, uint64_t size);
 
 /* Phase 5: mem service topology query RPC */
 extern int mem_rpc_get_topology(MemRpcClient *c, StorageTopology *out);
+extern int meta_rpc_register_storage_resource(MetaRpcClient *c, node_id_t node,
+                                               const StorageResource *res);
 
 /* Tier-aware allocation RPC */
 extern int mem_rpc_alloc_tiered(MemRpcClient *c, tier_id_t tier, uint64_t size,
@@ -263,7 +265,9 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
     void *ssd_ctx = NULL;
 
     if (topo && topo->num_resources > 0) {
-        for (uint32_t i = 0; i < topo->num_resources; i++) {
+        /* 遍历全部槽位而非 num_resources——兼容两种拓扑布局:
+         * mem_service_direct 返回紧凑数组, ummD 按 tier 稀疏存放 */
+        for (uint32_t i = 0; i < UMM_NUM_TIERS; i++) {
             const StorageResource *res = &topo->resources[i];
             if (!res->online)
                 continue;
@@ -866,10 +870,17 @@ int umm_free(ChunkDescriptor *desc)
         }
     }
 
-    /* Step 2: Free physical memory */
+    /* Step 2: Free physical memory（按 GPA 中的 tier 选择释放路径） */
+    tier_id_t tier = gpa_to_tier(desc->base_gpa);
     if (g_state.local_mem_vtbl) {
-        int rc2 = g_state.local_mem_vtbl->free_local(g_state.local_mem_ctx,
-                                                      offset, desc->user_size);
+        int rc2;
+        if (tier != UMM_TIER_CXL && g_state.local_mem_vtbl->free_tiered) {
+            rc2 = g_state.local_mem_vtbl->free_tiered(
+                      g_state.local_mem_ctx, tier, offset, desc->user_size);
+        } else {
+            rc2 = g_state.local_mem_vtbl->free_local(
+                      g_state.local_mem_ctx, offset, desc->user_size);
+        }
         if (rc2 != UMM_OK) {
             log_error(__FILE__, __LINE__,
                       "umm_free: local free failed (rc=%d)", rc2);
@@ -877,8 +888,14 @@ int umm_free(ChunkDescriptor *desc)
                 final_rc = rc2;
         }
     } else if (g_state.mem_client_buf) {
-        int rc2 = mem_rpc_free(g_state.mem_client_buf,
+        int rc2;
+        if (tier != UMM_TIER_CXL) {
+            rc2 = mem_rpc_free_tiered(g_state.mem_client_buf, tier,
+                                       offset, desc->user_size);
+        } else {
+            rc2 = mem_rpc_free(g_state.mem_client_buf,
                                offset, desc->user_size);
+        }
         if (rc2 != UMM_OK) {
             log_error(__FILE__, __LINE__,
                       "umm_free: mem_rpc_free failed (rc=%d)", rc2);
@@ -1067,8 +1084,93 @@ int umm_register_storage_tier(tier_id_t tier, const char *device_path,
         return UMM_OK;
     }
 
-    /* RPC mode not yet supported for client-side registration */
+    /* RPC mode: 上报 ummD 全局拓扑 + 重建本地数据面 transport。
+     * 架构事实: RPC 仅承载分配/元数据, SSD 数据面在 client 进程本地
+     * (tier_router → transport_ssd → 本地 ssd_pool → 设备)。
+     * 应在 umm_init 之后、任何数据 I/O 之前调用（router 整体重建）。 */
+    if (is_rpc_mode()) {
+        /* 1) 上报 ummD（供本 client 重查及其他 client 发现拓扑）。
+         *    失败仅告警——本地数据面不依赖 ummD 是否记录 */
+        if (g_state.meta_client_buf) {
+            int rrc = meta_rpc_register_storage_resource(
+                          g_state.meta_client_buf,
+                          g_state.config.my_node_id, &res);
+            if (rrc != UMM_OK)
+                log_warn(__FILE__, __LINE__,
+                         "umm_register_storage_tier: report to ummd failed "
+                         "(rc=%d), local datapath continues", rrc);
+        }
+
+        /* 2) 重建本地 tier router（含新 SSD transport） */
+        if (g_state.tier_router) {
+            StorageTopology topo;
+            memset(&topo, 0, sizeof(topo));
+            topo.node_id = g_state.config.my_node_id;
+            topo.resources[res.tier] = res;   /* 稀疏槽位, 遍历侧已兼容 */
+            topo.num_resources = 1;
+
+            /* 若此前已从 ummD 拿到拓扑, 合并已有 SSD 之外的资源 */
+            /* （Phase 3 单 SSD 设备场景: 直接以本次注册为准） */
+
+            tier_router_destroy(g_state.tier_router);
+            g_state.tier_router = NULL;
+            g_state.transport = NULL;
+            g_state.transport_ctx = NULL;
+            if (g_state.ssd_transport_vtbl && g_state.ssd_transport_ctx) {
+                ssd_transport_destroy(g_state.ssd_transport_ctx);
+                g_state.ssd_transport_vtbl = NULL;
+                g_state.ssd_transport_ctx = NULL;
+            }
+
+            int crc = configure_transports_from_topology(&g_state.config,
+                                                          &topo);
+            if (crc != UMM_OK) {
+                log_error(__FILE__, __LINE__,
+                          "umm_register_storage_tier: transport re-config "
+                          "failed (rc=%d)", crc);
+                return crc;
+            }
+            log_info(__FILE__, __LINE__,
+                     "rpc mode: local transport re-configured for %s tier "
+                     "(dev=%s, cap=%lu)",
+                     umm_tier_name(tier), device_path,
+                     (unsigned long)capacity);
+        }
+        return UMM_OK;
+    }
+
     return UMM_E_INVALID_ARG;
+}
+
+/* ------------------------------------------------------------------------ */
+/* umm_get_topology -- query storage topology (direct: local; rpc: ummD)   */
+/* ------------------------------------------------------------------------ */
+
+int umm_get_topology(StorageTopology *out)
+{
+    if (!g_state.initialized)
+        return UMM_E_NOT_INITIALIZED;
+    if (!out)
+        return UMM_E_INVALID_ARG;
+
+    memset(out, 0, sizeof(*out));
+
+    if (g_state.local_mem_vtbl && g_state.local_mem_vtbl->get_topology)
+        return g_state.local_mem_vtbl->get_topology(g_state.local_mem_ctx,
+                                                     out);
+    if (g_state.meta_client_buf) {
+        int rc = meta_rpc_get_storage_topology(g_state.meta_client_buf,
+                                                g_state.config.my_node_id,
+                                                out);
+        /* ummD 尚无本节点记录 → 语义上是"空拓扑"而非错误 */
+        if (rc != UMM_OK) {
+            memset(out, 0, sizeof(*out));
+            out->node_id = g_state.config.my_node_id;
+            return UMM_OK;
+        }
+        return rc;
+    }
+    return UMM_E_NOT_INITIALIZED;
 }
 
 /* ------------------------------------------------------------------------ */
