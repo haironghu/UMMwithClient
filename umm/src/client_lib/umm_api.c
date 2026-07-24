@@ -263,6 +263,8 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
     /* --- Create SSD transport if topology indicates SSD tier --- */
     MemoryTransportVtbl *ssd_vtbl = NULL;
     void *ssd_ctx = NULL;
+    int  ssd_local_skip_nds = 0;
+    char ssd_local_skip_path[256] = {0};
 
     if (topo && topo->num_resources > 0) {
         /* 遍历全部槽位而非 num_resources——兼容两种拓扑布局:
@@ -273,6 +275,21 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
                 continue;
 
             if (res->tier == UMM_TIER_SSD) {
+                /* nds: 直驱设备不在客户端建本地数据面——单次 nds_init
+                 * 纪律：全进程仅 worker 直连池 API 持有设备；客户端
+                 * write_chunk 的 host buffer 语义对 NDS 本就错误。
+                 * RPC 分配面（create_chunk）与拓扑可见性不受影响。
+                 * 注意 "nds:" 不会误匹配 "nds-meta:"（第 4 字符为 '-'） */
+                if (strncmp(res->device_path, "nds:", 4) == 0) {
+                    log_info(__FILE__, __LINE__,
+                             "客户端本地数据面跳过 NDS 直驱设备 %s：数据面"
+                             "由 worker 直连池 API 持有，分配走 RPC",
+                             res->device_path);
+                    ssd_local_skip_nds = 1;
+                    strncpy(ssd_local_skip_path, res->device_path,
+                            sizeof(ssd_local_skip_path) - 1);
+                    break;
+                }
                 ssd_vtbl = ssd_transport_create(res->device_path,
                                                  res->capacity,
                                                  &ssd_ctx);
@@ -307,6 +324,12 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
             ssd_transport_destroy(ssd_ctx);
         return UMM_E_UNKNOWN;
     }
+
+    /* nds: 设备跳过本地数据面后，对该 tier 的 get/put 返回明确的
+     * UMM_E_UNSUPPORTED（而非笼统 INVALID_ARG） */
+    if (ssd_local_skip_nds)
+        tier_router_mark_local_unsupported(router, UMM_TIER_SSD,
+                                           ssd_local_skip_path);
 
     g_state.tier_router     = router;
     g_state.ssd_transport_vtbl = ssd_vtbl;

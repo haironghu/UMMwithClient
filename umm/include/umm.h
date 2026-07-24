@@ -66,6 +66,7 @@ static inline gpa_t make_gpa(node_id_t node, tier_id_t tier, uint64_t offset) {
 #define UMM_E_TIMEOUT        -6
 #define UMM_E_TRANSPORT_ERROR -7
 #define UMM_E_NOT_INITIALIZED -8
+#define UMM_E_UNSUPPORTED   -9
 #define UMM_E_UNKNOWN        -99
 
 /* Aliases for backward compatibility */
@@ -141,6 +142,17 @@ typedef struct {
     /* Server listening config (for ummd/umms standalone mode) */
     uint16_t        listen_port;         /* listening port (0 = use default) */
     uint64_t        base_gpa;            /* base GPA for this node (default: 0) */
+
+    /* NDS RPC server（Process A）托管配置——仅 umms 服务层使用，
+     * 全部可选（缺省：enable=0, ctrl=/dev/libnvm_helper0, ns=1,
+     * qd=64, socket=/tmp/nvm_host_rpc.sock, keep_alive=1）。
+     * 库层（libumm.so）绝不拉起特权进程，见 umms.c 设计注释。 */
+    int             nds_rpc_server_enable;      /* 0/1 */
+    char            nds_rpc_server_ctrl[256];   /* NVMe 控制器路径 */
+    uint32_t        nds_rpc_server_ns;          /* namespace id */
+    uint32_t        nds_rpc_server_qd;          /* admin queue 深度 */
+    char            nds_rpc_server_socket[256]; /* RPC unix socket */
+    int             nds_rpc_server_keep_alive;  /* 1=umms 退出保留 server */
 } UMMConfig;
 
 /* ========================================================================

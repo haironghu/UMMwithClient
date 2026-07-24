@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/socket.h>
 #include <stdarg.h>
 #include <pthread.h>
 
@@ -397,10 +398,15 @@ void mem_server_stop(MemServer *srv)
     /* Signal all threads to stop */
     srv->running = 0;
 
-    /* Closing the listen socket wakes up the accept thread */
+    /* Closing the listen socket wakes up the accept thread.
+     * 注意：Linux 上另一线程阻塞在 accept() 时，单纯 close(listen_fd)
+     * 不会唤醒它（accept 在内核中已持有 socket 引用），会导致下面的
+     * pthread_join 永久挂起；必须先 shutdown() 使 accept 以 EINVAL
+     * 出错返回，线程见 running=0 退出后再 close。 */
     if (srv->listen_sock >= 0) {
         int tmp_sock = srv->listen_sock;
         srv->listen_sock = -1;
+        shutdown(tmp_sock, SHUT_RDWR);
         umm_tcp_close(tmp_sock);
     }
 

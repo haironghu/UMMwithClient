@@ -428,6 +428,52 @@ TEST(tier_router_ssd_only)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Test 7b: Tier router -- nds: tier skipped, local dataplane unsupported   */
+/* ------------------------------------------------------------------------ */
+TEST(tier_router_nds_skip_unsupported)
+{
+    MemoryTransportVtbl cxl_vtbl;  fake_vtbl_fill(&cxl_vtbl);
+    FakeTierCtx cxl_ctx = { .storage = 0, .last_op = -1 };
+    pthread_mutex_init(&cxl_ctx.lock, NULL);
+
+    /* nds: 设备在客户端不建本地 SSD 数据面 → SSD 槽位 NULL，
+     * 由 tier_router_mark_local_unsupported 标记 */
+    TierRouter *tr = tier_router_create(&cxl_vtbl, &cxl_ctx, NULL, NULL);
+    ASSERT_NOT_NULL(tr);
+    tier_router_mark_local_unsupported(tr, UMM_TIER_SSD, "nds:0+0x0");
+
+    MemoryTransportVtbl *router_vtbl = tier_router_get_vtbl(tr);
+    ASSERT_NOT_NULL(router_vtbl);
+
+    gpa_t gpa_ssd = make_gpa(0, UMM_TIER_SSD, 0x4000);
+    char buf[8] = {0};
+
+    /* write_chunk/read_chunk 到 nds: tier → 明确的 UNSUPPORTED（非 INVALID_ARG，
+     * 非 NULL 解引用，非静默成功） */
+    int rc = router_vtbl->put(tr, gpa_ssd, 8, "FAIL!");
+    ASSERT_EQ(rc, UMM_E_UNSUPPORTED);
+    rc = router_vtbl->get(tr, gpa_ssd, 8, buf);
+    ASSERT_EQ(rc, UMM_E_UNSUPPORTED);
+
+    /* CXL tier 数据面不受影响 */
+    gpa_t gpa_cxl = make_gpa(0, UMM_TIER_CXL, 0x4000);
+    rc = router_vtbl->put(tr, gpa_cxl, 8, "CXL ok!");
+    ASSERT_EQ(rc, UMM_OK);
+    ASSERT_EQ(cxl_ctx.last_op, 1);
+
+    /* 未标记的缺失 tier 仍返回既有 INVALID_ARG（行为不变） */
+    TierRouter *tr2 = tier_router_create(&cxl_vtbl, &cxl_ctx, NULL, NULL);
+    ASSERT_NOT_NULL(tr2);
+    MemoryTransportVtbl *rv2 = tier_router_get_vtbl(tr2);
+    rc = rv2->put(tr2, gpa_ssd, 8, "FAIL!");
+    ASSERT_EQ(rc, UMM_E_INVALID_ARG);
+    tier_router_destroy(tr2);
+
+    tier_router_destroy(tr);
+    pthread_mutex_destroy(&cxl_ctx.lock);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Test 8: Tier router + real SSD transport -- end-to-end                   */
 /* ------------------------------------------------------------------------ */
 TEST(tier_router_real_ssd)
@@ -476,5 +522,6 @@ TEST_SUITE("Multi-Tier Storage v3.0")
     RUN_TEST(transport_ssd_atomic);
     RUN_TEST(tier_router_routing);
     RUN_TEST(tier_router_ssd_only);
+    RUN_TEST(tier_router_nds_skip_unsupported);
     RUN_TEST(tier_router_real_ssd);
 END_TEST_SUITE()

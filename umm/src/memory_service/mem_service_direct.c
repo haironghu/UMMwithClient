@@ -268,15 +268,19 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
         return UMM_E_INVALID_ARG;
 
     /* ---- SSD：解析设备路径 ----
-     * 仅支持两类后端：
+     * 仅支持三类后端：
      *   libnvm:<ctrl>@<ns>  —— libnvm 用户态驱动（真实硬件，原样使用）
+     *   nds:<dev_id>[+<off>] —— NDS NPU 直驱后端（真实硬件，原样使用）
      *   文件/目录          —— 模拟盘（*.raw 原样；目录 → dir/pool.raw）
      * 内核块设备（/dev/nvmeXnY）不再支持：规避误写系统盘/数据盘风险。
      * 容量一律必须显式配置。 */
     char     ssd_resolved[288] = {0};
     uint64_t eff_capacity = res->capacity;
     if (res->tier == UMM_TIER_SSD && res->device_path[0] != '\0') {
-        if (strncmp(res->device_path, "libnvm:", 7) == 0) {
+        if (strncmp(res->device_path, "libnvm:", 7) == 0 ||
+            strncmp(res->device_path, "nds:", 4) == 0 ||
+            /* nds-meta 纯分配后端（umms 簿记形态），同样原样透传 */
+            strncmp(res->device_path, "nds-meta:", 9) == 0) {
             snprintf(ssd_resolved, sizeof(ssd_resolved), "%s",
                      res->device_path);
         } else {

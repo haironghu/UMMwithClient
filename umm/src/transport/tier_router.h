@@ -42,6 +42,20 @@ TierRouter* tier_router_create(MemoryTransportVtbl *cxl_vtbl, void *cxl_ctx,
 void tier_router_destroy(TierRouter *tr);
 
 /**
+ * tier_router_mark_local_unsupported — Mark a tier's local dataplane as
+ * intentionally unsupported (e.g. an "nds:" direct-drive device whose
+ * dataplane is owned by the worker's direct pool API, not by the client
+ * library).  Subsequent get/put to that tier fail with UMM_E_UNSUPPORTED
+ * and a clear log line instead of a generic UMM_E_INVALID_ARG.
+ *
+ * @param tr          Router instance.
+ * @param tier        Tier to mark.
+ * @param device_path Device path (for diagnostics), may be NULL.
+ */
+void tier_router_mark_local_unsupported(TierRouter *tr, tier_id_t tier,
+                                        const char *device_path);
+
+/**
  * tier_router_get_vtbl — Get the router's transport vtable.
  *
  * The returned vtable's get/put/atomic/fence will route to the correct

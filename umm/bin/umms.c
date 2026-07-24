@@ -25,6 +25,12 @@
 #include <getopt.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "../src/common/log.h"
 #include "../src/common/error_codes.h"
@@ -62,6 +68,203 @@ static void daemon_log(int level, const char *file, int line,
 /* ------------------------------------------------------------------------ */
 
 static volatile sig_atomic_t g_running = 1;
+
+/* 托管的 NDS RPC server（Process A）子进程 PID，-1 = 未托管 */
+static pid_t g_rpc_child = -1;
+
+/* keep_alive=false 时的退出钩子：SIGTERM 子进程并回收。
+ * SIGINT/SIGTERM 仅置 g_running=0，主循环退出后走正常 return →
+ * atexit 触发本钩子，与现有信号处理兼容（信号 handler 内不做 wait）。 */
+static void rpc_child_atexit(void)
+{
+    if (g_rpc_child <= 0)
+        return;
+    kill(g_rpc_child, SIGTERM);
+    for (int i = 0; i < 50; i++) {          /* 最多等 5s */
+        int st;
+        if (waitpid(g_rpc_child, &st, WNOHANG) == g_rpc_child)
+            break;
+        usleep(100 * 1000);
+    }
+    kill(g_rpc_child, SIGKILL);             /* 兜底（已退出则无害） */
+    waitpid(g_rpc_child, NULL, 0);
+    g_rpc_child = -1;
+}
+
+/* wait_ready：每 100ms 轮询 connect() 到 RPC unix socket，成功即
+ * ready（随即 close——仅探测 listen 是否就绪；stale socket 文件存在
+ * 但无监听时 connect 返回 ECONNREFUSED，可区分，继续轮询）。
+ * 同时检测子进程早夭（exec 失败/启动即崩）提前 fail。
+ * 返回 0=ready，-1=超时，-2=子进程已退出 */
+static int nds_rpc_wait_ready(const char *sock_path, pid_t child,
+                              uint64_t timeout_ms)
+{
+    if (strlen(sock_path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+        return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, sock_path);
+
+    uint64_t waited = 0;
+    while (waited < timeout_ms) {
+        int st;
+        pid_t r = waitpid(child, &st, WNOHANG);
+        if (r == child)
+            return -2;
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                close(fd);
+                return 0;
+            }
+            close(fd);
+        }
+        usleep(100 * 1000);
+        waited += 100;
+    }
+    return -1;
+}
+
+/* 定位 helper：env UMM_NDS_RPC_SERVER_BIN 覆盖 → 缺省
+ * /proc/self/exe 同目录下 umm_nds_rpc_server */
+static int nds_rpc_locate_helper(char *out, size_t out_size)
+{
+    const char *env = getenv("UMM_NDS_RPC_SERVER_BIN");
+    if (env && env[0]) {
+        snprintf(out, out_size, "%s", env);
+        return 0;
+    }
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0)
+        return -1;
+    exe[n] = '\0';
+    char *slash = strrchr(exe, '/');
+    if (!slash)
+        return -1;
+    *slash = '\0';
+    int w = snprintf(out, out_size, "%s/%s", exe, "umm_nds_rpc_server");
+    if (w < 0 || (size_t)w >= out_size)
+        return -1;
+    return 0;
+}
+
+/* NDS RPC server（Process A）托管拉起。
+ *
+ * 设计取舍：库层（libumm.so）绝不拉起特权进程——多进程各自 dlopen
+ * libumm.so 会产生拉起竞态（谁 fork？重复 bind 控制器？），且
+ * 持有 NVMe 控制器需要特权，客户端进程权限模型不一，进程生命周期
+ * 倒挂（server 应长于任一客户端）。托管只发生在 umms 服务层：
+ * umms 是部署形态中唯一的长驻特权服务进程，启动顺序天然正确。
+ *
+ * 返回 0=成功（或未启用），-1=fatal（调用方应退出） */
+static int nds_rpc_server_bootstrap(const UMMConfig *cfg, uint32_t num_ssd)
+{
+    if (!cfg->nds_rpc_server_enable)
+        return 0;
+
+    /* 仅当 SSD 设备列表含 nds: 设备时才拉起，否则配置无意义 */
+    int has_nds = 0;
+    for (uint32_t i = 0; i < num_ssd; i++)
+        if (strncmp(cfg->ssd_devices[i].path, "nds:", 4) == 0)
+            has_nds = 1;
+    if (!has_nds) {
+        DLOG_WARN("nds_rpc_server_enable=true 但 ssd_devices 不含 nds: "
+                  "设备，跳过 RPC server 托管");
+        return 0;
+    }
+
+    const char *ctrl = cfg->nds_rpc_server_ctrl[0]
+                       ? cfg->nds_rpc_server_ctrl : "/dev/libnvm_helper0";
+    const char *sock = cfg->nds_rpc_server_socket[0]
+                       ? cfg->nds_rpc_server_socket : "/tmp/nvm_host_rpc.sock";
+    uint32_t ns = cfg->nds_rpc_server_ns ? cfg->nds_rpc_server_ns : 1;
+    uint32_t qd = cfg->nds_rpc_server_qd ? cfg->nds_rpc_server_qd : 64;
+
+    /* 配置→env 一致性：同进程 ssd_backend_nds 的 RPC 引导读
+     * UMM_NDS_RPC_SOCKET，必须与托管 server 的 socket 一致 */
+    const char *env_sock = getenv("UMM_NDS_RPC_SOCKET");
+    if (!env_sock || !env_sock[0]) {
+        setenv("UMM_NDS_RPC_SOCKET", sock, 0);
+        DLOG_INFO("nds: UMM_NDS_RPC_SOCKET 未设置，已按配置 setenv 为 %s",
+                  sock);
+    } else if (strcmp(env_sock, sock) != 0) {
+        DLOG_WARN("nds: UMM_NDS_RPC_SOCKET=%s 与配置 "
+                  "nds_rpc_server_socket=%s 不一致，以 env 为准"
+                  "（二选一：改配置或 unset env）", env_sock, sock);
+    }
+
+    char helper[4096];
+    if (nds_rpc_locate_helper(helper, sizeof(helper)) != 0 ||
+        access(helper, X_OK) != 0) {
+        DLOG_FATAL("nds: 找不到 RPC server helper %s：先 make tools 构建 "
+                   "bin/umm_nds_rpc_server，或用 env UMM_NDS_RPC_SERVER_BIN "
+                   "指定完整路径", helper);
+        return -1;
+    }
+
+    char ns_str[16], qd_str[16];
+    snprintf(ns_str, sizeof(ns_str), "%u", (unsigned)ns);
+    snprintf(qd_str, sizeof(qd_str), "%u", (unsigned)qd);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        DLOG_FATAL("nds: fork RPC server 失败: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        /* 子进程：继承环境（UMM_LIBNVM_PATH 等）与 umms 日志流
+         *（stdout/stderr 不重定向），exec 失败立即退出 */
+        execl(helper, "umm_nds_rpc_server",
+              "--ctrl", ctrl, "--ns", ns_str, "--qd", qd_str,
+              "--socket", sock, (char *)NULL);
+        fprintf(stderr, "[umms] exec(%s) failed: %s\n",
+                helper, strerror(errno));
+        _exit(127);
+    }
+    g_rpc_child = pid;
+    DLOG_INFO("nds: spawned RPC server (Process A) pid=%d: %s --ctrl %s "
+              "--ns %s --qd %s --socket %s",
+              (int)pid, helper, ctrl, ns_str, qd_str, sock);
+
+    /* wait_ready（缺省 10000ms，env UMM_NDS_RPC_READY_TIMEOUT_MS 可调） */
+    uint64_t timeout_ms = 10000;
+    const char *e = getenv("UMM_NDS_RPC_READY_TIMEOUT_MS");
+    if (e && e[0]) {
+        unsigned long long v = strtoull(e, NULL, 10);
+        if (v)
+            timeout_ms = (uint64_t)v;
+    }
+    int wrc = nds_rpc_wait_ready(sock, pid, timeout_ms);
+    if (wrc != 0) {
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        g_rpc_child = -1;
+        if (wrc == -2)
+            DLOG_FATAL("nds: RPC server (pid=%d) 启动后立即退出：检查 "
+                       "UMM_LIBNVM_PATH、控制器 %s 路径与访问权限、"
+                       "libnvm_helper 内核模块", (int)pid, ctrl);
+        else
+            DLOG_FATAL("nds: RPC server (pid=%d) %lu ms 内未就绪 "
+                       "(socket=%s)：检查 UMM_LIBNVM_PATH、控制器 %s "
+                       "路径与访问权限",
+                       (int)pid, (unsigned long)timeout_ms, sock, ctrl);
+        return -1;
+    }
+    DLOG_INFO("nds: RPC server ready (pid=%d, socket=%s)", (int)pid, sock);
+
+    if (cfg->nds_rpc_server_keep_alive) {
+        DLOG_INFO("nds: RPC server keep_alive=true：umms 退出后 server "
+                  "(pid=%d) 保留运行", (int)pid);
+        g_rpc_child = -1;   /* 不纳管退出清理 */
+    } else {
+        atexit(rpc_child_atexit);
+        DLOG_INFO("nds: RPC server keep_alive=false：umms 退出时将 "
+                  "SIGTERM 子进程 (pid=%d)", (int)pid);
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Signal handler                                                           */
@@ -231,6 +434,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     signal(SIGPIPE, SIG_IGN);
+
+    /* ---- NDS RPC server (Process A) 托管：解析配置之后、memory
+     * service/storage 注册之前（storage 注册时 nds 设备 open 需要
+     * RPC server 已就绪） ---- */
+    if (nds_rpc_server_bootstrap(&cfg, cfg_num_ssd) != 0)
+        return EXIT_FAILURE;
 
     /* ---- Create and start server ---- */
     MemServer *server;

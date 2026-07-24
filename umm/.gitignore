@@ -4,3 +4,4 @@ bin/ummd
 bin/umms
 *.o
 bin/ssd_sim_test
+bin/umm_nds_rpc_server

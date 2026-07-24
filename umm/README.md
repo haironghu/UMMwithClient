@@ -324,6 +324,167 @@ ssd_devices: "/data/ssd0.raw:250G,/data/ssd1.raw:250G,/data/ssd2.raw:500G"
 - Bitmap 分配器管理合并后的空间
 - `ssd_pool_translate()` 将虚拟偏移映射到（设备, 物理偏移）
 
+### NDS（NPU2SSD 直驱）后端
+
+除常规文件与 `libnvm:` 后端外，SSD 池还支持 NDS 直驱后端（dlopen 软依赖
+`libnds_aiv.so`，数据通路为 NPU device 内存 ↔ SSD，UMM 核心保持纯 C，
+经 dlsym Itanium mangled 符号调用 C++ 单例）：
+
+生产部署（双进程形态，推荐）：
+
+```yaml
+# umms（CPU 侧分配/元数据服务）：纯分配簿记，不 nds_init
+ssd_devices: "nds-meta:0+0x40000000:16G"
+# worker 进程（sglang/demo，唯一 NDS 客户端）：spec "nds:0+0x40000000"
+# ——同窗口同容量，本地 ssd_pool 直驱 DMA
+```
+
+**为何 umms 要用 `nds-meta:`**：真机 RPC server 单客户端串行（qp_id
+全局唯一），若 umms 与 worker 双进程都用 `nds:` 后端 nds_init 同一
+设备，第二个客户端会卡死在 CREATE_CQ（真机实证）。`nds-meta:` 是纯
+分配后端：不 dlopen、不 `nds_init`、不占 RPC 连接、不 mmap，只做
+bitmap 分配簿记（spec 语义/容量/页对齐截断与 `nds:` 完全一致，
+`get_ptr` 返回 NULL，`pread/pwrite/register_dev_mem/batch_*` 一律
+`UMM_E_UNSUPPORTED`）。umms 用 `nds-meta:` 时**无需**
+`UMM_NDS_PATH`/`UMM_NDS_PRELOAD`/`UMM_NDS_RPC_SOCKET`（这些全在
+worker 侧设置）。单机自测/桩库形态 umms 仍可用 `nds:`（进程内
+refcount 复用单例，无此问题）：
+
+```yaml
+ssd_devices: "nds:0+0x40000000:16G"   # nds:<device_id>[+<base_off>]
+```
+
+**客户端库行为（单次 nds_init 纪律）**：客户端库（libumm.so）在按
+拓扑/`enable_ssd` 构建本地数据面时，遇到 `nds:` 设备**不建本地
+backend**——全进程仅 worker 直连池 API（`ssd_pool_*`）持有设备，
+避免 `client = UMMServiceClient(tier_aware)` 与 worker 数据面两次
+`nds_init` 同一设备（真机提供方库不支持 uninit 后重 init，第二次
+会卡在 qp 分配）。跳过时打一行 info 日志；对该 tier 的
+`write_chunk`/`read_chunk` 返回 `UMM_E_UNSUPPORTED`（host buffer
+语义对 NDS 本就错误），RPC 分配面（`create_chunk`）与拓扑可见性
+（`get_device_list`）不受影响。`nds-meta:`/`libnvm:`/文件设备行为
+不变。
+
+- **路径规范**：`nds:<device_id>[+<base_off>]`（纯分配变体
+  `nds-meta:<device_id>[+<base_off>]`）；`+<base_off>` 窗口语义与
+  libnvm 相同（落盘偏移 = base_off + 窗口内偏移，避开 LBA0）。NDS 无容量
+  查询接口，容量必须显式。
+- **环境变量**：`UMM_NDS_PATH`（库路径，缺省 `libnds_aiv.so`）、
+  `UMM_NDS_QUEUE_DEPTH`(64)、`UMM_NDS_CORE_NUM`(1，库当前单 qp；支持多 qp 后调大)、
+  `UMM_NDS_PAGE_SIZE`(4096)、`UMM_NDS_MAX_PAGE_NUM`(7340032)、
+  `UMM_NDS_MAX_IO`(1048576)；RPC 引导/托管相关：
+  `UMM_NDS_RPC_SOCKET`（客户端 RPC socket，设置即启用引导）、
+  `UMM_NDS_RPC_WAIT_MS`(3000，bind 重试预算，0=不重试)、
+  `UMM_NDS_RPC_READY_TIMEOUT_MS`(10000，umms 托管 wait_ready 超时)、
+  `UMM_NDS_RPC_SERVER_BIN`（RPC server helper 路径覆盖，缺省
+  /proc/self/exe 同目录 `umm_nds_rpc_server`）。
+  注意 `UMM_NDS_MAX_PAGE_NUM` 是 NDS
+  内部 IO 跟踪资源池规模（对齐 NDS 提供方测试代码的
+  `1024*1024*7`，支撑 ~10000 iov 在途），**不是**单次 IO 上限；
+  单次上限由 `UMM_NDS_MAX_IO` 独立控制（缺省 1MB，保守可调——
+  提供方样例 per-iov 为 8192，真实上限待库方文档确认）。
+  另：`UMM_NDS_PRELOAD`（冒号分隔的 .so 完整路径列表）用于预载
+  NDS 库的未声明依赖提供方库（RTLD_NOW|RTLD_GLOBAL，任一失败
+  fail-fast 返回 `UMM_E_NOT_FOUND`，预载句柄常驻不 dlclose）。
+  真实案例：`libnds_aiv.so` 引用 `libread-write_kernel.so` 的
+  `readwrite_demo` 但 DT_NEEDED 未声明它，`dlopen(RTLD_NOW)` 报
+  `undefined symbol: _Z14readwrite_demojPvPhS0_mjjmS0_`——此问题
+  LD_LIBRARY_PATH 无法解决，配置示例：
+  `export UMM_NDS_PRELOAD=/path/to/libread-write_kernel.so`。
+  未预载时后端对 "undefined symbol" 失败自动回退 RTLD_LAZY 懒加载
+  （打 WARN），仅作应急兜底：运行期真实调用到未定义符号会在调用点
+  崩溃。定位：`ldd -r <lib>` 查全部未定义符号，`nm -D --defined-only`
+  在提供方库目录定位符号后预载。
+- **双进程架构 / RPC context 引导**：真实 `libnds_aiv.so` 内部复用
+  nvm_host 的 admin queue。提供方为双进程架构——Process A（RPC
+  server，持有 NVMe 控制器）与 NDS 客户端进程分离，客户端必须先建立
+  RPC context 再 `nds_init`，否则 `nds_init` 内
+  `nvm_host_admin_cq_create` 报 `no RPC context` 失败。设置
+  `UMM_NDS_RPC_SOCKET`（如 `/tmp/nvm_host_rpc.sock`）后，后端在首个
+  open 的 `nds_init` 之前自动执行 `nvm_host_bind_remote` +
+  `nvm_host_set_rpc_context`（符号解析先 `libnds_aiv.so` 句柄再
+  `RTLD_DEFAULT`，覆盖 libnvm_host.so 经 `UMM_NDS_PRELOAD` 预载的
+  场景）；同 device 后续 open 复用 context 不重复 bind。bind 失败
+  → `UMM_E_IO`（提示先启动 Process A）；符号缺失 → `UMM_E_NOT_FOUND`
+  （提示把 libnvm_host.so 加入 `UMM_NDS_PRELOAD`）。不设该 env 则
+  完全保持本地 admin queue 旧行为。
+  **RPC 连接生命周期**：每条 RPC 连接随 device 注册表 entry——首个
+  open bind 建连，同 device 多 backend 共享 entry 期间不断开，最后
+  一个 close（refcount 归零）先 `nds_uninit` 停队列、再调
+  `nvm_host_rpc_disconnect(rpc_ctx)` 释放 server 侧连接（info 日志
+  一行），然后才 dlclose 主库（disconnect 符号可能解析自 NDS 主库
+  句柄，顺序不能反）。`nvm_host_rpc_disconnect` 为可选符号（同 bind
+  的查找顺序解析；老版本库未导出则记 NULL + debug 日志，close 跳过
+  断开，不视为错误）。此前 close 从不断开，反复 open/close 会把真实
+  RPC server 的僵尸连接占满导致后续 bind 阻塞（真机实证）。真机完整配置：
+
+  ```bash
+  # 1. 先启动 Process A（本仓库配套守护进程 umm_nds_rpc_server，
+  #    本地持有 NVMe 控制器 + 对外提供 RPC admin queue 服务）：
+  make tools   # 产出 bin/umm_nds_rpc_server（仅依赖 -ldl -pthread）
+  UMM_LIBNVM_PATH=/path/libnvm_host.so \
+    ./bin/umm_nds_rpc_server --ctrl /dev/libnvm_helper0 --ns 1 --qd 64 \
+    --socket /tmp/nvm_host_rpc.sock &
+  #    启动成功打印 "RPC server ready on <socket> ..."；真机残留
+  #    stale socket 会自动 unlink（warn 一行）；SIGINT/SIGTERM 优雅
+  #    退出（free + 清理 socket，退出码 0）。参数均有 env 等价物
+  #    （UMM_NVM_CTRL/UMM_NVM_NS/UMM_NVM_QD/UMM_NVM_RPC_SOCKET）。
+  # 2. UMM 侧（Process B，NDS 客户端）：
+  export UMM_NDS_PRELOAD=/path/libread-write_kernel.so:/path/libnvm_host.so
+  export UMM_NDS_PATH=/path/libnds_aiv.so
+  export UMM_NDS_RPC_SOCKET=/tmp/nvm_host_rpc.sock
+  ./bin/umms -c config/umms_ssd_nds.yaml &
+  # 3. UMM 客户端照常连接 ummD/umms（三进程部署形态：
+  #    umm_nds_rpc_server → ummD/umms → 客户端）
+  ```
+
+- **运维加固 Phase 1 — 客户端 bind 重试**：`nvm_host_bind_remote`
+  失败（多为 Process A 启动窗口期的暂态失败）时在预算内指数退避
+  重试（50→100→200→400→800ms 封顶），由 env `UMM_NDS_RPC_WAIT_MS`
+  控制（缺省 3000；`0` = 不重试，保持单次失败立即返回的旧行为）。
+  每次重试打 debug 日志（含剩余预算），预算耗尽报 error（沿用
+  "Process A 未启动" 提示 + 已等待毫秒数/尝试次数）。重试只针对
+  bind 失败；符号缺失等确定性错误仍 fail-fast 不重试。提供方库
+  bind 每次失败会自行打印 `Failed to connect...`，属可观测暂态
+  噪声，未抑制。
+- **运维加固 Phase 2 — umms 托管拉起 RPC server（推荐部署形态，
+  三进程 → 单命令）**：umms 解析配置后、storage 注册前，若
+  `nds_rpc_server_enable: true` 且 `ssd_devices` 含 `nds:` 设备，
+  自动 fork+exec 同目录（或 `UMM_NDS_RPC_SERVER_BIN` 指定）的
+  `umm_nds_rpc_server`，wait_ready（每 100ms `connect()` 探测
+  unix socket，缺省超时 10000ms，env
+  `UMM_NDS_RPC_READY_TIMEOUT_MS` 可调；子进程早夭/超时均 fatal
+  并提示检查 `UMM_LIBNVM_PATH`/控制器权限）。配置 socket 后若
+  `UMM_NDS_RPC_SOCKET` 未设置则自动 `setenv`（保证同进程
+  ssd_backend_nds 引导用同一 socket）；已设置且不一致则 warn
+  （以 env 为准）。`nds_rpc_server_keep_alive`（缺省 true）：
+  true = umms 退出后 server 保留（日志注明 PID）；false = 注册
+  atexit 钩子，umms 退出（含 SIGTERM/SIGINT 优雅退出）时 SIGTERM
+  子进程。设计取舍：库层（libumm.so）绝不拉起特权进程（多进程
+  加载竞态/权限/生命周期倒挂），托管只在 umms 服务层。配置示例
+  见 `config/umms_ssd_nds.yaml`。
+  **systemd 终态建议**：生产上更推荐 systemd 表达依赖——
+  `umm-nds-rpc.service`（`umm_nds_rpc_server`）+ `umms.service`
+  `After=umm-nds-rpc.service`，由 systemd 保证启动顺序与
+  重启策略；umms 托管模式面向无 systemd 的容器/手工部署。
+  即便有 systemd 编排，Phase 1 的 bind 重试仍建议保留
+  （server 重启窗口期的天然容错）。
+- **与 libnvm 的差异**：
+  - I/O 缓冲是 NPU device 内存（device vaddr），不是 host buffer；
+    I/O 前必须 `ssd_pool_register_dev_mem()` 注册 device 内存段，
+    未注册一律拒绝（`UMM_E_INVALID_ARG`）。支持多段注册（至多
+    16 段，与 NDS 提供方测试代码的连续多段 `nds_register` 用法
+    一致）；单条 IO 的 vaddr 必须完整落在某一个段内（跨段拒绝）。
+    注册段建议用 `aclrtMalloc(ACL_MEM_MALLOC_HUGE_ONLY)` 分配
+    （提供方测试代码即用 HUGE 页）。
+  - offset/len 必须 page_size 对齐；单次 I/O 上限 =
+    `UMM_NDS_MAX_IO`（缺省 1MB），超限自动分段。
+  - NDS 全部接口 void 返回：无法调用后感知错误，只能调用前校验。
+  - 新增批量 I/O：`ssd_pool_batch_read/write`（iov.offset 为池虚拟
+    偏移，每个 iov 须完整落在单设备内）。
+- **构建/测试**：桩库 `test/stub_nds_aiv.cpp`（g++ -shared 产出
+  `bin/libnds_aiv.so`）+ `bin/test_ssd_nds`，纳入 `make test`。
+
 ---
 
 ## 常见问题排查

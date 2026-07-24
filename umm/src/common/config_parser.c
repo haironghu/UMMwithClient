@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -103,6 +104,24 @@ static int parse_int(const char *s, int *out)
     return UMM_OK;
 }
 
+/**
+ * Parse a boolean value: true/false/1/0/yes/no (大小写不敏感).
+ */
+static int parse_bool(const char *s, int *out)
+{
+    if (!strcasecmp(s, "true") || !strcmp(s, "1") ||
+        !strcasecmp(s, "yes")) {
+        *out = 1;
+        return UMM_OK;
+    }
+    if (!strcasecmp(s, "false") || !strcmp(s, "0") ||
+        !strcasecmp(s, "no")) {
+        *out = 0;
+        return UMM_OK;
+    }
+    return UMM_E_INVALID_ARG;
+}
+
 /* ========================================================================
  * Public API
  * ======================================================================== */
@@ -113,6 +132,10 @@ int umm_parse_config(const char *filepath, UMMConfig *out_cfg)
         return UMM_E_INVALID_ARG;
 
     memset(out_cfg, 0, sizeof(*out_cfg));
+    /* NDS RPC server 托管缺省值（全部为可覆盖缺省，enable 缺省关） */
+    out_cfg->nds_rpc_server_ns = 1;
+    out_cfg->nds_rpc_server_qd = 64;
+    out_cfg->nds_rpc_server_keep_alive = 1;
 
     FILE *fp = fopen(filepath, "r");
     if (!fp)
@@ -223,6 +246,28 @@ int umm_parse_config(const char *filepath, UMMConfig *out_cfg)
             int v;
             if (parse_int(value, &v) != UMM_OK || v < 0) { rc = UMM_E_INVALID_ARG; break; }
             out_cfg->my_node_id = (node_id_t)v;
+        } else if (strcmp(key, "nds_rpc_server_enable") == 0) {
+            int v;
+            if (parse_bool(value, &v) != UMM_OK) { rc = UMM_E_INVALID_ARG; break; }
+            out_cfg->nds_rpc_server_enable = v;
+        } else if (strcmp(key, "nds_rpc_server_ctrl") == 0) {
+            set_str(out_cfg->nds_rpc_server_ctrl,
+                    sizeof(out_cfg->nds_rpc_server_ctrl), value);
+        } else if (strcmp(key, "nds_rpc_server_ns") == 0) {
+            int v;
+            if (parse_int(value, &v) != UMM_OK || v <= 0) { rc = UMM_E_INVALID_ARG; break; }
+            out_cfg->nds_rpc_server_ns = (uint32_t)v;
+        } else if (strcmp(key, "nds_rpc_server_qd") == 0) {
+            int v;
+            if (parse_int(value, &v) != UMM_OK || v <= 0) { rc = UMM_E_INVALID_ARG; break; }
+            out_cfg->nds_rpc_server_qd = (uint32_t)v;
+        } else if (strcmp(key, "nds_rpc_server_socket") == 0) {
+            set_str(out_cfg->nds_rpc_server_socket,
+                    sizeof(out_cfg->nds_rpc_server_socket), value);
+        } else if (strcmp(key, "nds_rpc_server_keep_alive") == 0) {
+            int v;
+            if (parse_bool(value, &v) != UMM_OK) { rc = UMM_E_INVALID_ARG; break; }
+            out_cfg->nds_rpc_server_keep_alive = v;
         }
         /* Unknown keys are silently ignored */
     }

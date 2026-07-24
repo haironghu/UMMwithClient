@@ -12,6 +12,7 @@ const char* umm_error_string(int code)
     case UMM_E_TIMEOUT:         return "Operation timed out";
     case UMM_E_TRANSPORT_ERROR: return "Transport error";
     case UMM_E_NOT_INITIALIZED: return "Not initialized";
+    case UMM_E_UNSUPPORTED:     return "Unsupported operation";
     case UMM_E_UNKNOWN:         return "Unknown error";
     default:                    return "Unknown error";
     }

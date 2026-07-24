@@ -4,6 +4,8 @@
 
 CC      = gcc
 CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -pthread -I./include -I./src
+CXX     = g++
+CXXFLAGS = -std=c++11 -O2 -Wall -fPIC -I./include
 LDFLAGS = -pthread -ldl
 AR      = ar
 ARFLAGS = rcs
@@ -35,6 +37,7 @@ TRANSPORT_SRC := \
     transport_ssd.c \
     ssd_pool.c \
     ssd_backend_libnvm.c \
+    ssd_backend_nds.c \
     tier_router.c
 
 METADATA_SRC := \
@@ -82,9 +85,11 @@ ALL_OBJ := \
 # Phony targets
 # ========================================================================
 
-.PHONY: all dirs server client test clean shared
+.PHONY: all dirs server client test test-build clean shared test-bootstrap
 
-all: dirs server client test tools shared
+# 注意：all 只编译不运行测试；运行测试套件用 make test；
+# 只编译测试二进制（不运行）用 make test-build。
+all: dirs server client tools shared
 
 dirs: $(BUILD_DIR) $(BIN_DIR)
 
@@ -129,9 +134,13 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/server/%.c | dirs
 server: $(BIN_DIR)/ummd $(BIN_DIR)/umms
 # storage-tierd disabled during SSD refactor — will re-enable after RPC update
 
-tools: $(BIN_DIR)/ssd_sim_test
+tools: $(BIN_DIR)/ssd_sim_test $(BIN_DIR)/umm_nds_rpc_server
 
 $(BIN_DIR)/ssd_sim_test: $(BIN_DIR)/ssd_sim_test.c | dirs
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "  LD      $@"
+
+$(BIN_DIR)/umm_nds_rpc_server: $(BIN_DIR)/umm_nds_rpc_server.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 	@echo "  LD      $@"
 
@@ -149,6 +158,7 @@ UMMS_OBJ := \
     $(METADATA_OBJ) \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
+    $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/transport_ssd.o
 
 $(BIN_DIR)/ummd: $(BIN_DIR)/ummd.c $(UMMD_OBJ) | dirs
@@ -238,6 +248,7 @@ TEST_TRANSPORT_OBJ := \
     $(BUILD_DIR)/mem_service_direct.o \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
+    $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/bitmap_allocator.o \
     $(BUILD_DIR)/error_codes.o \
@@ -258,6 +269,7 @@ TEST_INTEGRATION_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
+    $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/tier_router.o \
     $(BUILD_DIR)/meta_service_direct.o \
     $(BUILD_DIR)/meta_hash_table.o \
@@ -300,6 +312,7 @@ TEST_TIER_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
+    $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/tier_router.o \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/umm_transport.o \
@@ -351,13 +364,43 @@ $(BIN_DIR)/libnvm_host.so: $(TEST_DIR)/stub_libnvm_host.c | dirs
 $(BIN_DIR)/test_ssd_libnvm: $(TEST_DIR)/test_ssd_libnvm.c $(TEST_TIER_OBJ) $(BIN_DIR)/libnvm_host.so | dirs
 	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
 
-test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
+# nds 桩库（C++，文件模拟 SSD）+ 接入测试
+$(BIN_DIR)/libnds_aiv.so: $(TEST_DIR)/stub_nds_aiv.cpp | dirs
+	$(CXX) $(CXXFLAGS) -shared $< -o $@
+
+$(BIN_DIR)/test_ssd_nds: $(TEST_DIR)/test_ssd_nds.c $(TEST_TIER_OBJ) $(BIN_DIR)/libnds_aiv.so | dirs
+	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
+
+# nvm_host RPC 桩库（server + client 双侧面符号）
+$(BIN_DIR)/libnvm_host_rpc_stub.so: $(TEST_DIR)/stub_nvm_host_rpc.c | dirs
+	$(CC) $(CFLAGS) -shared -fPIC $< -o $@
+
+# 不导出 nvm_host_rpc_disconnect 的变体（模拟老版本库，可选符号缺失路径）
+$(BIN_DIR)/libnvm_host_rpc_stub_nodisconn.so: $(TEST_DIR)/stub_nvm_host_rpc.c | dirs
+	$(CC) $(CFLAGS) -DSTUB_NO_DISCONNECT -shared -fPIC $< -o $@
+
+# RPC 连接断开测试（close 时 rpc_disconnect 释放 server 侧连接）
+$(BIN_DIR)/test_nds_rpc_disconnect: $(TEST_DIR)/test_nds_rpc_disconnect.c \
+      $(TEST_TIER_OBJ) $(BIN_DIR)/libnds_aiv.so \
+      $(BIN_DIR)/libnvm_host_rpc_stub.so \
+      $(BIN_DIR)/libnvm_host_rpc_stub_nodisconn.so | dirs
+	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
+
+TEST_BINS := \
+      $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
       $(BIN_DIR)/test_metadata $(BIN_DIR)/test_integration \
       $(BIN_DIR)/test_cross_node $(BIN_DIR)/test_cxl $(BIN_DIR)/test_tier \
       $(BIN_DIR)/test_ssd_dist $(BIN_DIR)/test_ssd_simple_dist \
       $(BIN_DIR)/test_ssd_multi_device $(BIN_DIR)/test_rw \
       $(BIN_DIR)/test_p0_concurrent $(BIN_DIR)/test_ssd_pool_io \
-      $(BIN_DIR)/test_ssd_libnvm
+      $(BIN_DIR)/test_ssd_libnvm $(BIN_DIR)/test_ssd_nds \
+      $(BIN_DIR)/test_nds_rpc_disconnect
+
+# 只编译测试二进制，不运行（CI 构建/交叉编译场景用）
+test-build: dirs $(TEST_BINS)
+
+# 编译并运行完整测试套件
+test: test-build
 	@echo ""
 	@echo "========================================"
 	@echo "Running test suite..."
@@ -391,12 +434,49 @@ test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
 	@echo ""
 	@cd $(BIN_DIR) && env -u UMM_TEST_LIBNVM_CTRL -u UMM_TEST_LIBNVM_OFF \
 	      -u UMM_TEST_LIBNVM_INITONLY \
+	      -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD \
 	      UMM_LIBNVM_PATH=$(abspath $(BIN_DIR)/libnvm_host.so) \
 	      ./test_ssd_libnvm
+	@echo ""
+	@cd $(BIN_DIR) && env -u UMM_TEST_NDS_SPEC -u UMM_TEST_NDS_OFF \
+	      -u UMM_TEST_NDS_INITONLY \
+	      -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD -u UMM_NDS_RPC_WAIT_MS \
+	      UMM_NDS_PATH=$(abspath $(BIN_DIR)/libnds_aiv.so) \
+	      ./test_ssd_nds
+	@echo ""
+	@cd $(BIN_DIR) && env -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD \
+	      -u UMM_NDS_RPC_WAIT_MS -u UMM_NDS_PATH \
+	      ./test_nds_rpc_disconnect single \
+	      $(abspath $(BIN_DIR)/libnds_aiv.so) \
+	      $(abspath $(BIN_DIR)/libnvm_host_rpc_stub.so) \
+	      /tmp/umm_test_rpc_disconn_single.sock
+	@cd $(BIN_DIR) && env -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD \
+	      -u UMM_NDS_RPC_WAIT_MS -u UMM_NDS_PATH \
+	      ./test_nds_rpc_disconnect shared \
+	      $(abspath $(BIN_DIR)/libnds_aiv.so) \
+	      $(abspath $(BIN_DIR)/libnvm_host_rpc_stub.so) \
+	      /tmp/umm_test_rpc_disconn_shared.sock
+	@cd $(BIN_DIR) && env -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD \
+	      -u UMM_NDS_RPC_WAIT_MS -u UMM_NDS_PATH \
+	      ./test_nds_rpc_disconnect nodisconn \
+	      $(abspath $(BIN_DIR)/libnds_aiv.so) \
+	      $(abspath $(BIN_DIR)/libnvm_host_rpc_stub_nodisconn.so) \
+	      /tmp/umm_test_rpc_disconn_nodisconn.sock
+	@cd $(BIN_DIR) && env -u UMM_NDS_RPC_SOCKET -u UMM_NDS_PRELOAD \
+	      -u UMM_NDS_RPC_WAIT_MS -u UMM_NDS_PATH \
+	      ./test_nds_rpc_disconnect nosock \
+	      $(abspath $(BIN_DIR)/libnds_aiv.so) \
+	      $(abspath $(BIN_DIR)/libnvm_host_rpc_stub.so) \
+	      /tmp/umm_test_rpc_disconn_nosock.sock
 	@echo ""
 	@echo "========================================"
 	@echo "All tests completed."
 	@echo "========================================"
+
+# NDS RPC 运维加固端到端验证（bind 重试 + umms 托管拉起 RPC server）。
+# 不进 make test 默认套件：依赖进程编排与端口，防真机/flaky 影响回归。
+test-bootstrap: $(BIN_DIR)/umms $(BIN_DIR)/umm_nds_rpc_server $(BIN_DIR)/libnds_aiv.so
+	@bash $(TEST_DIR)/test_umms_nds_bootstrap.sh
 
 # ========================================================================
 # Clean
@@ -405,4 +485,7 @@ test: dirs $(BIN_DIR)/test_allocator $(BIN_DIR)/test_transport_mock \
 clean:
 	rm -rf $(BUILD_DIR) $(PIC_DIR)
 	rm -f $(BIN_DIR)/test_* $(BIN_DIR)/ummd $(BIN_DIR)/umms \
-	       $(BIN_DIR)/ssd_sim_test $(BIN_DIR)/libnvm_host.so
+	       $(BIN_DIR)/ssd_sim_test $(BIN_DIR)/umm_nds_rpc_server \
+	       $(BIN_DIR)/libnvm_host.so $(BIN_DIR)/libnds_aiv.so \
+	       $(BIN_DIR)/libnvm_host_rpc_stub.so \
+	       $(BIN_DIR)/libnvm_host_rpc_stub_nodisconn.so

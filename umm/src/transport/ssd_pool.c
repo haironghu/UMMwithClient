@@ -28,11 +28,12 @@
 #define SSD_BITS_PER_U64 64
 
 #include "ssd_backend_libnvm.h"
+#include "ssd_backend_nds.h"
 
 struct SsdBackend {
     char       *device_path;    /* path to device file */
     int         fd;             /* device file descriptor */
-    void       *mmap_base;      /* mmap base address (文件后端; libnvm 为 MAP_FAILED) */
+    void       *mmap_base;      /* mmap base address (文件后端; libnvm/nds 为 MAP_FAILED) */
     uint64_t    capacity;       /* total capacity (bytes) */
     uint64_t    total_pages;    /* capacity / page_size */
     uint64_t    free_pages;     /* number of free pages */
@@ -40,6 +41,9 @@ struct SsdBackend {
     uint64_t    bitmap_words;   /* number of uint64_t in bitmap */
     int         is_libnvm;      /* 1 = libnvm userspace NVMe backend */
     SsdLibnvmBackend *libnvm;   /* libnvm handle (is_libnvm only) */
+    int         is_nds;         /* 1 = NDS NPU 直驱后端 */
+    SsdNdsBackend *nds;         /* nds handle (is_nds only) */
+    int         is_nds_meta;    /* 1 = nds-meta 纯分配后端（无后端资源） */
     pthread_mutex_t lock;
 };
 
@@ -132,6 +136,70 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
         sb->free_pages  = sb->total_pages;
         umm_log_info(
                      "ssd_backend: libnvm device=%s, managed=%lu MB",
+                     device_path,
+                     (unsigned long)(capacity / 1024 / 1024));
+        goto init_bitmap;
+    }
+
+    /* ---- nds-meta 路径："nds-meta:<device_id>[+<base_off>]"，纯分配后端 ----
+     * 部署形态（NPU2SSD，解决 umms 与 worker 双进程同抢一个 NPU 设备 /
+     * RPC server 单客户端串行导致的 nds_init 卡死）：
+     *   umms:   ssd_devices: "nds-meta:0+0x40000000:16G"  ← 纯分配簿记
+     *   worker: spec "nds:0+0x40000000"（同窗口同容量）    ← 唯一 NDS 客户端
+     * umms 只做 bitmap 分配簿记，不 dlopen/不 nds_init/不占 RPC 连接/
+     * 不 mmap（因此无需 UMM_NDS_PATH/UMM_NDS_PRELOAD/UMM_NDS_RPC_SOCKET）；
+     * 数据面 I/O 一律 UMM_E_UNSUPPORTED（见下方各接口分支）。
+     * 注意 strncmp(path,"nds:",4) 不会误匹配 "nds-meta:"（第 4 字符是
+     * '-' 不是 ':'），但为可读性仍将本分支放在 nds 之前。
+     * spec 语义与 nds 完全一致（device_id/base_off/显式容量/页对齐
+     * 截断），仅校验格式不打开设备；bitmap 分配簿记与 nds 一致
+     * （走 init_bitmap 建池内 bitmap）。 */
+    if (strncmp(device_path, "nds-meta:", 9) == 0) {
+        const char *spec = device_path + 9;
+        /* 轻量格式校验（复用 nds 的 spec 形态：<id>[+<off>]），
+         * 不解析保存——簿记只需要容量 */
+        char spec_buf[64];
+        if (strlen(spec) >= sizeof(spec_buf))
+            goto fail;
+        strcpy(spec_buf, spec);
+        char *plus = strrchr(spec_buf, '+');
+        if (plus)
+            *plus = '\0';
+        char *end = NULL;
+        (void)strtoul(spec_buf, &end, 10);
+        if (spec_buf[0] == '\0' || end == spec_buf || *end != '\0') {
+            umm_log_error(
+                          "ssd_backend: nds-meta spec 非法（须为 "
+                          "<device_id>[+<base_off>]）：%s", spec);
+            goto fail;
+        }
+        capacity &= ~(uint64_t)(SSD_PAGE_SIZE - 1);
+        sb->is_nds_meta = 1;
+        sb->capacity    = capacity;
+        sb->total_pages = capacity / SSD_PAGE_SIZE;
+        sb->free_pages  = sb->total_pages;
+        umm_log_info(
+                     "ssd_backend: nds-meta 纯分配后端 device=%s, "
+                     "managed=%lu MB（不 nds_init，数据面在 worker）",
+                     device_path,
+                     (unsigned long)(capacity / 1024 / 1024));
+        goto init_bitmap;
+    }
+
+    /* ---- nds 路径："nds:<device_id>[+<base_off>]"，NDS NPU 直驱后端 ----
+     * 无 mmap：数据通路为 NPU device 内存（pread/pwrite 的 buf 语义为
+     * device 虚拟地址），I/O 前必须 ssd_backend_register_dev_mem 注册；
+     * NDS 无容量查询接口，容量必须显式（顶部已统一拒绝 capacity=0） */
+    if (strncmp(device_path, "nds:", 4) == 0) {
+        capacity &= ~(uint64_t)(SSD_PAGE_SIZE - 1);
+        if (ssd_nds_open(device_path + 4, &sb->nds) != UMM_OK)
+            goto fail;
+        sb->is_nds      = 1;
+        sb->capacity    = capacity;
+        sb->total_pages = capacity / SSD_PAGE_SIZE;
+        sb->free_pages  = sb->total_pages;
+        umm_log_info(
+                     "ssd_backend: nds device=%s, managed=%lu MB",
                      device_path,
                      (unsigned long)(capacity / 1024 / 1024));
         goto init_bitmap;
@@ -236,6 +304,8 @@ void ssd_backend_destroy(SsdBackend *sb)
         close(sb->fd);
     if (sb->libnvm)
         ssd_libnvm_close(sb->libnvm);
+    if (sb->nds)
+        ssd_nds_close(sb->nds);
 
     umm_log_info(
                  "ssd_backend: destroyed device=%s, used=%lu/%lu pages",
@@ -386,8 +456,14 @@ uint64_t ssd_backend_max_io(const SsdBackend *sb)
 {
     if (!sb)
         return 0;
-    /* 文件后端无单次上限（pread/pwrite 全量循环）；libnvm 为 disk_info 值 */
-    return sb->is_libnvm ? ssd_libnvm_max_io(sb->libnvm) : 0;
+    /* 文件后端无单次上限（pread/pwrite 全量循环）；
+     * libnvm 为 disk_info 值；nds 为 page_size*max_page_num */
+    if (sb->is_libnvm)
+        return ssd_libnvm_max_io(sb->libnvm);
+    if (sb->is_nds)
+        return ssd_nds_max_io(sb->nds);
+    /* nds-meta 纯分配后端无 IO 概念，回落默认 0 */
+    return 0;
 }
 
 /* 全量 pread：处理短读与 EINTR，直到读满 len 或出错 */
@@ -398,8 +474,17 @@ int ssd_backend_pread(SsdBackend *sb, uint64_t offset, uint64_t len, void *buf)
     if (offset + len > sb->capacity)
         return UMM_E_INVALID_ARG;  /* 越界 */
 
+    if (sb->is_nds_meta) {
+        umm_log_error(
+                      "ssd_backend: nds-meta 为纯分配后端，pread 不受理——"
+                      "数据面在 worker 进程（nds: 后端）");
+        return UMM_E_UNSUPPORTED;
+    }
     if (sb->is_libnvm)
         return ssd_libnvm_read(sb->libnvm, offset, len, buf);
+    if (sb->is_nds)
+        /* nds 后端：buf 语义为已注册的 NPU device 虚拟地址 */
+        return ssd_nds_read(sb->nds, offset, len, buf);
 
     uint8_t *p = (uint8_t *)buf;
     uint64_t done = 0;
@@ -431,8 +516,17 @@ int ssd_backend_pwrite(SsdBackend *sb, uint64_t offset, uint64_t len,
     if (offset + len > sb->capacity)
         return UMM_E_INVALID_ARG;  /* 越界 */
 
+    if (sb->is_nds_meta) {
+        umm_log_error(
+                      "ssd_backend: nds-meta 为纯分配后端，pwrite 不受理——"
+                      "数据面在 worker 进程（nds: 后端）");
+        return UMM_E_UNSUPPORTED;
+    }
     if (sb->is_libnvm)
         return ssd_libnvm_write(sb->libnvm, offset, len, buf);
+    if (sb->is_nds)
+        /* nds 后端：buf 语义为已注册的 NPU device 虚拟地址 */
+        return ssd_nds_write(sb->nds, offset, len, buf);
 
     const uint8_t *p = (const uint8_t *)buf;
     uint64_t done = 0;
@@ -449,6 +543,108 @@ int ssd_backend_pwrite(SsdBackend *sb, uint64_t offset, uint64_t len,
             return UMM_E_IO;
         }
         done += (uint64_t)n;
+    }
+    return UMM_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* device 内存注册与后端级批量 I/O（nds 后端；文件后端批量为模拟通路）        */
+/* ------------------------------------------------------------------------ */
+
+int ssd_backend_register_dev_mem(SsdBackend *sb, void *dev_mem,
+                                 uint64_t aligned_size)
+{
+    if (!sb || !dev_mem || aligned_size == 0)
+        return UMM_E_INVALID_ARG;
+    if (sb->is_nds_meta) {
+        umm_log_error(
+                      "ssd_backend: nds-meta 为纯分配后端，register_dev_mem "
+                      "不受理——数据面在 worker 进程（nds: 后端）");
+        return UMM_E_UNSUPPORTED;
+    }
+    if (!sb->is_nds) {
+        umm_log_error(
+                      "ssd_backend: register_dev_mem 仅 nds 后端支持 "
+                      "(device=%s)", sb->device_path);
+        return UMM_E_INVALID_ARG;
+    }
+    return ssd_nds_register_mem(sb->nds, dev_mem, aligned_size);
+}
+
+/* 后端级 batch 逐 iov 越界校验（对全部后端统一前置，文件后端双保险
+ * ——其模拟通路内的 pread/pwrite 还会再查一次）。
+ * 防溢出写法：不做 offset+length 加法，避免回绕绕过校验 */
+static int ssd_backend_batch_check_bounds(SsdBackend *sb,
+                                          const UmmNdsIOVec *iovs,
+                                          size_t n_iov,
+                                          const char *what)
+{
+    for (size_t i = 0; i < n_iov; i++) {
+        if (iovs[i].length > sb->capacity ||
+            iovs[i].offset > sb->capacity - iovs[i].length) {
+            umm_log_error(
+                          "ssd_backend: %s iov[%zu] 越界 "
+                          "(offset=%lu, length=%lu, capacity=%lu)",
+                          what, i,
+                          (unsigned long)iovs[i].offset,
+                          (unsigned long)iovs[i].length,
+                          (unsigned long)sb->capacity);
+            return UMM_E_INVALID_ARG;
+        }
+    }
+    return UMM_OK;
+}
+
+int ssd_backend_batch_read(SsdBackend *sb, UmmNdsIOVec *iovs, size_t n_iov)
+{
+    if (!sb || (!iovs && n_iov > 0))
+        return UMM_E_INVALID_ARG;
+    int rc = ssd_backend_batch_check_bounds(sb, iovs, n_iov,
+                                            "batch_read");
+    if (rc != UMM_OK)
+        return rc;
+    if (sb->is_nds_meta) {
+        umm_log_error(
+                      "ssd_backend: nds-meta 为纯分配后端，batch_read "
+                      "不受理——数据面在 worker 进程（nds: 后端）");
+        return UMM_E_UNSUPPORTED;
+    }
+    if (sb->is_nds)
+        return ssd_nds_batch_read(sb->nds, iovs, n_iov);
+    /* 文件后端：pread 逐 iov 循环模拟（vaddr 为 host buffer），
+     * 便于无 NPU 环境测试池级批量通路 */
+    for (size_t i = 0; i < n_iov; i++) {
+        rc = ssd_backend_pread(sb, iovs[i].offset, iovs[i].length,
+                               iovs[i].vaddr);
+        if (rc != UMM_OK)
+            return rc;
+    }
+    return UMM_OK;
+}
+
+int ssd_backend_batch_write(SsdBackend *sb, const UmmNdsIOVec *iovs,
+                            size_t n_iov)
+{
+    if (!sb || (!iovs && n_iov > 0))
+        return UMM_E_INVALID_ARG;
+    int rc = ssd_backend_batch_check_bounds(sb, iovs, n_iov,
+                                            "batch_write");
+    if (rc != UMM_OK)
+        return rc;
+    if (sb->is_nds_meta) {
+        umm_log_error(
+                      "ssd_backend: nds-meta 为纯分配后端，batch_write "
+                      "不受理——数据面在 worker 进程（nds: 后端）");
+        return UMM_E_UNSUPPORTED;
+    }
+    if (sb->is_nds)
+        return ssd_nds_batch_write(sb->nds, iovs, n_iov);
+    /* 文件后端：pwrite 逐 iov 循环模拟 */
+    for (size_t i = 0; i < n_iov; i++) {
+        int rc = ssd_backend_pwrite(sb, iovs[i].offset, iovs[i].length,
+                                    iovs[i].vaddr);
+        if (rc != UMM_OK)
+            return rc;
     }
     return UMM_OK;
 }
@@ -893,4 +1089,119 @@ int ssd_pool_pwrite(SsdPool *pool, uint64_t voffset, uint64_t len,
                     const void *buf)
 {
     return ssd_pool_io(pool, voffset, len, (void *)buf, 1);
+}
+
+/* ------------------------------------------------------------------------ */
+/* ssd_pool_register_dev_mem / 池级批量 I/O                                   */
+/* ------------------------------------------------------------------------ */
+
+int ssd_pool_register_dev_mem(SsdPool *pool, void *dev_mem,
+                              uint64_t aligned_size)
+{
+    if (!pool || !dev_mem || aligned_size == 0)
+        return UMM_E_INVALID_ARG;
+
+    /* 向池内所有 nds 设备转发 register（非 nds 设备跳过） */
+    int nds_seen = 0;
+    for (uint32_t i = 0; i < pool->num_devices; i++) {
+        SsdBackend *sb = pool->devices[i].backend;
+        if (!sb->is_nds)
+            continue;
+        nds_seen = 1;
+        int rc = ssd_backend_register_dev_mem(sb, dev_mem, aligned_size);
+        if (rc != UMM_OK)
+            return rc;
+    }
+    if (!nds_seen) {
+        umm_log_error(
+                      "ssd_pool: register_dev_mem 失败：池内无 nds 设备");
+        return UMM_E_INVALID_ARG;
+    }
+    return UMM_OK;
+}
+
+static int ssd_pool_batch_io(SsdPool *pool, const UmmNdsIOVec *iovs,
+                             size_t n_iov, int is_write)
+{
+    if (!pool || (!iovs && n_iov > 0))
+        return UMM_E_INVALID_ARG;
+    if (n_iov == 0)
+        return UMM_OK;          /* no-op */
+
+    /* 内部拷贝临时数组改写 offset，不得修改调用方 iov 数组 */
+    UmmNdsIOVec *tmp = malloc(n_iov * sizeof(*tmp));
+    uint32_t *dev_of = malloc(n_iov * sizeof(*dev_of));
+    if (!tmp || !dev_of) {
+        free(tmp);
+        free(dev_of);
+        return UMM_E_NO_MEMORY;
+    }
+    memcpy(tmp, iovs, n_iov * sizeof(*tmp));
+
+    /* 先全量校验（translate + 单设备内），全部通过后才下发 I/O，
+     * 避免部分 iov 已落盘才报错 */
+    for (size_t i = 0; i < n_iov; i++) {
+        if (!tmp[i].vaddr || tmp[i].length == 0) {
+            umm_log_error(
+                          "ssd_pool: batch iov[%zu] invalid vaddr/length",
+                          i);
+            free(tmp);
+            free(dev_of);
+            return UMM_E_INVALID_ARG;
+        }
+        uint32_t dev_idx;
+        uint64_t poff;
+        int rc = ssd_pool_translate(pool, tmp[i].offset, &dev_idx, &poff);
+        if (rc != UMM_OK) {
+            free(tmp);
+            free(dev_of);
+            return rc;
+        }
+        SsdDevice *dev = &pool->devices[dev_idx];
+        if (poff + tmp[i].length > dev->capacity) {
+            umm_log_error(
+                          "ssd_pool: batch iov[%zu] 跨设备（voff=%lu, "
+                          "len=%lu），调用方须按设备边界切分", i,
+                          (unsigned long)tmp[i].offset,
+                          (unsigned long)tmp[i].length);
+            free(tmp);
+            free(dev_of);
+            return UMM_E_INVALID_ARG;
+        }
+        tmp[i].offset = poff;       /* 池虚拟偏移 → 设备物理偏移 */
+        dev_of[i]     = dev_idx;
+    }
+
+    /* 按设备连续段分组下发（同设备相邻 iov 合并为一次后端批量调用） */
+    size_t i = 0;
+    while (i < n_iov) {
+        size_t j = i + 1;
+        while (j < n_iov && dev_of[j] == dev_of[i])
+            j++;
+        SsdBackend *sb = pool->devices[dev_of[i]].backend;
+        int rc = is_write
+            ? ssd_backend_batch_write(sb, tmp + i, j - i)
+            : ssd_backend_batch_read (sb, tmp + i, j - i);
+        if (rc != UMM_OK) {
+            free(tmp);
+            free(dev_of);
+            return rc;
+        }
+        i = j;
+    }
+
+    free(tmp);
+    free(dev_of);
+    return UMM_OK;
+}
+
+int ssd_pool_batch_read(SsdPool *pool, UmmNdsIOVec *iovs, size_t n_iov)
+{
+    return ssd_pool_batch_io(pool, iovs, n_iov, 0);
+}
+
+int ssd_pool_batch_write(SsdPool *pool, const UmmNdsIOVec *iovs,
+                         size_t n_iov)
+{
+    return ssd_pool_batch_io(pool, iovs, n_iov, 1);
 }

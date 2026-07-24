@@ -28,6 +28,11 @@
 struct TierRouter {
     MemoryTransportVtbl *tier_vtbls[UMM_NUM_TIERS];  /* one per tier */
     void                *tier_ctxs[UMM_NUM_TIERS];   /* matching ctx  */
+    /* tier_local_unsupported[t] != 0: 该 tier 的本地数据面被有意跳过
+     *（nds: 直驱设备——数据面由 worker 直连池 API 持有），
+     * get/put 返回 UMM_E_UNSUPPORTED 而非笼统的 INVALID_ARG */
+    uint8_t              tier_local_unsupported[UMM_NUM_TIERS];
+    char                 tier_unsupported_path[UMM_NUM_TIERS][256];
     MemoryTransportVtbl  router_vtbl;                /* exported interface */
     pthread_mutex_t      lock;
 };
@@ -56,13 +61,32 @@ static inline void* resolve_ctx(TierRouter *tr, gpa_t gpa)
 /* Data path — get / put                                               */
 /* ------------------------------------------------------------------ */
 
+/* 该 gpa 所属 tier 是否被有意跳过本地数据面（nds: 直驱设备）。
+ * 是则记录清晰日志并返回 UMM_E_UNSUPPORTED；否则返回 0 让调用者走
+ * 既有 INVALID_ARG 路径（行为不变）。 */
+static int tier_local_unsupported_err(TierRouter *tr, gpa_t gpa,
+                                      const char *op)
+{
+    tier_id_t t = gpa_to_tier(gpa);
+    if (t < UMM_NUM_TIERS && tr->tier_local_unsupported[t]) {
+        umm_log_error("tier_router: %s 到 tier %d 不受理——客户端本地数据面"
+                      "已跳过 NDS 直驱设备 %s（数据面由 worker 直连池 API "
+                      "持有，分配走 RPC）",
+                      op, (int)t, tr->tier_unsupported_path[t]);
+        return UMM_E_UNSUPPORTED;
+    }
+    return 0;
+}
+
 static int router_get(void *ctx, gpa_t gpa, uint64_t len, void *out_buf)
 {
     TierRouter *tr  = ctx;
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
-    if (!v || !v->get)
-        return UMM_E_INVALID_ARG;
+    if (!v || !v->get) {
+        int urc = tier_local_unsupported_err(tr, gpa, "read_chunk");
+        return urc ? urc : UMM_E_INVALID_ARG;
+    }
     return v->get(c, gpa, len, out_buf);
 }
 
@@ -71,8 +95,10 @@ static int router_put(void *ctx, gpa_t gpa, uint64_t len, const void *buf)
     TierRouter *tr  = ctx;
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
-    if (!v || !v->put)
-        return UMM_E_INVALID_ARG;
+    if (!v || !v->put) {
+        int urc = tier_local_unsupported_err(tr, gpa, "write_chunk");
+        return urc ? urc : UMM_E_INVALID_ARG;
+    }
     return v->put(c, gpa, len, buf);
 }
 
@@ -219,6 +245,20 @@ void tier_router_destroy(TierRouter *tr)
     if (!tr)
         return;
     router_deinit(tr);
+}
+
+void tier_router_mark_local_unsupported(TierRouter *tr, tier_id_t tier,
+                                        const char *device_path)
+{
+    if (!tr || tier >= UMM_NUM_TIERS)
+        return;
+    tr->tier_local_unsupported[tier] = 1;
+    if (device_path) {
+        strncpy(tr->tier_unsupported_path[tier], device_path,
+                sizeof(tr->tier_unsupported_path[tier]) - 1);
+        tr->tier_unsupported_path[tier]
+            [sizeof(tr->tier_unsupported_path[tier]) - 1] = '\0';
+    }
 }
 
 struct MemoryTransportVtbl* tier_router_get_vtbl(TierRouter *tr)

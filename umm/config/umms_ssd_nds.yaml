@@ -1,0 +1,127 @@
+# umms — 内存服务配置（真实 SSD tier，NDS NPU2SSD 直驱后端）
+# ======================================================================
+# 启动方式:
+#   export UMM_NDS_PATH=/path/to/libnds_aiv.so
+#   export LD_LIBRARY_PATH=<NDS 传递依赖所在目录>:$LD_LIBRARY_PATH
+#   ./umms -c config/umms_ssd_nds.yaml
+#
+# 数据安全（务必阅读）:
+#   设备路径必须带 "+<base_off>" 窗口后缀！窗口外的盘区域（含 LBA0）
+#   不会被触碰。下例窗口 = [1GB, 1GB+16GB)。
+#   调整窗口时同步修改 base_off 与 size（size = 窗口大小）。
+#
+# NDS 后端约束（与 libnvm 的差异）:
+#   - 数据通路为 NPU device 内存：I/O 前必须注册 device 内存段
+#     （ssd_pool_register_dev_mem / ssd_backend_register_dev_mem），
+#     未注册的读写一律拒绝。支持多段注册（至多 16 段，与 NDS 提供方
+#     测试代码的连续多段 nds_register 用法一致）；单条 IO 的 vaddr
+#     必须完整落在某一个段内（跨段拒绝）。建议用
+#     aclrtMalloc(ACL_MEM_MALLOC_HUGE_ONLY) 分配注册段（提供方
+#     测试代码即用 HUGE 页）。
+#   - offset/len 必须按 page_size 对齐（缺省 4096）；
+#     单次 I/O 上限 = UMM_NDS_MAX_IO（缺省 1MB，保守可调——提供方
+#     样例 per-iov 为 8192，真实上限待库方文档确认），超限由后端
+#     自动分段（batch 接口不分段，逐 iov 须 <= max_io）。
+#   - NDS 全部接口 void 返回：无法在调用后感知错误，运行期错误
+#     只能依赖 NDS 侧自身日志排查。
+#   - NDS 无容量查询接口，size 必须显式给出。
+#   - 运行参数环境变量（缺省值）:
+#       UMM_NDS_QUEUE_DEPTH(64) UMM_NDS_CORE_NUM(1，库当前单 qp)
+#       UMM_NDS_PAGE_SIZE(4096) UMM_NDS_MAX_PAGE_NUM(7340032)
+#       UMM_NDS_MAX_IO(1048576)
+#     注意 UMM_NDS_MAX_PAGE_NUM 是 NDS 内部 IO 跟踪资源池规模
+#     （对齐提供方测试代码 1024*1024*7，支撑 ~10000 iov 在途），
+#     不是单次 IO 上限。
+#
+# 未声明依赖（真机已知问题）:
+#   若 dlopen 报 "undefined symbol"（如 libnds_aiv.so 引用了
+#   libread-write_kernel.so 的 readwrite_demo 但 DT_NEEDED 未声明它），
+#   LD_LIBRARY_PATH 无法解决未声明依赖，两种解法：
+#     1) 根治：export UMM_NDS_PRELOAD=/path/libread-write_kernel.so
+#        （冒号分隔可预载多个；RTLD_NOW|RTLD_GLOBAL 预载，失败 fail-fast）
+#     2) 兜底：后端会自动回退 RTLD_LAZY 懒加载（打 WARN），运行期真实
+#        调用到未定义符号会在调用点崩溃，仅应急使用。
+#   定位方法: ldd -r /path/libnds_aiv.so 查全部未定义符号；在提供方
+#   库目录用 nm -D --defined-only 定位符号定义在哪个库后预载。
+#
+# 双进程架构 / RPC context 引导（真机必读）:
+#   真实 libnds_aiv.so 内部复用 nvm_host 的 admin queue。提供方为双
+#   进程架构：Process A（RPC server，持有 NVMe 控制器）与 NDS 客户端
+#   进程分离，客户端必须先建立 RPC context 再 nds_init，否则 nds_init
+#   内 nvm_host_admin_cq_create 报 "no RPC context" 失败。
+#   UMM 侧用 UMM_NDS_RPC_SOCKET 触发自动引导（首个 open 在 nds_init
+#   之前执行 nvm_host_bind_remote + nvm_host_set_rpc_context，
+#   符号解析先 libnds_aiv.so 句柄再 RTLD_DEFAULT 全局命名空间）：
+#     # 1. 先启动 Process A（本仓库配套守护进程，三进程部署形态：
+#     #    umm_nds_rpc_server → ummD/umms → 客户端）：
+#     make tools
+#     UMM_LIBNVM_PATH=/path/libnvm_host.so \
+#       ./bin/umm_nds_rpc_server --ctrl /dev/libnvm_helper0 --ns 1 \
+#       --qd 64 --socket /tmp/nvm_host_rpc.sock &
+#     #    （env 等价物 UMM_NVM_CTRL/UMM_NVM_NS/UMM_NVM_QD/
+#     #     UMM_NVM_RPC_SOCKET；stale socket 自动接管；SIGTERM 优雅退出）
+#     # 2. UMM 侧：
+#     export UMM_NDS_PRELOAD=/path/libread-write_kernel.so:/path/libnvm_host.so
+#     export UMM_NDS_PATH=/path/libnds_aiv.so
+#     export UMM_NDS_RPC_SOCKET=/tmp/nvm_host_rpc.sock
+#   不设 UMM_NDS_RPC_SOCKET 则完全走本地 admin queue 路径（旧行为，
+#   零影响）。bind 失败（RPC server 未启动）→ open 返回 UMM_E_IO；
+#   找不到 nvm_host_bind_remote/set_rpc_context 符号（libnvm_host.so
+#   未预载）→ UMM_E_NOT_FOUND。
+
+# 运维加固（NDS RPC）:
+#   Phase 1 客户端 bind 重试：env UMM_NDS_RPC_WAIT_MS（缺省 3000，
+#   0=不重试），bind 失败在预算内指数退避（50→100→…→800ms 封顶），
+#   覆盖 RPC server 启动窗口期的暂态失败。
+#   Phase 2 umms 托管拉起 RPC server（下方 nds_rpc_server_* 配置段）：
+#   部署形态从"人肉编排三进程启动顺序"演进为单命令——
+#     旧：1) 启动 umm_nds_rpc_server  2) export UMM_NDS_RPC_SOCKET
+#        3) 启动 umms（顺序/env 错一个即死）
+#     新：./umms -c config/umms_ssd_nds.yaml（umms 自动拉起 server、
+#        wait_ready、setenv UMM_NDS_RPC_SOCKET，无需手工对齐）
+#   设计取舍：库层（libumm.so）绝不拉起特权进程（多进程加载竞态/
+#   权限/生命周期倒挂），托管只在 umms 服务层。生产 systemd 部署仍
+#   建议用 unit 依赖（After=umm-nds-rpc.service）表达，托管模式面向
+#   无 systemd 的容器/手工场景。
+
+node_id: 0
+listen_addr: "0.0.0.0"
+listen_port: 20002
+memory_size: 134217728        # 128MB —— CXL/DRAM 模拟层容量
+base_gpa: 0
+
+# NDS RPC server（Process A）托管——全部可选，缺省不启用
+# nds_rpc_server_enable: true               # umms 启动时自动拉起 umm_nds_rpc_server
+# nds_rpc_server_ctrl: /dev/libnvm_helper0  # NVMe 控制器（缺省 /dev/libnvm_helper0）
+# nds_rpc_server_ns: 1                      # namespace id（缺省 1）
+# nds_rpc_server_qd: 64                     # admin queue 深度（缺省 64）
+# nds_rpc_server_socket: /tmp/nvm_host_rpc.sock  # 缺省 /tmp/nvm_host_rpc.sock；
+#                                            # UMM_NDS_RPC_SOCKET 未设置时自动
+#                                            # setenv 为该值；已设置且不一致以
+#                                            # env 为准（warn）
+# nds_rpc_server_keep_alive: true           # 缺省 true：umms 退出 server 保留；
+#                                           # false：umms 退出（含 SIGTERM/SIGINT
+#                                           # 优雅退出）时 SIGTERM 子进程
+# 相关 env：UMM_NDS_RPC_SERVER_BIN（helper 路径覆盖，缺省 umms 同目录
+# umm_nds_rpc_server，找不到则 fatal 提示 make tools）、
+# UMM_NDS_RPC_READY_TIMEOUT_MS（wait_ready 超时，缺省 10000）
+
+# SSD 设备列表（格式: "path:size,path:size,..."，后缀 G/M/K）
+# nds 路径约定: nds:<device_id>[+<base_off>]
+#   device_id 十进制 NPU 设备号
+#   base_off  窗口基址（支持 0x 十六进制），落盘偏移 = base_off + 窗口内偏移
+#   size      窗口容量（NDS 无容量查询接口，必须显式给出）
+#
+# 生产部署（双进程形态）: umms 用 nds-meta: 纯分配后端！
+#   umms 只做分配簿记，不持 NPU 设备；worker 进程（sglang/demo）是唯一
+#   NDS 客户端，本地 ssd_pool 以同窗口同容量的 "nds:" spec 直驱 DMA。
+#   若 umms 也用 "nds:"，双进程 nds_init 同一设备——RPC server 单客户
+#   端串行（qp_id 全局唯一），第二个客户端卡死 CREATE_CQ（真机实证）。
+#   nds-meta: 不 dlopen/不 nds_init/不占 RPC 连接/不 mmap，簿记语义与
+#   nds: 一致；umms 侧无需 UMM_NDS_PATH/UMM_NDS_PRELOAD/
+#   UMM_NDS_RPC_SOCKET（全在 worker 侧设置）。
+#   注意: nds_rpc_server_* 托管仅在 ssd_devices 含 "nds:" 设备时触发；
+#   umms 用 nds-meta: 时 RPC server 由 worker 侧/外部编排管理。
+ssd_devices: "nds-meta:0+0x40000000:16G"
+# 单机自测/桩库形态（umms 与客户端同进程语义，refcount 复用单例）可改用：
+# ssd_devices: "nds:0+0x40000000:16G"
