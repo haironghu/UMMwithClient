@@ -65,6 +65,11 @@ class StorageTopology(ctypes.Structure):
 
 
 class UMMConfig(ctypes.Structure):
+    """必须与 umm/include/umm.h 的 UMMConfig 布局逐字段一致。
+
+    注意：umm_init 内部 memcpy(&g_state.config, cfg, sizeof(UMMConfig))，
+    ctypes 镜像缺字段 = C 侧越界读 Python 堆（存量 bug，Phase 1 修复）。
+    改动 C 侧 UMMConfig 后必须同步本镜像并核对 sizeof。"""
     _fields_ = [
         ("transport", ctypes.c_char * 16),
         ("consistency_model", ctypes.c_char * 16),
@@ -78,7 +83,27 @@ class UMMConfig(ctypes.Structure):
         ("num_ssd_devices", ctypes.c_uint32),
         ("listen_port", ctypes.c_uint16),
         ("base_gpa", ctypes.c_uint64),
+        # ---- NDS RPC server 托管配置（仅 umms 使用；此前镜像缺失！） ----
+        ("nds_rpc_server_enable", ctypes.c_int),
+        ("nds_rpc_server_ctrl", ctypes.c_char * 256),
+        ("nds_rpc_server_ns", ctypes.c_uint32),
+        ("nds_rpc_server_qd", ctypes.c_uint32),
+        ("nds_rpc_server_socket", ctypes.c_char * 256),
+        ("nds_rpc_server_keep_alive", ctypes.c_int),
+        # ---- Phase 1: 多节点远程数据面 ----
+        ("peer_nodes", ctypes.c_char * 1024),
+        ("rpc_token", ctypes.c_char * 64),
+        ("allow_cidrs", ctypes.c_char * 512),
+        ("ssd_owner_node", ctypes.c_uint8),
+        # Phase 2 混合池：1 = 本地内存数据面注册 DRAM tier（默认 0=CXL 旧行为）
+        ("local_mem_as_dram", ctypes.c_uint8),
+        ("_reserved_phase1", ctypes.c_uint8 * 2),
+        ("data_max_io", ctypes.c_uint32),
     ]
+
+
+# ssd_owner_node 哨兵值（match include/umm.h UMM_NODE_UNKNOWN）
+UMM_NODE_UNKNOWN = 0xFF
 
 
 # Tier IDs (match include/umm.h)
@@ -186,6 +211,19 @@ class UMMLib:
         lib.umm_lookup_chunk.argtypes = [ctypes.c_char_p, ctypes.POINTER(ChunkMetadata)]
         lib.umm_lookup_chunk.restype = ctypes.c_int
 
+        # umm_fence / umm_invalidate：共享盘读共享场景的落盘与刷盘。
+        # umm_invalidate 是新符号，可选绑定（旧库返回 None 由调用方报错）。
+        lib.umm_fence.argtypes = []
+        lib.umm_fence.restype = None
+        self._fn_invalidate = getattr(lib, "umm_invalidate", None)
+        if self._fn_invalidate is not None:
+            self._fn_invalidate.argtypes = [
+                ctypes.POINTER(ChunkDescriptor),
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+            ]
+            self._fn_invalidate.restype = ctypes.c_int
+
         lib.umm_error_string.argtypes = [ctypes.c_int]
         lib.umm_error_string.restype = ctypes.c_char_p
 
@@ -274,6 +312,22 @@ class UMMLib:
         rc = self._lib.umm_free(ctypes.byref(desc))
         if rc != UMM_OK:
             raise RuntimeError(f"umm_free failed: rc={rc} ({self.errstr(rc)})")
+
+    def fence(self) -> None:
+        """落盘屏障：CPU 屏障 + SSD 数据面 msync(MS_SYNC)。"""
+        self._lib.umm_fence()
+
+    def invalidate(self, desc: ChunkDescriptor, offset: int, size: int) -> None:
+        """丢弃对 chunk 区域的缓存页视图（共享盘读共享：对端落盘后本端刷盘）。"""
+        if self._fn_invalidate is None:
+            raise RuntimeError(
+                "当前 libumm.so 未导出 umm_invalidate（需较新版本 UMM）"
+            )
+        rc = self._fn_invalidate(ctypes.byref(desc), offset, size)
+        if rc != UMM_OK:
+            raise RuntimeError(
+                f"umm_invalidate failed: rc={rc} ({self.errstr(rc)})"
+            )
 
     def read(self, desc: ChunkDescriptor, offset: int, size: int) -> bytes:
         buf = ctypes.create_string_buffer(size)

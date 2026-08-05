@@ -34,6 +34,13 @@ int64_t  proto_read_i64(const uint8_t *buf, size_t *pos);
 /* Read max_len bytes, always NUL-terminate out (max_len chars + '\0') */
 void proto_read_str(const uint8_t *buf, size_t *pos, char *out, size_t max_len);
 
+/* ------------------------------------------------------------------ */
+/* Token digest（Phase 1 鉴权）                                         */
+/* FNV-1a 64-bit 摘要的低 6 字节，填入 UmmProtoHeader.reserved[6]。     */
+/* token 为 NULL/空串 时输出全 0（= 未启用鉴权的旧客户端线格式）。        */
+/* ------------------------------------------------------------------ */
+void umm_token_digest(const char *token, uint8_t out6[6]);
+
 #ifdef __cplusplus
 }
 #endif

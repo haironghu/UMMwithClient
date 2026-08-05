@@ -24,6 +24,12 @@ enum {
     MEM_OP_GET_TIER_STATS   = 7,   /* tier(u8) */
     MEM_OP_REGISTER_STORAGE = 8,   /* StorageResource serialized */
     MEM_OP_GET_TOPOLOGY     = 9,   /* no request body */
+    /* --- Phase 1: 跨节点数据面（payload 走流式传输，不占 4KB body） --- */
+    MEM_OP_DATA_READ        = 10,  /* req: gpa(u64)+len(u64)；
+                                      resp: status(i32)+len(u64)，随后 len 字节
+                                      原始数据流（仅 status==OK 时存在） */
+    MEM_OP_DATA_WRITE       = 11,  /* req: gpa(u64)+len(u64)，随后 len 字节
+                                      原始数据流；resp: status(i32) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -121,6 +127,12 @@ int mem_pack_alloc_tiered(uint8_t tier, uint64_t size, uint32_t flags, UmmProtoB
 int mem_unpack_alloc_tiered(const UmmProtoBody *body, MemAllocTieredReq *out);
 int mem_unpack_alloc_tiered_resp(const UmmProtoBody *body, MemAllocTieredResp *out);
 
+/* v2：新服务端响应追加属主 node(u8)（13 字节）；旧服务端 12 字节时
+ * *out_owner 置 UMM_NODE_UNKNOWN(0xFF)，由调用方按配置回退。 */
+int mem_unpack_alloc_tiered_resp2(const UmmProtoBody *body,
+                                  MemAllocTieredResp *out,
+                                  uint8_t *out_owner);
+
 /* ------------------------------------------------------------------ */
 /* Pack / Unpack — Tiered free                                        */
 /* ------------------------------------------------------------------ */
@@ -146,6 +158,17 @@ int mem_unpack_register_storage(const UmmProtoBody *body, StorageResource *out);
 int mem_pack_get_topology(UmmProtoBody *body);
 int mem_pack_get_topology_resp(const StorageTopology *topo, UmmProtoBody *body);
 int mem_unpack_get_topology_resp(const UmmProtoBody *body, StorageTopology *out);
+
+/* ------------------------------------------------------------------ */
+/* Pack / Unpack — Phase 1 数据面 op                                   */
+/* 请求 body 固定 16 字节：gpa(u64) + len(u64)；payload 流式跟随。      */
+/* ------------------------------------------------------------------ */
+int mem_pack_data_req(gpa_t gpa, uint64_t len, UmmProtoBody *body);
+int mem_unpack_data_req(const UmmProtoBody *body, gpa_t *out_gpa,
+                        uint64_t *out_len);
+/* DATA_READ 响应 body：status(i32) + len(u64) = 12 字节 */
+int mem_unpack_data_read_resp(const UmmProtoBody *body, int32_t *out_status,
+                              uint64_t *out_len);
 
 #ifdef __cplusplus
 }

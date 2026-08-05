@@ -18,7 +18,17 @@ typedef struct {
     int       port;
     int       sock;
     pthread_mutex_t lock;
+    /* Phase 1 鉴权：header.reserved[6] 填充的 FNV-1a 摘要（token_on=0 时全 0） */
+    int       token_on;
+    uint8_t   token[6];
 } MemRpcClient;
+
+/* Phase 1 扩展接口前向声明（定义见本文件下部） */
+int mem_rpc_client_init_ex(MemRpcClient *client, const char *host, int port,
+                           const char *rpc_token);
+int mem_rpc_alloc_tiered2(MemRpcClient *c, tier_id_t tier, uint64_t size,
+                          uint32_t flags, uint64_t *out_offset,
+                          uint8_t *out_owner);
 
 /* ========================================================================
  * Internal helpers
@@ -75,6 +85,8 @@ static int memrpc_do_call(MemRpcClient *c, uint8_t opcode,
     hdr.opcode   = opcode;
     hdr.flags    = UMM_FLAG_REQUEST;
     hdr.body_len = req_body ? req_body->len : 0;
+    if (c->token_on)
+        memcpy(hdr.reserved, c->token, sizeof(hdr.reserved));
 
     rc = umm_tcp_send(c->sock, &hdr, sizeof(hdr));
     if (rc != UMM_OK) {
@@ -132,6 +144,12 @@ static int memrpc_do_call(MemRpcClient *c, uint8_t opcode,
 
 int mem_rpc_client_init(MemRpcClient *client, const char *host, int port)
 {
+    return mem_rpc_client_init_ex(client, host, port, NULL);
+}
+
+int mem_rpc_client_init_ex(MemRpcClient *client, const char *host, int port,
+                           const char *rpc_token)
+{
     if (!client || !host || port <= 0 || port > 65535)
         return UMM_E_INVALID_ARG;
 
@@ -146,6 +164,11 @@ int mem_rpc_client_init(MemRpcClient *client, const char *host, int port)
     client->port = port;
     client->sock = -1;
     pthread_mutex_init(&client->lock, NULL);
+
+    if (rpc_token && rpc_token[0] != '\0') {
+        umm_token_digest(rpc_token, client->token);
+        client->token_on = 1;
+    }
 
     return UMM_OK;
 }
@@ -298,8 +321,18 @@ int mem_rpc_get_stats(MemRpcClient *c, uint64_t *total, uint64_t *used,
 int mem_rpc_alloc_tiered(MemRpcClient *c, tier_id_t tier, uint64_t size,
                          uint32_t flags, uint64_t *out_offset)
 {
+    return mem_rpc_alloc_tiered2(c, tier, size, flags, out_offset, NULL);
+}
+
+int mem_rpc_alloc_tiered2(MemRpcClient *c, tier_id_t tier, uint64_t size,
+                          uint32_t flags, uint64_t *out_offset,
+                          uint8_t *out_owner)
+{
     if (!c || !out_offset || size == 0 || tier >= UMM_NUM_TIERS)
         return UMM_E_INVALID_ARG;
+
+    if (out_owner)
+        *out_owner = UMM_NODE_UNKNOWN;
 
     pthread_mutex_lock(&c->lock);
 
@@ -319,7 +352,7 @@ int mem_rpc_alloc_tiered(MemRpcClient *c, tier_id_t tier, uint64_t size,
     }
 
     MemAllocTieredResp resp;
-    rc = mem_unpack_alloc_tiered_resp(&resp_body, &resp);
+    rc = mem_unpack_alloc_tiered_resp2(&resp_body, &resp, out_owner);
     if (rc != UMM_OK) {
         pthread_mutex_unlock(&c->lock);
         return rc;

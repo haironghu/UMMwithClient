@@ -35,6 +35,7 @@ PROTOCOL_SRC := \
 TRANSPORT_SRC := \
     transport_local.c \
     transport_ssd.c \
+    transport_remote.c \
     ssd_pool.c \
     ssd_backend_libnvm.c \
     ssd_backend_nds.c \
@@ -267,6 +268,7 @@ TEST_INTEGRATION_OBJ := \
     $(BUILD_DIR)/umm_descriptor.o \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/transport_ssd.o \
+    $(BUILD_DIR)/transport_remote.o \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
@@ -310,6 +312,7 @@ $(BIN_DIR)/test_cxl: $(TEST_DIR)/test_cxl.c $(TEST_CXL_OBJ) | dirs
 # Multi-tier test
 TEST_TIER_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
+    $(BUILD_DIR)/transport_remote.o \
     $(BUILD_DIR)/ssd_pool.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
@@ -336,6 +339,18 @@ TEST_TIER_OBJ := \
 
 $(BIN_DIR)/test_tier: $(TEST_DIR)/test_tier.c $(TEST_TIER_OBJ) | dirs
 	$(CC) $(CFLAGS) $< $(TEST_TIER_OBJ) -o $@ $(LDFLAGS)
+
+# Phase 1 远程数据面单元测试（ACL/token/CIS 静态表/tier_router node 位分派）
+TEST_REMOTE_PHASE1_OBJ := \
+    $(BUILD_DIR)/umm_network.o \
+    $(BUILD_DIR)/protocol_common.o \
+    $(BUILD_DIR)/cis_router.o \
+    $(BUILD_DIR)/tier_router.o \
+    $(BUILD_DIR)/error_codes.o \
+    $(BUILD_DIR)/log.o
+
+$(BIN_DIR)/test_remote_phase1: $(TEST_DIR)/test_remote_phase1.c $(TEST_REMOTE_PHASE1_OBJ) | dirs
+	$(CC) $(CFLAGS) $< $(TEST_REMOTE_PHASE1_OBJ) -o $@ $(LDFLAGS)
 
 TEST_SSD_DIST_OBJ := $(TEST_TIER_OBJ)
 
@@ -394,7 +409,8 @@ TEST_BINS := \
       $(BIN_DIR)/test_ssd_multi_device $(BIN_DIR)/test_rw \
       $(BIN_DIR)/test_p0_concurrent $(BIN_DIR)/test_ssd_pool_io \
       $(BIN_DIR)/test_ssd_libnvm $(BIN_DIR)/test_ssd_nds \
-      $(BIN_DIR)/test_nds_rpc_disconnect
+      $(BIN_DIR)/test_nds_rpc_disconnect \
+      $(BIN_DIR)/test_remote_phase1
 
 # 只编译测试二进制，不运行（CI 构建/交叉编译场景用）
 test-build: dirs $(TEST_BINS)
@@ -431,6 +447,8 @@ test: test-build
 	@$(BIN_DIR)/test_p0_concurrent
 	@echo ""
 	@$(BIN_DIR)/test_ssd_pool_io
+	@echo ""
+	@$(BIN_DIR)/test_remote_phase1
 	@echo ""
 	@cd $(BIN_DIR) && env -u UMM_TEST_LIBNVM_CTRL -u UMM_TEST_LIBNVM_OFF \
 	      -u UMM_TEST_LIBNVM_INITONLY \

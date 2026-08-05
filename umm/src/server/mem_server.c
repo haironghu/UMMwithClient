@@ -55,9 +55,20 @@ static void mem_srv_log(int level, const char *file, int line,
 
 extern int mem_service_rpc_handle(int client_sock, void *ctx,
                                    MemoryServiceVtbl *vtbl);
+extern void mem_rpc_server_configure(node_id_t node_id,
+                                     const char *rpc_token,
+                                     uint32_t data_max_io);
 extern MemoryServiceVtbl* mem_service_direct_create(node_id_t node_id,
                                                      uint64_t memory_size,
                                                      uint64_t base_gpa,
+                                                     void **out_ctx);
+/* Phase 2 混合池：内存层 tier 可选（CXL 默认 / DRAM 无 CXL 硬件）；
+ * Phase 2.5：mem_device 可选内存层后备设备（共享内存窗口） */
+extern MemoryServiceVtbl* mem_service_direct_create_tiered(node_id_t node_id,
+                                                     uint64_t memory_size,
+                                                     uint64_t base_gpa,
+                                                     tier_id_t tier,
+                                                     const char *mem_device,
                                                      void **out_ctx);
 extern void mem_service_direct_destroy(void *ctx);
 
@@ -79,6 +90,10 @@ struct MemServer {
     char                bind_addr[64];
     int                 port;
     int                 listen_sock;
+    node_id_t           node_id;
+
+    /* Phase 1 安全：accept 白名单（空串 = 全放行） */
+    char                allow_cidrs[512];
 
     /* Service implementation */
     MemoryServiceVtbl  *vtbl;
@@ -153,6 +168,16 @@ static void* mem_accept_thread(void *arg)
             continue;
         }
 
+        /* Phase 1：CIDR 白名单——未命中即断开（数据面 op 上线后，
+         * 端口能力 = 整盘读写，必须在最外层拦截） */
+        if (srv->allow_cidrs[0] != '\0' &&
+            !umm_net_acl_match(srv->allow_cidrs, client_addr)) {
+            MEM_LOG_WARN("mem_server: client %s rejected by ACL (%s)",
+                         client_addr, srv->allow_cidrs);
+            umm_tcp_close(csock);
+            continue;
+        }
+
         /* Find a free slot in the client thread array */
         pthread_mutex_lock(&srv->client_list_lock);
         if (srv->thread_count >= MEM_SERVER_MAX_THREADS) {
@@ -217,9 +242,13 @@ static void* mem_accept_thread(void *arg)
 /* Public API                                                           */
 /* ==================================================================== */
 
-MemServer* mem_server_create(const char *bind_addr, int port,
+/* create_impl — 全参数内部实现；mem_tier 选择内存层注册为 CXL（默认）
+ * 还是 DRAM（Phase 2 混合池，无 CXL 硬件场景）；
+ * mem_device 为内存层后备设备（Phase 2.5 共享内存窗口，NULL=旧行为）。 */
+static MemServer* create_impl(const char *bind_addr, int port,
                               node_id_t node_id, uint64_t memory_size,
-                              uint64_t base_gpa,
+                              uint64_t base_gpa, tier_id_t mem_tier,
+                              const char *mem_device,
                               const char *ssd_backend_dir)
 {
     if (!bind_addr || port <= 0 || port > 65535 || memory_size == 0)
@@ -234,15 +263,18 @@ MemServer* mem_server_create(const char *bind_addr, int port,
     srv->port        = port;
     srv->listen_sock = -1;
     srv->running     = 0;
+    srv->node_id     = node_id;
 
     if (pthread_mutex_init(&srv->client_list_lock, NULL) != 0) {
         free(srv);
         return NULL;
     }
 
-    /* Create the memory service implementation */
-    srv->vtbl = mem_service_direct_create(node_id, memory_size, base_gpa,
-                                          &srv->service_ctx);
+    /* Create the memory service implementation（按 mem_tier 注册内存层） */
+    srv->vtbl = mem_service_direct_create_tiered(node_id, memory_size,
+                                                 base_gpa, mem_tier,
+                                                 mem_device,
+                                                 &srv->service_ctx);
     if (!srv->vtbl || !srv->service_ctx) {
         MEM_LOG_ERROR("mem_server: failed to create memory service");
         pthread_mutex_destroy(&srv->client_list_lock);
@@ -291,21 +323,32 @@ MemServer* mem_server_create(const char *bind_addr, int port,
     return srv;
 }
 
+MemServer* mem_server_create(const char *bind_addr, int port,
+                              node_id_t node_id, uint64_t memory_size,
+                              uint64_t base_gpa,
+                              const char *ssd_backend_dir)
+{
+    return create_impl(bind_addr, port, node_id, memory_size, base_gpa,
+                       UMM_TIER_CXL, NULL, ssd_backend_dir);
+}
+
 /* ======================================================================== */
 /* mem_server_create_multi — Create with explicit multi-device list         */
 /* ======================================================================== */
 
-MemServer* mem_server_create_multi(const char *bind_addr, int port,
+/* Internal: multi-device create with selectable memory tier */
+static MemServer* create_multi_impl(const char *bind_addr, int port,
                                     node_id_t node_id, uint64_t memory_size,
-                                    uint64_t base_gpa,
+                                    uint64_t base_gpa, tier_id_t mem_tier,
+                                    const char *mem_device,
                                     const char *ssd_backend_dir,
                                     const void *ssd_devices_void,
                                     uint32_t num_ssd_devices)
 {
-    /* First create with basic SSD backend (handles CXL tier) */
-    MemServer *srv = mem_server_create(bind_addr, port, node_id,
-                                        memory_size, base_gpa,
-                                        ssd_backend_dir);
+    /* First create with basic SSD backend (registers memory tier) */
+    MemServer *srv = create_impl(bind_addr, port, node_id,
+                                  memory_size, base_gpa, mem_tier,
+                                  mem_device, ssd_backend_dir);
     if (!srv)
         return NULL;
 
@@ -339,6 +382,36 @@ MemServer* mem_server_create_multi(const char *bind_addr, int port,
     }
 
     return srv;
+}
+
+MemServer* mem_server_create_multi(const char *bind_addr, int port,
+                                    node_id_t node_id, uint64_t memory_size,
+                                    uint64_t base_gpa,
+                                    const char *ssd_backend_dir,
+                                    const void *ssd_devices_void,
+                                    uint32_t num_ssd_devices)
+{
+    return create_multi_impl(bind_addr, port, node_id, memory_size, base_gpa,
+                             UMM_TIER_CXL, NULL, ssd_backend_dir,
+                             ssd_devices_void, num_ssd_devices);
+}
+
+/* Phase 2 混合池：内存层 tier 可选（UMM_TIER_DRAM = 无 CXL 硬件场景，
+ * 注册即 malloc 后备；UMM_TIER_CXL = 默认旧行为）。
+ * Phase 2.5：mem_device = 内存层后备设备（共享内存窗口，如 /dev/pmem0；
+ * NULL = 旧行为）。 */
+MemServer* mem_server_create_multi_tiered(const char *bind_addr, int port,
+                                           node_id_t node_id,
+                                           uint64_t memory_size,
+                                           uint64_t base_gpa,
+                                           tier_id_t mem_tier,
+                                           const char *mem_device,
+                                           const void *ssd_devices_void,
+                                           uint32_t num_ssd_devices)
+{
+    return create_multi_impl(bind_addr, port, node_id, memory_size, base_gpa,
+                             mem_tier, mem_device, NULL,
+                             ssd_devices_void, num_ssd_devices);
 }
 
 /* ======================================================================== */
@@ -434,4 +507,31 @@ int mem_server_is_running(MemServer *srv)
     if (!srv)
         return 0;
     return srv->running;
+}
+
+/* ========================================================================
+ * Phase 1 安全接口：token 校验 + CIDR 白名单 + 数据面帧上限
+ * ======================================================================== */
+
+int mem_server_set_security(MemServer *srv, const char *rpc_token,
+                            const char *allow_cidrs, uint32_t data_max_io)
+{
+    if (!srv)
+        return UMM_E_INVALID_ARG;
+
+    if (allow_cidrs) {
+        strncpy(srv->allow_cidrs, allow_cidrs,
+                sizeof(srv->allow_cidrs) - 1);
+        srv->allow_cidrs[sizeof(srv->allow_cidrs) - 1] = '\0';
+    }
+
+    /* token / data_max_io 注入协议处理层（进程级单例） */
+    mem_rpc_server_configure(srv->node_id, rpc_token, data_max_io);
+
+    MEM_LOG_INFO("mem_server: security configured (acl=%s, token=%s, "
+                 "data_max_io=%u)",
+                 srv->allow_cidrs[0] ? srv->allow_cidrs : "(allow-all)",
+                 (rpc_token && rpc_token[0]) ? "ON" : "off",
+                 data_max_io ? data_max_io : 0);
+    return UMM_OK;
 }

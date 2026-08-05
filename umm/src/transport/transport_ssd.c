@@ -150,8 +150,40 @@ static int ssd_transport_atomic_set(void *ctx, gpa_t gpa, uint64_t value)
 
 static void ssd_transport_fence(void *ctx)
 {
-    (void)ctx;
+    SsdTransportCtx *stx = ctx;
+
+    /* CPU 屏障（原有语义） */
     __sync_synchronize();
+
+    /* 落盘（语义修正）：存储 tier 的 fence 必须含持久化——此前只有
+     * CPU 屏障，mmap 脏页仍滞留页缓存，"写完落盘"无从保证。
+     * 对文件/块设备后端做全池 msync(MS_SYNC)；无 pool（或未注册
+     * SSD tier）时退化为纯屏障。libnvm/NDS 后端无 mmap（MAP_FAILED），
+     * ssd_backend_sync 会判无效跳过——直驱设备本就 bypass 页缓存。 */
+    if (stx && stx->mem_ctx) {
+        SsdPool *pool = mem_service_direct_ssd_pool(stx->mem_ctx);
+        if (pool) {
+            int rc = ssd_pool_sync(pool, 0,
+                                   ssd_pool_total_capacity(pool));
+            if (rc != UMM_OK)
+                umm_log_warn("ssd_transport_fence: pool sync rc=%d", rc);
+        }
+    }
+}
+
+/* ssd_transport_invalidate — 丢弃 SSD 数据面的缓存页视图。
+ * 共享盘读共享场景：对端节点 umm_write + umm_fence 落盘后，本端须先
+ * invalidate 再读，否则 mmap 页缓存返回旧数据（guest 页缓存不会
+ * 自动感知另一 VM 经同一后备文件的写入）。 */
+int ssd_transport_invalidate(void *ctx, gpa_t gpa, uint64_t len)
+{
+    SsdTransportCtx *stx = ctx;
+    if (!stx || !stx->mem_ctx || len == 0)
+        return UMM_E_INVALID_ARG;
+    SsdPool *pool = mem_service_direct_ssd_pool(stx->mem_ctx);
+    if (!pool)
+        return UMM_E_UNSUPPORTED;
+    return ssd_pool_invalidate(pool, gpa_to_offset(gpa), len);
 }
 
 static void ssd_transport_barrier_all(void *ctx)
@@ -263,6 +295,81 @@ MemoryTransportVtbl* ssd_transport_create(const char *base_dir,
     strncpy(res.device_path, base_dir ? base_dir : "/tmp/umm_ssd",
             sizeof(res.device_path) - 1);
     mem_vtbl->register_storage(mem_ctx, &res);
+
+    vtbl->get              = ssd_transport_get;
+    vtbl->put              = ssd_transport_put;
+    vtbl->atomic_cas       = ssd_transport_atomic_cas;
+    vtbl->atomic_fetch_add = ssd_transport_atomic_fetch_add;
+    vtbl->atomic_set       = ssd_transport_atomic_set;
+    vtbl->fence            = ssd_transport_fence;
+    vtbl->barrier_all      = ssd_transport_barrier_all;
+    vtbl->quiet            = ssd_transport_quiet;
+    vtbl->register_node    = ssd_transport_register_node;
+    vtbl->init             = ssd_transport_init;
+    vtbl->deinit           = ssd_transport_deinit;
+
+    *out_ctx = stx;
+    return vtbl;
+}
+
+MemoryTransportVtbl* ssd_transport_create_multi(const SsdDeviceConfig *devs,
+                                                 uint32_t num_devs,
+                                                 void **out_ctx)
+{
+    if (!devs || num_devs == 0 || !out_ctx)
+        return NULL;
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < num_devs; i++)
+        total += devs[i].size;
+
+    MemoryTransportVtbl *vtbl = calloc(1, sizeof(MemoryTransportVtbl));
+    if (!vtbl)
+        return NULL;
+
+    SsdTransportCtx *stx = calloc(1, sizeof(SsdTransportCtx));
+    if (!stx) {
+        free(vtbl);
+        return NULL;
+    }
+
+    void *mem_ctx = NULL;
+    MemoryServiceVtbl *mem_vtbl = mem_service_direct_create(0, total, 0,
+                                                             &mem_ctx);
+    if (!mem_vtbl || !mem_ctx) {
+        free(stx);
+        free(vtbl);
+        return NULL;
+    }
+
+    stx->mem_vtbl = mem_vtbl;
+    stx->mem_ctx  = mem_ctx;
+    stx->my_vtbl  = vtbl;
+
+    /* 逐设备注册进同一 pool（pool 内部维护虚拟偏移拼接）；
+     * 任一失败即整体回滚——共享池实验里设备打不开必须当场暴露 */
+    for (uint32_t i = 0; i < num_devs; i++) {
+        StorageResource res = {
+            .tier        = UMM_TIER_SSD,
+            .capacity    = devs[i].size,
+            .base_offset = 0,
+            .online      = 1,
+        };
+        strncpy(res.device_path, devs[i].path,
+                sizeof(res.device_path) - 1);
+        int rc = mem_vtbl->register_storage(mem_ctx, &res);
+        if (rc != UMM_OK) {
+            umm_log_error("ssd_transport_multi: register device[%u] %s "
+                          "failed (rc=%d), rolling back",
+                          i, devs[i].path, rc);
+            mem_service_direct_destroy(mem_ctx);
+            free(stx);
+            free(vtbl);
+            return NULL;
+        }
+    }
+    umm_log_info("ssd_transport_multi: %u device(s), total=%lu MB",
+                 num_devs, (unsigned long)(total / (1024 * 1024)));
 
     vtbl->get              = ssd_transport_get;
     vtbl->put              = ssd_transport_put;

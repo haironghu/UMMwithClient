@@ -56,6 +56,33 @@ void tier_router_mark_local_unsupported(TierRouter *tr, tier_id_t tier,
                                         const char *device_path);
 
 /**
+ * tier_router_set_remote — 挂载远端数据面 transport（Phase 1）。
+ *
+ * 挂载后，get/put 先查 GPA node 位：owner != my_node 的 GPA 路由到
+ * remote transport（跨节点 RPC），owner == my_node 维持 tier 分派。
+ * 未调用本函数（remote == NULL）时行为与旧版完全一致（纯 tier 分派）。
+ * 远端原子操作不支持，明确返回 UMM_E_UNSUPPORTED。
+ *
+ * @param tr        Router 实例。
+ * @param my_node   本节点 ID。
+ * @param vtbl      远端 transport vtbl（ownership 归调用方，router 不销毁）。
+ * @param ctx       远端 transport 上下文。
+ */
+void tier_router_set_remote(TierRouter *tr, node_id_t my_node,
+                            MemoryTransportVtbl *vtbl, void *ctx);
+
+/**
+ * tier_router_set_dram — 填充 DRAM tier 槽位（Phase 2 混合池）。
+ *
+ * tier_router_create 只填 CXL/SSD 两个槽位；无 CXL 硬件的部署里，
+ * 客户端本地内存数据面（malloc 后备）应挂到 DRAM 槽位，使
+ * umm_alloc_tiered(size, UMM_TIER_DRAM) 的 GPA 数据面有处可去。
+ * ownership 归调用方，router 不销毁。
+ */
+void tier_router_set_dram(TierRouter *tr, MemoryTransportVtbl *vtbl,
+                          void *ctx);
+
+/**
  * tier_router_get_vtbl — Get the router's transport vtable.
  *
  * The returned vtable's get/put/atomic/fence will route to the correct

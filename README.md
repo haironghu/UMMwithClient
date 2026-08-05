@@ -3,6 +3,33 @@
 > 目标读者：首次部署本项目的工程师。
 > 读完可完成：编译 → 单测 → mock 全链路 → 真机 SSD tier 全链路。
 
+## 更新日志
+
+- **2026-08 Phase 1：跨节点远程数据面**（设计见 `docs/05_多节点远程数据面_规划与Phase1设计.md`）
+  - mem RPC 新增数据面 op：`MEM_OP_DATA_READ=10` / `MEM_OP_DATA_WRITE=11`（流式 payload，不占 4KB body）；此前"RPC 仅控制面"的契约自此扩展。
+  - `ALLOC_TIERED` 响应扩展为 13 字节（末字节 = 属主 node id），按 body_len 向后兼容：旧服务端 → 客户端回退 `ssd_owner_node` 配置 → `my_node_id`。
+  - GPA node 位修复：`umm_alloc_tiered` 现在填**数据属主**节点 id（旧实现填客户端自己的 `my_node_id`，跨节点会静默读错盘）。
+  - 新组件：`transport_remote`（TCP 同步数据面、按属主懒连接、≤data_max_io 分片、断连重发一次）；`tier_router` 分派前先看 node 位；`cis_router` 实做静态 peer 表（`peer_nodes` 配置）。
+  - 安全：`rpc_token`（FNV-1a 摘要，逐请求校验）+ `allow_cidrs`（accept 时 IPv4 CIDR 白名单）+ `data_max_io` 帧上限。
+  - 远端原子操作显式返回 `UMM_E_UNSUPPORTED`（Phase 1 边界）；控制面断连无自动重连（Phase 2 范围）。
+  - 配置新增：`peer_nodes` / `rpc_token` / `allow_cidrs` / `ssd_owner_node` / `data_max_io`（C 与 Python ctypes `UMMConfig` 布局一致，sizeof=7448）。
+  - 验证：`make test` 新增 `test_remote_phase1`（8 用例）；e2e `bmpclient/scripts/demo_e2e_remote_ssd.py`（R0 远程读写 / R1 并发分配 / R2a-e 负路径 / R3 重启重连）。
+  - **单节点/旧部署零行为变化**：不配置 `peer_nodes`/不挂 remote transport 时走原 tier 分派路径。
+
+- **2026-08 共享盘池实验环境**（套件见 `lab_shared_ssd/`，仿真见 `bmpclient/scripts/simulate_shared_pool.py`）
+  - 部署形态扩展：两块 SSD 经 QEMU 同时挂给两个 VM（共享盘模型）；umms 为分配权威，各 VM 本机盘直接 I/O，无跨节点读写/搬运。与 Phase 1 shared-nothing 远程数据面正交。
+  - remote transport 挂载改为**显式 opt-in**：仅当配置 `peer_nodes` 或 `ssd_owner_node` 时才挂载；零配置 RPC 部署即共享盘模型，两种形态由配置区分、不再隐式猜测。
+  - 多设备 ssd_pool 修复（共享盘实验负路径实测发现的 5 个既有 bug）：
+    1. umms 双注册：`mem_server_create_multi` 与旧 `ssd_dir` 提示重复注册同一设备 → pool 容量虚增且区间重叠；现 umms 传 NULL 关闭旧路径。
+    2. ba 分配器按首设备容量创建 → 多设备池把 >首设备容量的合法分配误判 NO_MEMORY；SSD tier 现统一走 `ssd_pool_alloc`。
+    3. `memsvc_map_device` 不做长度校验 → 跨设备 memcpy 冲出映射（SEGV，dmesg 实锤）；现按 `ssd_pool_span_in_one_device` 校验，跨界请求回退 host 路径分段 I/O。
+    4. `ssd_pool_free` 静默接受越界/重复释放 → 改为带校验的 int 返回（double-free 显式拒绝）。
+    5. mem RPC 服务端把**业务错误**（NO_MEMORY/参数非法）当连接错误关闭客户端连接 → 响应发出后业务状态只在响应体里，连接保持复用。
+  - file backend 支持块设备（ioctl BLKGETSIZE64，跳过 ftruncate）；默认仍拒绝块设备（防误写系统盘），实验/真机需显式 `UMM_ALLOW_BLOCK_DEVICE=1`。
+  - `ssd_transport_create_multi`：任一设备注册失败即整体回滚报错（旧单设备路径静默忽略 register 失败）。
+  - 客户端 `demo_shared_pool.py`：写读按 1MB piece 流式（内存与 chunk 大小无关，支持 GB 级 chunk 跨设备）；S0-S3 含负路径三件套。
+  - 验证：单机仿真 `simulate_shared_pool.py` A1-A4（双客户端并发、集群级 offset 不相交、remote transport 未挂载断言、盘上逐字节校验含跨设备分段）；Phase 1 远程 e2e R0-R3 回归全绿。
+
 ## 0. 项目结构
 
 ```
@@ -36,7 +63,7 @@ make -j
 
 ```bash
 make test
-# 预期：15 个测试程序全 PASS。
+# 预期：16 个测试程序全 PASS（含 Phase 1 新增 test_remote_phase1）。
 # 注：test_ssd_libnvm 已钉死桩库（libnvm_host.so 桩），
 #     与 shell 里是否 export 真库路径无关。
 # 注：若分区挂载 noexec，把 bin/* 复制到 /tmp 再运行。
@@ -146,3 +173,4 @@ export UMM_LIBNVM_PATH=... LD_LIBRARY_PATH=...
 | `docs/04_架构总览_数据面.md` | I/O 全旅程、双后端、锁纪律、性能档案 |
 | `docs/R6_单队列并发安全性遗留问题.md` | 并发天花板根因与单 ctx 多队列路线 |
 | `docs/真机风险分析与测试流程.md` | R1-R14 风险清单 + 五阶段验证流程 |
+| `docs/05_多节点远程数据面_规划与Phase1设计.md` | 多 Phase 集群规划 + Phase 1 协议/组件/部署/验收 |

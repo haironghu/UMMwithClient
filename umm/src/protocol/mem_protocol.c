@@ -172,11 +172,23 @@ int mem_unpack_alloc_tiered(const UmmProtoBody *body, MemAllocTieredReq *out)
 
 int mem_unpack_alloc_tiered_resp(const UmmProtoBody *body, MemAllocTieredResp *out)
 {
+    return mem_unpack_alloc_tiered_resp2(body, out, NULL);
+}
+
+int mem_unpack_alloc_tiered_resp2(const UmmProtoBody *body,
+                                  MemAllocTieredResp *out,
+                                  uint8_t *out_owner)
+{
     if (!body || !out || body->len < 12)
         return UMM_E_INVALID_ARG;
     size_t p = 0;
     out->status = proto_read_i32(body->data, &p);
     out->offset = proto_read_u64(body->data, &p);
+    if (out_owner) {
+        /* 新服务端追加属主 node(u8)（13 字节）；旧服务端 12 字节 → 未知 */
+        *out_owner = (body->len >= 13) ? proto_read_u8(body->data, &p)
+                                       : UMM_NODE_UNKNOWN;
+    }
     return UMM_OK;
 }
 
@@ -337,5 +349,42 @@ int mem_unpack_get_topology_resp(const UmmProtoBody *body, StorageTopology *out)
     for (uint32_t i = 0; i < count; i++)
         p = unpack_storage_resource(body->data, p, &out->resources[i]);
 
+    return UMM_OK;
+}
+
+/* ==================================================================== */
+/* Phase 1 数据面 op（MEM_OP_DATA_READ=10 / MEM_OP_DATA_WRITE=11）       */
+/*   请求 body：gpa(u64) + len(u64) = 16 字节；payload 流式跟随。        */
+/* ==================================================================== */
+
+int mem_pack_data_req(gpa_t gpa, uint64_t len, UmmProtoBody *body)
+{
+    size_t p = 0;
+    body_init(body);
+    proto_write_u64(body->data, &p, (uint64_t)gpa);
+    proto_write_u64(body->data, &p, len);
+    body->len = (uint16_t)p;
+    return UMM_OK;
+}
+
+int mem_unpack_data_req(const UmmProtoBody *body, gpa_t *out_gpa,
+                        uint64_t *out_len)
+{
+    if (!body || !out_gpa || !out_len || body->len < 16)
+        return UMM_E_INVALID_ARG;
+    size_t p = 0;
+    *out_gpa = (gpa_t)proto_read_u64(body->data, &p);
+    *out_len = proto_read_u64(body->data, &p);
+    return UMM_OK;
+}
+
+int mem_unpack_data_read_resp(const UmmProtoBody *body, int32_t *out_status,
+                              uint64_t *out_len)
+{
+    if (!body || !out_status || !out_len || body->len < 12)
+        return UMM_E_INVALID_ARG;
+    size_t p = 0;
+    *out_status = proto_read_i32(body->data, &p);
+    *out_len    = proto_read_u64(body->data, &p);
     return UMM_OK;
 }

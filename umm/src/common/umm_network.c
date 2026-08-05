@@ -270,3 +270,71 @@ void umm_tcp_close(int sock)
     if (sock >= 0)
         close(sock);
 }
+
+/* ========================================================================
+ * Phase 1: CIDR 白名单（accept 级拦截，IPv4）
+ * ======================================================================== */
+
+/* 解析单个 "a.b.c.d[/n]" 条目；返回 UMM_OK 时输出网络序地址与前缀长 */
+static int parse_cidr_entry(const char *entry, size_t len,
+                            uint32_t *out_net, int *out_prefix)
+{
+    char buf[64];
+    if (len == 0 || len >= sizeof(buf))
+        return UMM_E_INVALID_ARG;
+    memcpy(buf, entry, len);
+    buf[len] = '\0';
+
+    char *slash = strchr(buf, '/');
+    int prefix = 32;
+    if (slash) {
+        *slash = '\0';
+        prefix = atoi(slash + 1);
+        if (prefix < 0 || prefix > 32)
+            return UMM_E_INVALID_ARG;
+    }
+
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1)
+        return UMM_E_INVALID_ARG;
+
+    *out_net    = ntohl(a.s_addr);   /* 转主机序便于位移比较 */
+    *out_prefix = prefix;
+    return UMM_OK;
+}
+
+int umm_net_acl_match(const char *cidr_list, const char *ip)
+{
+    if (!cidr_list || cidr_list[0] == '\0')
+        return 1;   /* 无白名单 = 全放行（旧行为） */
+    if (!ip)
+        return 0;
+
+    struct in_addr ia;
+    if (inet_pton(AF_INET, ip, &ia) != 1)
+        return 0;
+    uint32_t addr = ntohl(ia.s_addr);
+
+    const char *p = cidr_list;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+
+        /* 跳过前导空白 */
+        while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
+
+        uint32_t net; int prefix;
+        if (parse_cidr_entry(p, len, &net, &prefix) == UMM_OK) {
+            uint32_t mask = (prefix == 0) ? 0u
+                          : (0xFFFFFFFFu << (32 - prefix));
+            if ((addr & mask) == (net & mask))
+                return 1;
+        }
+        /* 非法条目：不命中，继续看后续条目 */
+
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+    return 0;
+}

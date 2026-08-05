@@ -300,8 +300,86 @@ static void print_usage(const char *prog)
             "  listen_addr: \"0.0.0.0\"\n"
             "  listen_port: 20002\n"
             "  memory_size: 67108864\n"
+            "  memory_tier: \"cxl\"   # cxl(默认) / dram(Phase 2 混合池, 无 CXL 硬件)\n"
+            "  memory_device: \"/dev/pmem0\"  # 可选(Phase 2.5 共享内存窗口);\n"
+            "                                 # 不配 = malloc/mock 私有后备\n"
             "  ssd_devices: \"/data/ssd0.raw:250G,/data/ssd1.raw:250G\"\n",
             prog);
+}
+
+/* ------------------------------------------------------------------------ */
+/* memory_tier 是 umms 专属配置（不进 UMMConfig ABI），config_parser 对     */
+/* 未知 key 静默忽略，故此处自行做行级扫描。合法值：cxl(默认) / dram。       */
+/* ------------------------------------------------------------------------ */
+
+static tier_id_t parse_memory_tier_key(const char *cfg_file)
+{
+    if (!cfg_file)
+        return UMM_TIER_CXL;
+    FILE *fp = fopen(cfg_file, "r");
+    if (!fp)
+        return UMM_TIER_CXL;
+    char line[512];
+    tier_id_t tier = UMM_TIER_CXL;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "memory_tier", 11) != 0)
+            continue;
+        p += 11;
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+        /* 去引号与行尾 */
+        if (*p == '"' || *p == '\'') p++;
+        if (strncmp(p, "dram", 4) == 0)
+            tier = UMM_TIER_DRAM;
+        else if (strncmp(p, "cxl", 3) == 0)
+            tier = UMM_TIER_CXL;
+        else
+            fprintf(stderr, "umms: 未知 memory_tier 值，按 cxl 处理: %s", p);
+        break;
+    }
+    fclose(fp);
+    return tier;
+}
+
+/* ------------------------------------------------------------------------ */
+/* memory_device 同样是 umms 专属配置（行级扫描，理由同 memory_tier）。       */
+/* 内存层后备设备（Phase 2.5 共享内存窗口，如 virtio-pmem 的 /dev/pmem0）；   */
+/* 未配置返回 NULL = 旧行为（CXL mock / DRAM malloc 私有后备）。              */
+/* ------------------------------------------------------------------------ */
+
+static const char *parse_memory_device_key(const char *cfg_file,
+                                           char *out, size_t out_sz)
+{
+    if (!cfg_file || !out || out_sz == 0)
+        return NULL;
+    FILE *fp = fopen(cfg_file, "r");
+    if (!fp)
+        return NULL;
+    char line[512];
+    const char *ret = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "memory_device", 13) != 0)
+            continue;
+        p += 13;
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+        if (*p == '"' || *p == '\'') p++;
+        char *end = p;
+        while (*end && *end != '"' && *end != '\'' &&
+               *end != '\n' && *end != '\r' && *end != '#' &&
+               *end != ' ' && *end != '\t') end++;
+        size_t len = (size_t)(end - p);
+        if (len > 0 && len < out_sz) {
+            memcpy(out, p, len);
+            out[len] = '\0';
+            ret = out;
+        }
+        break;
+    }
+    fclose(fp);
+    return ret;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -442,14 +520,30 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
 
     /* ---- Create and start server ---- */
+    tier_id_t mem_tier = parse_memory_tier_key(cfg_file);
+    char mem_device_buf[256];
+    const char *mem_device = parse_memory_device_key(cfg_file,
+                                                     mem_device_buf,
+                                                     sizeof(mem_device_buf));
     MemServer *server;
     if (cfg_num_ssd > 0) {
-        server = mem_server_create_multi(bind_addr, port,
-                                          node_id, memory_size, base_gpa,
-                                          ssd_dir,
-                                          cfg.ssd_devices, cfg_num_ssd);
-        DLOG_INFO("Creating memory server with %u SSD device(s)", cfg_num_ssd);
+        /* 显式设备列表场景传 NULL legacy hint——否则
+         * mem_server_create 会先以 memory_size 容量注册一遍
+         * ssd_dir 设备，create_multi 再注册一遍显式列表：
+         * 同一设备进池两次，pool 虚拟空间虚增且区间互相重叠 */
+        server = mem_server_create_multi_tiered(bind_addr, port,
+                                                 node_id, memory_size,
+                                                 base_gpa, mem_tier,
+                                                 mem_device,
+                                                 cfg.ssd_devices, cfg_num_ssd);
+        DLOG_INFO("Creating memory server with %u SSD device(s), mem_tier=%s%s%s",
+                  cfg_num_ssd, mem_tier == UMM_TIER_DRAM ? "dram" : "cxl",
+                  mem_device ? ", mem_device=" : "",
+                  mem_device ? mem_device : "");
     } else {
+        if (mem_tier == UMM_TIER_DRAM)
+            DLOG_WARN("memory_tier=dram 需要 ssd_devices 显式列表，"
+                      "legacy ssd_dir 路径按 cxl 处理");
         server = mem_server_create(bind_addr, port,
                                     node_id, memory_size, base_gpa,
                                     ssd_dir);
@@ -457,6 +551,18 @@ int main(int argc, char **argv)
     if (!server) {
         DLOG_FATAL("Failed to create memory server");
         return EXIT_FAILURE;
+    }
+
+    /* ---- Phase 1 安全配置：token / CIDR 白名单 / 数据面帧上限 ---- */
+    if (mem_server_set_security(server,
+                                cfg.rpc_token[0]    ? cfg.rpc_token    : NULL,
+                                cfg.allow_cidrs[0]  ? cfg.allow_cidrs  : NULL,
+                                cfg.data_max_io) != UMM_OK) {
+        DLOG_WARN("mem_server_set_security failed, running WITHOUT "
+                  "token/ACL protection");
+    } else if (cfg.rpc_token[0] == '\0' && cfg.allow_cidrs[0] == '\0') {
+        DLOG_WARN("rpc_token / allow_cidrs 均未配置：数据面端口无保护，"
+                  "仅限可信内网（跨节点部署请务必配置）");
     }
 
     if (mem_server_start(server) != UMM_OK) {

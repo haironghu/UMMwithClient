@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>           /* BLKGETSIZE64 */
 #include <pthread.h>
 #include <errno.h>
 
@@ -231,8 +233,33 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
         goto fail;
     }
 
-    /* Size the file (sparse) */
-    if (ftruncate(sb->fd, (off_t)capacity) != 0) {
+    /* 块设备（如 QEMU/SAN 共享的 /dev/nvme0n1）：不能 ftruncate，
+     * 直接 ioctl 取设备容量并要求 >= 配置窗口；普通文件照旧 sparse。 */
+    struct stat st;
+    int         is_blk = (fstat(sb->fd, &st) == 0) && S_ISBLK(st.st_mode);
+    if (is_blk) {
+        uint64_t blk_bytes = 0;
+        if (ioctl(sb->fd, BLKGETSIZE64, &blk_bytes) != 0) {
+            umm_log_error(
+                          "ssd_backend: BLKGETSIZE64(%s) failed: %s",
+                          device_path, strerror(errno));
+            goto fail;
+        }
+        if (blk_bytes < capacity) {
+            umm_log_error(
+                          "ssd_backend: block device %s too small: "
+                          "%lu < %lu bytes",
+                          device_path, (unsigned long)blk_bytes,
+                          (unsigned long)capacity);
+            goto fail;
+        }
+        umm_log_info(
+                     "ssd_backend: block device=%s, size=%lu MB, "
+                     "window=%lu MB (no ftruncate)",
+                     device_path,
+                     (unsigned long)(blk_bytes / (1024 * 1024)),
+                     (unsigned long)(capacity / (1024 * 1024)));
+    } else if (ftruncate(sb->fd, (off_t)capacity) != 0) {
         umm_log_error(
                       "ssd_backend: ftruncate(%s, %lu) failed: %s",
                       device_path, (unsigned long)capacity, strerror(errno));
@@ -438,6 +465,32 @@ int ssd_backend_sync(SsdBackend *sb, uint64_t offset, uint64_t size)
     if (rc != 0) {
         umm_log_error(
                       "ssd_backend: msync failed: %s", strerror(errno));
+        return UMM_E_TRANSPORT_ERROR;
+    }
+    return UMM_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ssd_backend_invalidate — 丢弃本进程视角的缓存页（msync MS_INVALIDATE），   */
+/* 使后续读重新从设备取数。共享盘读共享场景：另一节点写完落盘后，本节点必须   */
+/* 先 invalidate 才能看到新数据（mmap 页缓存不会自动感知外部写入）。          */
+/* 注意：会丢弃本映射的脏页——调用方应确保本区域无未落盘的写。                 */
+/* ------------------------------------------------------------------------ */
+
+int ssd_backend_invalidate(SsdBackend *sb, uint64_t offset, uint64_t size)
+{
+    if (!sb || sb->mmap_base == MAP_FAILED)
+        return UMM_E_INVALID_ARG;
+
+    if (offset + size > sb->capacity)
+        size = sb->capacity - offset;
+
+    int rc = msync((uint8_t *)sb->mmap_base + offset, (size_t)size,
+                   MS_INVALIDATE);
+    if (rc != 0) {
+        umm_log_error(
+                      "ssd_backend: msync(MS_INVALIDATE) failed: %s",
+                      strerror(errno));
         return UMM_E_TRANSPORT_ERROR;
     }
     return UMM_OK;
@@ -931,24 +984,35 @@ int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset)
 /* ssd_pool_free                                                            */
 /* ------------------------------------------------------------------------ */
 
-void ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size)
+int ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size)
 {
     if (!pool || size == 0 || voffset >= pool->total_capacity)
-        return;
+        return UMM_E_INVALID_ARG;
 
     uint64_t start_page = voffset / SSD_POOL_PAGE_SIZE;
     uint64_t npages = (size + SSD_POOL_PAGE_SIZE - 1) / SSD_POOL_PAGE_SIZE;
 
     if (start_page + npages > pool->total_pages)
-        npages = pool->total_pages - start_page;
+        return UMM_E_INVALID_ARG;   /* 越界释放（原为静默截断） */
 
     pthread_mutex_lock(&pool->lock);
 
+    /* 双重释放检测：区间内所有页必须处于已分配态
+     * （升级为 int 返回值前，重复 free 会被静默吞掉） */
     for (uint64_t i = 0; i < npages; i++) {
-        if (bm_test(pool->bitmap, start_page + i)) {
-            bm_clear(pool->bitmap, start_page + i);
-            pool->free_pages++;
+        if (!bm_test(pool->bitmap, start_page + i)) {
+            pthread_mutex_unlock(&pool->lock);
+            umm_log_warn("ssd_pool: double free rejected at voffset=0x%lx "
+                         "(page %lu not allocated)",
+                         (unsigned long)voffset,
+                         (unsigned long)(start_page + i));
+            return UMM_E_INVALID_ARG;
         }
+    }
+
+    for (uint64_t i = 0; i < npages; i++) {
+        bm_clear(pool->bitmap, start_page + i);
+        pool->free_pages++;
     }
 
     pthread_mutex_unlock(&pool->lock);
@@ -959,6 +1023,7 @@ void ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size)
                   (unsigned long)npages, (unsigned long)voffset,
                   (unsigned long)pool->free_pages,
                   (unsigned long)pool->total_pages);
+    return UMM_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1001,6 +1066,50 @@ void* ssd_pool_get_ptr(SsdPool *pool, uint64_t voffset)
 }
 
 /* ------------------------------------------------------------------------ */
+/* ssd_pool_span_in_one_device — mmap 快路径安全性判定                        */
+/*                                                                         */
+/* [voffset, voffset+len) 完全落在单个设备内 → UMM_OK（map+memcpy 安全）；   */
+/* 跨界/越界 → 错误（调用方必须回退 ssd_pool_pread/pwrite 分段通路）。         */
+/* 直接返回指针不做长度校验曾在多设备池下 memcpy 冲出设备映射（SEGV）。        */
+/* ------------------------------------------------------------------------ */
+
+int ssd_pool_span_in_one_device(SsdPool *pool, uint64_t voffset, uint64_t len)
+{
+    if (!pool || len == 0)
+        return UMM_E_INVALID_ARG;
+
+    uint32_t dev_idx;
+    uint64_t poff;
+    if (ssd_pool_translate(pool, voffset, &dev_idx, &poff) != UMM_OK)
+        return UMM_E_NOT_FOUND;
+
+    uint64_t dev_end = pool->devices[dev_idx].virtual_base
+                     + pool->devices[dev_idx].capacity;
+    /* len > dev_end - voffset：减法形式避免 voffset+len 溢出 */
+    return (len <= dev_end - voffset) ? UMM_OK : UMM_E_INVALID_ARG;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ssd_pool_get_usage — 池级容量统计（SSD tier stats 数据源）                 */
+/* ------------------------------------------------------------------------ */
+
+void ssd_pool_get_usage(SsdPool *pool, uint64_t *out_total,
+                        uint64_t *out_free)
+{
+    if (!pool) {
+        if (out_total) *out_total = 0;
+        if (out_free)  *out_free  = 0;
+        return;
+    }
+    pthread_mutex_lock(&pool->lock);
+    uint64_t total = pool->total_pages * (uint64_t)SSD_POOL_PAGE_SIZE;
+    uint64_t freeb = pool->free_pages  * (uint64_t)SSD_POOL_PAGE_SIZE;
+    pthread_mutex_unlock(&pool->lock);
+    if (out_total) *out_total = total;
+    if (out_free)  *out_free  = freeb;
+}
+
+/* ------------------------------------------------------------------------ */
 /* ssd_pool_sync                                                            */
 /* ------------------------------------------------------------------------ */
 
@@ -1029,6 +1138,43 @@ int ssd_pool_sync(SsdPool *pool, uint64_t voffset, uint64_t size)
             chunk = dev_end - voffset;
 
         rc = ssd_backend_sync(pool->devices[dev_idx].backend, poff, chunk);
+        if (rc != UMM_OK)
+            return rc;
+
+        voffset += chunk;
+    }
+    return UMM_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ssd_pool_invalidate — 池级缓存失效（跨设备分段，镜像 ssd_pool_sync）。     */
+/* 用途：共享盘读共享——对端节点写入并落盘后，本端 invalidate 再读。           */
+/* ------------------------------------------------------------------------ */
+
+int ssd_pool_invalidate(SsdPool *pool, uint64_t voffset, uint64_t size)
+{
+    if (!pool || size == 0)
+        return UMM_E_INVALID_ARG;
+
+    uint64_t end = voffset + size;
+    if (end > pool->total_capacity)
+        end = pool->total_capacity;
+
+    while (voffset < end) {
+        uint32_t dev_idx;
+        uint64_t poff;
+        int rc = ssd_pool_translate(pool, voffset, &dev_idx, &poff);
+        if (rc != UMM_OK)
+            return rc;
+
+        uint64_t dev_end = pool->devices[dev_idx].virtual_base
+                         + pool->devices[dev_idx].capacity;
+        uint64_t chunk = end - voffset;
+        if (voffset + chunk > dev_end)
+            chunk = dev_end - voffset;
+
+        rc = ssd_backend_invalidate(pool->devices[dev_idx].backend,
+                                    poff, chunk);
         if (rc != UMM_OK)
             return rc;
 

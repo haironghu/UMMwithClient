@@ -152,37 +152,30 @@ static int memsvc_alloc_tiered(void *ctx, tier_id_t tier, uint64_t size,
         }
     }
 
+    /* SSD tier：池自有虚拟位图即分配权威（覆盖全部设备），
+     * 不再与 tier ba 双写——ba 仅按首设备容量创建，多设备池下
+     * 会把 >首设备容量的合法分配误判为 NO_MEMORY。 */
+    if (tier == UMM_TIER_SSD && t->ssd_pool) {
+        uint64_t voffset = 0;
+        int rc = ssd_pool_alloc(t->ssd_pool, size, &voffset);
+        if (rc == UMM_OK) {
+            *out_offset = t->base_offset + voffset;
+            m->alloc_count++;
+            umm_log_debug("memsvc: SSD chunk at voffset=0x%lx, "
+                          "global=0x%lx, size=%lu",
+                          (unsigned long)voffset,
+                          (unsigned long)*out_offset,
+                          (unsigned long)size);
+        }
+        pthread_mutex_unlock(&m->lock);
+        return rc;
+    }
+
     uint64_t offset_within_tier = 0;
     int rc = ba_alloc(t->allocator, size, &offset_within_tier);
     if (rc == UMM_OK) {
         *out_offset = t->base_offset + offset_within_tier;
         m->alloc_count++;
-
-        /* For SSD tier: allocate from the multi-device pool.
-         * ssd_pool_alloc returns a virtual offset across all devices. */
-        if (tier == UMM_TIER_SSD && t->ssd_pool) {
-            uint64_t voffset = 0;
-            int ssd_rc = ssd_pool_alloc(t->ssd_pool, size, &voffset);
-            if (ssd_rc != UMM_OK) {
-                /* rollback bitmap allocation */
-                ba_free(t->allocator, offset_within_tier, size);
-                m->alloc_count--;
-                pthread_mutex_unlock(&m->lock);
-                return ssd_rc;
-            }
-            /* Virtual offset must match the tier-local offset */
-            if (voffset != offset_within_tier) {
-                umm_log_warn("memsvc: SSD pool alloc returned voffset %lu, "
-                             "expected %lu",
-                             (unsigned long)voffset,
-                             (unsigned long)offset_within_tier);
-            }
-            umm_log_debug("memsvc: SSD chunk at voffset=0x%lx (tier_offset=0x%lx), "
-                          "global=0x%lx, size=%lu",
-                          (unsigned long)voffset,
-                          (unsigned long)offset_within_tier,
-                          (unsigned long)*out_offset, (unsigned long)size);
-        }
     }
 
     pthread_mutex_unlock(&m->lock);
@@ -207,18 +200,22 @@ static int memsvc_free_tiered(void *ctx, tier_id_t tier, uint64_t offset,
         return UMM_E_NOT_INITIALIZED;
     }
 
+    /* SSD tier：与 alloc 对称，只走池位图 */
+    if (tier == UMM_TIER_SSD && t->ssd_pool) {
+        int rc = ssd_pool_free(t->ssd_pool, offset - t->base_offset, size);
+        if (rc == UMM_OK) {
+            m->free_count++;
+            umm_log_debug("memsvc: SSD chunk freed at voffset 0x%lx",
+                          (unsigned long)(offset - t->base_offset));
+        }
+        pthread_mutex_unlock(&m->lock);
+        return rc;
+    }
+
     uint64_t offset_within_tier = offset - t->base_offset;
     int rc = ba_free(t->allocator, offset_within_tier, size);
-    if (rc == UMM_OK) {
+    if (rc == UMM_OK)
         m->free_count++;
-
-        /* For SSD tier: free from multi-device pool */
-        if (tier == UMM_TIER_SSD && t->ssd_pool) {
-            ssd_pool_free(t->ssd_pool, offset, size);
-            umm_log_debug("memsvc: SSD chunk freed at voffset 0x%lx",
-                          (unsigned long)offset);
-        }
-    }
 
     pthread_mutex_unlock(&m->lock);
     return rc;
@@ -241,6 +238,18 @@ static int memsvc_get_tier_stats(void *ctx, tier_id_t tier,
     if (!t->online || !t->allocator) {
         pthread_mutex_unlock(&m->lock);
         return UMM_E_NOT_INITIALIZED;
+    }
+
+    /* SSD tier：以池虚拟位图为权威（ba 仅按首设备容量创建，
+     * 多设备池下 ba 统计失真） */
+    if (tier == UMM_TIER_SSD && t->ssd_pool) {
+        uint64_t pool_total = 0, pool_free = 0;
+        ssd_pool_get_usage(t->ssd_pool, &pool_total, &pool_free);
+        *total    = pool_total;
+        *used     = pool_total - pool_free;
+        *free_mem = pool_free;
+        pthread_mutex_unlock(&m->lock);
+        return UMM_OK;
     }
 
     uint64_t free_pages = ba_get_free_pages(t->allocator);
@@ -287,12 +296,33 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
             size_t dplen = strlen(res->device_path);
             int is_file = (dplen > 4 &&
                            strcmp(res->device_path + dplen - 4, ".raw") == 0);
-            if (is_file)
+            /* 内核块设备（QEMU/SAN 共享盘实验场景）：默认沿用"不支持"
+             * 保护（防误写系统盘），仅在显式 UMM_ALLOW_BLOCK_DEVICE=1
+             * 时原样透传；后端打开侧已支持 S_ISBLK（跳过 ftruncate） */
+            struct stat st;
+            if (!is_file && stat(res->device_path, &st) == 0 &&
+                S_ISBLK(st.st_mode)) {
+                const char *allow = getenv("UMM_ALLOW_BLOCK_DEVICE");
+                if (!allow || strcmp(allow, "1") != 0) {
+                    umm_log_error("memsvc: block device %s rejected "
+                                  "(export UMM_ALLOW_BLOCK_DEVICE=1 to "
+                                  "opt in, 确认非系统盘/数据盘)",
+                                  res->device_path);
+                    return UMM_E_INVALID_ARG;
+                }
+                umm_log_warn("memsvc: BLOCK DEVICE %s opt-in 放行，"
+                             "将直接读写该设备（capacity=%lu）",
+                             res->device_path,
+                             (unsigned long)eff_capacity);
                 snprintf(ssd_resolved, sizeof(ssd_resolved), "%s",
                          res->device_path);
-            else
+            } else if (is_file) {
+                snprintf(ssd_resolved, sizeof(ssd_resolved), "%s",
+                         res->device_path);
+            } else {
                 snprintf(ssd_resolved, sizeof(ssd_resolved), "%s/pool.raw",
                          res->device_path);
+            }
         }
         if (eff_capacity == 0) {
             umm_log_error("memsvc: SSD backend requires explicit "
@@ -310,6 +340,7 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
 
     tier_id_t tier = res->tier;
     TierMemCtx *t = &m->tiers[tier];
+    int       first_reg = !t->online;
 
     /* First-time registration: initialize tier */
     if (!t->online) {
@@ -373,6 +404,9 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
                 pthread_mutex_unlock(&m->lock);
                 return rc;
             }
+            /* 第 2+ 个设备：容量累加进 tier 总量（首设备在初始化分支） */
+            if (!first_reg)
+                t->total_size += eff_capacity;
         }
         umm_log_info("memsvc: registered SSD tier, capacity=%lu, "
                      "base_offset=0x%lx, path=%s, devices=%u",
@@ -382,20 +416,57 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
                      ssd_pool_num_devices(t->ssd_pool));
 
     } else if (tier == UMM_TIER_DRAM) {
-        /* MOCK/DRAM: malloc backing buffer immediately */
-        t->mmap_base = malloc((size_t)t->total_size);
-        if (!t->mmap_base) {
-            ba_destroy(t->allocator);
-            t->allocator = NULL;
-            t->online = 0;
-            pthread_mutex_unlock(&m->lock);
-            return UMM_E_NO_MEMORY;
+        if (t->device_path[0] != '\0') {
+            /* Phase 2.5 共享内存窗口（virtio-pmem 等，/dev/pmem0）：
+             * open + mmap(MAP_SHARED) 作为 DRAM tier 后备。显式给了设备就
+             * 绝不回退 malloc——静默回退会把"共享"无声退化成"私有"。
+             * （CXL tier 保留 lazy+malloc 回退的旧行为，那是路线A语义；
+             *  其共享窗口场景由 06 断言"无 fallback 日志"来守护。） */
+            int fd = open(t->device_path, O_RDWR);
+            if (fd < 0) {
+                umm_log_error("memsvc: DRAM tier device %s open failed: %s",
+                              t->device_path, strerror(errno));
+                ba_destroy(t->allocator);
+                t->allocator = NULL;
+                t->online = 0;
+                pthread_mutex_unlock(&m->lock);
+                return UMM_E_NOT_FOUND;
+            }
+            void *map = mmap(NULL, (size_t)t->total_size,
+                             PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (map == MAP_FAILED) {
+                umm_log_error("memsvc: DRAM tier device %s mmap(%lu) failed: %s",
+                              t->device_path, (unsigned long)t->total_size,
+                              strerror(errno));
+                close(fd);
+                ba_destroy(t->allocator);
+                t->allocator = NULL;
+                t->online = 0;
+                pthread_mutex_unlock(&m->lock);
+                return UMM_E_NO_MEMORY;
+            }
+            t->mmap_base = map;
+            t->mmap_fd   = fd;
+            umm_log_info("memsvc: registered DRAM tier, capacity=%lu, "
+                         "base_offset=0x%lx, dev=%s (shared window)",
+                         (unsigned long)t->total_size,
+                         (unsigned long)t->base_offset, t->device_path);
+        } else {
+            /* MOCK/DRAM: malloc backing buffer immediately */
+            t->mmap_base = malloc((size_t)t->total_size);
+            if (!t->mmap_base) {
+                ba_destroy(t->allocator);
+                t->allocator = NULL;
+                t->online = 0;
+                pthread_mutex_unlock(&m->lock);
+                return UMM_E_NO_MEMORY;
+            }
+            memset(t->mmap_base, 0, (size_t)t->total_size);
+            t->mmap_fd = -1;
+            umm_log_info("memsvc: registered DRAM tier, capacity=%lu, base_offset=0x%lx",
+                         (unsigned long)t->total_size,
+                         (unsigned long)t->base_offset);
         }
-        memset(t->mmap_base, 0, (size_t)t->total_size);
-        t->mmap_fd = -1;
-        umm_log_info("memsvc: registered DRAM tier, capacity=%lu, base_offset=0x%lx",
-                     (unsigned long)t->total_size,
-                     (unsigned long)t->base_offset);
 
     } else {
         /* Reserved tier - not supported */
@@ -450,7 +521,7 @@ static int memsvc_get_topology(void *ctx, StorageTopology *out)
 static int memsvc_map_device(void *ctx, tier_id_t tier, node_id_t node,
                               uint64_t offset, uint64_t size, void **out_ptr)
 {
-    (void)size;  /* unused: size validated by caller if needed */
+    /* size：SSD 池 mmap 快路径需校验跨设备跨度（见下） */
     (void)node;  /* node not used in new ssd_backend API */
 
     if (!ctx || !out_ptr)
@@ -481,6 +552,16 @@ static int memsvc_map_device(void *ctx, tier_id_t tier, node_id_t node,
     void *ptr = NULL;
 
     if (tier == UMM_TIER_SSD && t->ssd_pool) {
+        /* mmap 快路径仅当 [offset, offset+size) 完全落在单个设备内；
+         * 跨界/越界返回 INVALID，调用方回退 ssd_read/ssd_write
+         * （host 通路自带跨设备分段与边界检查）。
+         * 修复前多设备池下 map+memcpy 可冲出设备映射（SEGV）。 */
+        if (size > 0 &&
+            ssd_pool_span_in_one_device(t->ssd_pool, offset_within_tier,
+                                        size) != UMM_OK) {
+            pthread_mutex_unlock(&m->lock);
+            return UMM_E_INVALID_ARG;
+        }
         /* Translate virtual offset to (device, physical_offset) → pointer */
         ptr = ssd_pool_get_ptr(t->ssd_pool, offset_within_tier);
         if (!ptr) {
@@ -646,22 +727,52 @@ MemoryServiceVtbl* mem_service_direct_create(node_id_t node_id,
                                               uint64_t base_gpa,
                                               void **out_ctx)
 {
+    return mem_service_direct_create_tiered(node_id, memory_size, base_gpa,
+                                            UMM_TIER_CXL, NULL, out_ctx);
+}
+
+/* ========================================================================
+ * Public API: tier-selectable variant（Phase 2 混合池）
+ *
+ * tier = UMM_TIER_CXL（默认，mock/真实 CXL 语义不变）
+ *      = UMM_TIER_DRAM（无 CXL 硬件的 DRAM 层：注册即 malloc 后备）
+ * mem_device = 内存层后备设备（Phase 2.5 共享内存窗口，如 /dev/pmem0）；
+ *              NULL/"" = 旧行为。
+ * ======================================================================== */
+
+MemoryServiceVtbl* mem_service_direct_create_tiered(node_id_t node_id,
+                                                     uint64_t memory_size,
+                                                     uint64_t base_gpa,
+                                                     tier_id_t tier,
+                                                     const char *mem_device,
+                                                     void **out_ctx)
+{
     if (!out_ctx || memory_size == 0)
+        return NULL;
+    if (tier != UMM_TIER_CXL && tier != UMM_TIER_DRAM)
         return NULL;
 
     MemoryServiceVtbl *vtbl = mem_service_direct_create_v2(node_id, out_ctx);
     if (!vtbl || !*out_ctx)
         return NULL;
 
-    /* Auto-register a CXL tier with the legacy parameters */
+    /* Auto-register the requested memory tier with the legacy parameters.
+     * CXL: device_path="mock"（lazy mmap→malloc 回退）；
+     * DRAM: device_path=""（DRAM 分支忽略 path，注册即 malloc 后备）。
+     * mem_device 非空时两个 tier 都改用显式设备后备。 */
     StorageResource res = {
-        .tier        = UMM_TIER_CXL,
+        .tier        = tier,
         .capacity    = memory_size,
         .base_offset = base_gpa,
         .online      = 1,
     };
-    strncpy(res.device_path, "mock", sizeof(res.device_path) - 1);
-    res.device_path[sizeof(res.device_path) - 1] = '\0';
+    if (mem_device && mem_device[0] != '\0') {
+        strncpy(res.device_path, mem_device, sizeof(res.device_path) - 1);
+        res.device_path[sizeof(res.device_path) - 1] = '\0';
+    } else if (tier == UMM_TIER_CXL) {
+        strncpy(res.device_path, "mock", sizeof(res.device_path) - 1);
+        res.device_path[sizeof(res.device_path) - 1] = '\0';
+    }
 
     int rc = vtbl->register_storage(*out_ctx, &res);
     if (rc != UMM_OK) {
@@ -676,6 +787,19 @@ MemoryServiceVtbl* mem_service_direct_create(node_id_t node_id,
 /* ========================================================================
  * Public API: destroy
  * ======================================================================== */
+
+/* ========================================================================
+ * Accessor: SSD pool（供 transport_ssd 的 fence/invalidate 使用。
+ * 数据面语义操作不属于 mem_service vtbl 的分配面职责，故以访问器暴露。）
+ * ======================================================================== */
+
+SsdPool *mem_service_direct_ssd_pool(void *ctx)
+{
+    MemServiceCtx *m = (MemServiceCtx *)ctx;
+    if (!m)
+        return NULL;
+    return m->tiers[UMM_TIER_SSD].ssd_pool;
+}
 
 void mem_service_direct_destroy(void *ctx)
 {
@@ -700,11 +824,10 @@ void mem_service_direct_destroy(void *ctx)
         }
 
         if (t->mmap_base) {
-            if (i == UMM_TIER_CXL && t->mmap_fd >= 0) {
-                /* Real CXL mmap */
+            if (t->mmap_fd >= 0) {
+                /* 设备后备（CXL 真设备 / DRAM 共享窗口）：munmap + close */
                 munmap(t->mmap_base, (size_t)t->total_size);
-                if (t->mmap_fd >= 0)
-                    close(t->mmap_fd);
+                close(t->mmap_fd);
             } else {
                 /* MOCK/DRAM malloc buffer */
                 free(t->mmap_base);

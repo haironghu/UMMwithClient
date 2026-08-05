@@ -77,6 +77,17 @@ int umm_tcp_recv_exact(int sock, void *buf, size_t len);
  */
 void umm_tcp_close(int sock);
 
+/**
+ * Match an IPv4 address against a comma-separated CIDR whitelist.
+ *
+ * @param cidr_list  e.g. "10.0.0.0/8,192.168.1.0/24"；NULL/空串 = 无白名单。
+ * @param ip         点分十进制 IPv4 地址（umm_tcp_accept 返回的 client_addr）。
+ * @return           1 = 放行（列表为空或命中）；0 = 拒绝。
+ *
+ * 条目解析失败（非法格式）按"不命中"处理——宁可误拒不可误放。
+ */
+int umm_net_acl_match(const char *cidr_list, const char *ip);
+
 #ifdef __cplusplus
 }
 #endif

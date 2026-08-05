@@ -260,9 +260,16 @@ static int local_init(void *ctx, const UMMConfig *cfg)
     uint64_t mem_size = cfg->memory_size ? cfg->memory_size
                                          : 256ULL * 1024 * 1024; /* 256 MiB */
     void *mem_ctx = NULL;
-    MemoryServiceVtbl *mem_vtbl = mem_service_direct_create(cfg->my_node_id,
-                                                              mem_size,
-                                                              0, &mem_ctx);
+    MemoryServiceVtbl *mem_vtbl;
+    if (cfg->local_mem_as_dram) {
+        /* Phase 2 混合池（无 CXL 硬件）：本地内存数据面注册为 DRAM tier。
+         * 用 create_v2 避免自动注册 CXL mock，只保留 DRAM 一层。 */
+        mem_vtbl = mem_service_direct_create_v2(cfg->my_node_id, &mem_ctx);
+    } else {
+        mem_vtbl = mem_service_direct_create(cfg->my_node_id,
+                                              mem_size,
+                                              0, &mem_ctx);
+    }
     if (!mem_vtbl || !mem_ctx) {
         local_error("local_init: mem_service_direct_create failed");
         pthread_mutex_destroy(&local->lock);
@@ -274,18 +281,34 @@ static int local_init(void *ctx, const UMMConfig *cfg)
 
     /* Register local storage */
     StorageResource res = {
-        .tier        = UMM_TIER_CXL,
+        .tier        = cfg->local_mem_as_dram ? UMM_TIER_DRAM
+                                               : UMM_TIER_CXL,
         .capacity    = mem_size,
         .base_offset = 0,
         .online      = 1,
     };
-    const char *dev_path = cfg->cxl_device[0] ? cfg->cxl_device
-                                               : "/dev/cxl/mem0";
-    snprintf(res.device_path, sizeof(res.device_path), "%s", dev_path);
+    if (cfg->local_mem_as_dram) {
+        /* DRAM 分支：device_path 默认为空（注册即 malloc 私有后备）。
+         * 复用 cxl_device 字段作为"内存层后备设备"（避免 ABI 变更）：
+         * 非空时 DRAM tier 以该设备为后备（Phase 2.5 共享内存窗口，
+         * 如 virtio-pmem /dev/pmem0，open+mmap(MAP_SHARED)，失败即注册
+         * 失败、不回退 malloc——否则"共享"会无声退化成"私有"）。 */
+        if (cfg->cxl_device[0]) {
+            snprintf(res.device_path, sizeof(res.device_path), "%s",
+                     cfg->cxl_device);
+        } else {
+            res.device_path[0] = '\0';
+        }
+    } else {
+        const char *dev_path = cfg->cxl_device[0] ? cfg->cxl_device
+                                                   : "/dev/cxl/mem0";
+        snprintf(res.device_path, sizeof(res.device_path), "%s", dev_path);
+    }
     mem_vtbl->register_storage(mem_ctx, &res);
 
-    local_info("local transport: direct mode, node=%u, mem=%lu bytes",
-             (unsigned)local->local_node, (unsigned long)mem_size);
+    local_info("local transport: direct mode, node=%u, mem=%lu bytes, tier=%s",
+             (unsigned)local->local_node, (unsigned long)mem_size,
+             cfg->local_mem_as_dram ? "DRAM" : "CXL");
     return UMM_OK;
 }
 

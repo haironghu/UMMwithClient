@@ -41,6 +41,10 @@
 #include "../transport/tier_router.h"
 #include "../transport/transport_ssd.h"
 
+/* Phase 1: 跨节点远程数据面 */
+#include "../transport/transport_remote.h"
+#include "../cis/cis_router.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -63,6 +67,8 @@ extern int  meta_rpc_client_init(MetaRpcClient *client, const char *host, int po
 extern void meta_rpc_client_deinit(MetaRpcClient *client);
 
 extern int  mem_rpc_client_init(MemRpcClient *client, const char *host, int port);
+extern int  mem_rpc_client_init_ex(MemRpcClient *client, const char *host,
+                                   int port, const char *rpc_token);
 extern void mem_rpc_client_deinit(MemRpcClient *client);
 
 /* Metadata RPC operations (v2.0 signatures -- no region_id, no flags) */
@@ -93,6 +99,9 @@ extern int meta_rpc_register_storage_resource(MetaRpcClient *c, node_id_t node,
 /* Tier-aware allocation RPC */
 extern int mem_rpc_alloc_tiered(MemRpcClient *c, tier_id_t tier, uint64_t size,
                                 uint32_t flags, uint64_t *out_offset);
+extern int mem_rpc_alloc_tiered2(MemRpcClient *c, tier_id_t tier,
+                                 uint64_t size, uint32_t flags,
+                                 uint64_t *out_offset, uint8_t *out_owner);
 extern int mem_rpc_free_tiered(MemRpcClient *c, tier_id_t tier, uint64_t offset,
                                uint64_t size);
 
@@ -159,6 +168,11 @@ typedef struct {
     TierRouter         *tier_router;        /* NULL in legacy single-transport mode */
     void               *ssd_transport_ctx;  /* SSD context for cleanup */
     MemoryTransportVtbl *ssd_transport_vtbl; /* SSD vtable for cleanup */
+
+    /* Phase 1: 跨节点远程数据面 */
+    void               *remote_transport_ctx;
+    MemoryTransportVtbl *remote_transport_vtbl;
+    node_id_t           mem_server_node;    /* 学习到的 umms node（0xFF=未知） */
 } UMMGlobalState;
 
 static UMMGlobalState g_state = {0};
@@ -231,6 +245,14 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
 {
     int rc;
 
+    /* Phase 1：本函数可能被多次调用（init / topology re-config /
+     * register_storage_tier re-config），先自清旧 remote transport */
+    if (g_state.remote_transport_ctx) {
+        remote_transport_destroy(g_state.remote_transport_ctx);
+        g_state.remote_transport_ctx  = NULL;
+        g_state.remote_transport_vtbl = NULL;
+    }
+
     /* --- Create local transport (CXL + mock unified) --- */
     MemoryTransportVtbl *cxl_vtbl = NULL;
     void *cxl_ctx = NULL;
@@ -275,6 +297,10 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
                 continue;
 
             if (res->tier == UMM_TIER_SSD) {
+                /* cfg.ssd_devices 显式给出本机多设备数据面列表时，
+                 * 跳过拓扑单设备路径，统一由循环后的 multi 版本创建 */
+                if (cfg->num_ssd_devices > 0)
+                    break;
                 /* nds: 直驱设备不在客户端建本地数据面——单次 nds_init
                  * 纪律：全进程仅 worker 直连池 API 持有设备；客户端
                  * write_chunk 的 host buffer 语义对 NDS 本就错误。
@@ -309,6 +335,29 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
         }
     }
 
+    /* 多设备共享池（如 QEMU 共享块设备实验）：cfg.ssd_devices 显式
+     * 给出本机数据面设备列表时优先于拓扑单设备资源——pool 虚拟
+     * 偏移按数组顺序拼接（与 umms 侧 ssd_devices 顺序必须一致）。
+     * 任一设备打不开即失败暴露（configure 返回错误），不留空池。 */
+    if (!ssd_vtbl && !ssd_local_skip_nds && cfg->num_ssd_devices > 0) {
+        ssd_vtbl = ssd_transport_create_multi(
+            cfg->ssd_devices, cfg->num_ssd_devices, &ssd_ctx);
+        if (ssd_vtbl) {
+            log_info(__FILE__, __LINE__,
+                     "topology: multi-SSD transport created (%u device(s))",
+                     cfg->num_ssd_devices);
+        } else {
+            log_error(__FILE__, __LINE__,
+                      "topology: multi-SSD transport create FAILED "
+                      "(%u device(s)) — check device paths/capacities",
+                      cfg->num_ssd_devices);
+            if (cxl_vtbl && cxl_vtbl->deinit)
+                cxl_vtbl->deinit(cxl_ctx);
+            free(cxl_ctx);
+            return UMM_E_TRANSPORT_ERROR;
+        }
+    }
+
     /* --- Create tier router wrapping all transports --- */
     TierRouter *router = tier_router_create(cxl_vtbl, cxl_ctx,
                                              ssd_vtbl, ssd_ctx);
@@ -325,11 +374,54 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
         return UMM_E_UNKNOWN;
     }
 
+    /* Phase 2 混合池：local_mem_as_dram 时本地 transport 的 mem_service
+     * 只注册了 DRAM tier（transport_local 已按配置选择），把它同时挂进
+     * router 的 DRAM 槽位，umm_alloc_tiered(size, UMM_TIER_DRAM) 的 GPA
+     * 数据面即可路由到本地 malloc 后备。
+     * CXL 槽位保留同一 transport：tier=1 的 GPA 会在 resolve 时因 CXL
+     * 未注册而干净报错（本模式无 CXL，属预期）。 */
+    if (cfg->local_mem_as_dram)
+        tier_router_set_dram(router, cxl_vtbl, cxl_ctx);
+
     /* nds: 设备跳过本地数据面后，对该 tier 的 get/put 返回明确的
      * UMM_E_UNSUPPORTED（而非笼统 INVALID_ARG） */
     if (ssd_local_skip_nds)
         tier_router_mark_local_unsupported(router, UMM_TIER_SSD,
                                            ssd_local_skip_path);
+
+    /* --- Phase 1: RPC 模式下挂载远端数据面 transport ---
+     * 挂载后 owner != my_node 的 GPA 走 DATA_READ/WRITE RPC 到属主
+     * 节点；owner == my_node 维持本地 tier 分派（单节点行为不变）。
+     *
+     * 显式 opt-in：仅当配置 peer_nodes 或 ssd_owner_node 时挂载。
+     * 零配置的 RPC 部署 = 共享盘模型（各节点对本机盘做 I/O，如
+     * QEMU/ SAN 共享块设备），挂载 remote 会把本机 I/O 错误地
+     * 搬上网络——共享盘与 shared-nothing 必须由配置区分。 */
+    if (cfg->mem_server_addr[0] != '\0' &&
+        (cfg->peer_nodes[0] != '\0' ||
+         cfg->ssd_owner_node != UMM_NODE_UNKNOWN)) {
+        void *rctx = NULL;
+        MemoryTransportVtbl *rvtbl = remote_transport_create(
+            cfg->my_node_id, cfg->data_max_io,
+            cfg->rpc_token[0] ? cfg->rpc_token : NULL, &rctx);
+        if (rvtbl) {
+            /* umms 回退地址：alloc 学习值 > ssd_owner_node 配置 */
+            node_id_t fb = (g_state.mem_server_node != UMM_NODE_UNKNOWN)
+                         ? g_state.mem_server_node
+                         : cfg->ssd_owner_node;
+            if (fb != UMM_NODE_UNKNOWN)
+                remote_transport_set_fallback(rctx, fb,
+                                              cfg->mem_server_addr);
+            tier_router_set_remote(router, cfg->my_node_id, rvtbl, rctx);
+            g_state.remote_transport_vtbl = rvtbl;
+            g_state.remote_transport_ctx  = rctx;
+        } else {
+            /* 非致命：仅丧失远端数据面，本地路径不受影响 */
+            log_warn(__FILE__, __LINE__,
+                     "topology: remote transport create failed, "
+                     "cross-node data plane disabled");
+        }
+    }
 
     g_state.tier_router     = router;
     g_state.ssd_transport_vtbl = ssd_vtbl;
@@ -383,6 +475,15 @@ int umm_init(const UMMConfig *cfg)
 
     /* Copy configuration */
     memcpy(&g_state.config, cfg, sizeof(UMMConfig));
+
+    /* Phase 1：mem_server_node 初值 = ssd_owner_node 配置（0xFF = 未知，
+     * 待首次 alloc 响应学习）；CIS 静态节点表初始化（此前为死代码）。
+     * 失败非致命——远端地址解析还有 umms 回退。 */
+    g_state.mem_server_node = cfg->ssd_owner_node;
+    if (cis_router_init(cfg) != UMM_OK) {
+        log_warn(__FILE__, __LINE__,
+                 "umm_init: cis_router_init failed, peer_nodes ignored");
+    }
 
     int rc;
     StorageTopology topo;
@@ -571,7 +672,10 @@ int umm_init(const UMMConfig *cfg)
                 rc = UMM_E_NO_MEMORY;
                 goto fail;
             }
-            rc = mem_rpc_client_init(g_state.mem_client_buf, mem_host, mem_port);
+            rc = mem_rpc_client_init_ex(g_state.mem_client_buf, mem_host,
+                                        mem_port,
+                                        cfg->rpc_token[0]
+                                            ? cfg->rpc_token : NULL);
             if (rc != UMM_OK) {
                 log_error(__FILE__, __LINE__,
                           "umm_init: mem_rpc_client_init failed (rc=%d)", rc);
@@ -654,6 +758,14 @@ void umm_deinit(void)
         g_state.local_mem_vtbl = NULL;
         g_state.local_mem_ctx  = NULL;
     }
+
+    /* -- Phase 1: remote transport & CIS router -- */
+    if (g_state.remote_transport_ctx) {
+        remote_transport_destroy(g_state.remote_transport_ctx);
+        g_state.remote_transport_ctx  = NULL;
+        g_state.remote_transport_vtbl = NULL;
+    }
+    cis_router_deinit();
 
     memset(&g_state, 0, sizeof(g_state));
 }
@@ -765,6 +877,11 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
     uint64_t offset = 0;
     int rc;
 
+    /* Phase 1：GPA node 位 = 数据属主节点。SSD tier 在 RPC 模式下属主是
+     * umms（数据在其池中）；其余情况维持 my_node_id（CXL 数据面本就是
+     * client 进程本地，direct 模式也属本节点）。 */
+    node_id_t gpa_node = g_state.config.my_node_id;
+
     /* Step 1: Allocate physical memory from the specified tier */
     if (g_state.local_mem_vtbl && g_state.local_mem_vtbl->alloc_tiered) {
         /* Direct mode with tier support */
@@ -781,9 +898,27 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
         rc = g_state.local_mem_vtbl->alloc_local(g_state.local_mem_ctx,
                                                   alloc_size, &offset);
     } else if (g_state.mem_client_buf) {
-        /* RPC mode: use tiered alloc RPC */
-        rc = mem_rpc_alloc_tiered(g_state.mem_client_buf, tier,
-                                   alloc_size, 0, &offset);
+        /* RPC mode: use tiered alloc RPC（v2 响应携带属主 node） */
+        uint8_t owner = UMM_NODE_UNKNOWN;
+        rc = mem_rpc_alloc_tiered2(g_state.mem_client_buf, tier,
+                                    alloc_size, 0, &offset, &owner);
+        if (rc == UMM_OK && tier == UMM_TIER_SSD) {
+            /* 属主解析：新服务端响应 > ssd_owner_node 配置 > my_node_id
+             *（旧服务端/旧行为） */
+            if (owner != UMM_NODE_UNKNOWN) {
+                gpa_node = owner;
+                if (g_state.mem_server_node != owner) {
+                    g_state.mem_server_node = owner;
+                    if (g_state.remote_transport_ctx) {
+                        remote_transport_set_fallback(
+                            g_state.remote_transport_ctx, owner,
+                            g_state.config.mem_server_addr);
+                    }
+                }
+            } else if (g_state.config.ssd_owner_node != UMM_NODE_UNKNOWN) {
+                gpa_node = g_state.config.ssd_owner_node;
+            }
+        }
     } else {
         return UMM_E_NOT_INITIALIZED;
     }
@@ -794,8 +929,8 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
         return rc;
     }
 
-    /* Step 2: Compose GPA with the specified tier */
-    gpa_t gpa = make_gpa(g_state.config.my_node_id, tier, offset);
+    /* Step 2: Compose GPA with the specified tier（node 位 = 数据属主） */
+    gpa_t gpa = make_gpa(gpa_node, tier, offset);
 
     /* Step 3: Register with ummd */
     char name[64];
@@ -1124,6 +1259,33 @@ int umm_register_storage_tier(tier_id_t tier, const char *device_path,
                          "(rc=%d), local datapath continues", rrc);
         }
 
+        /* 1.5) SSD 设备累加进本机数据面设备表（按路径去重）——
+         *      共享池实验里每个 VM 依次 enable 全部共享盘，
+         *      re-config 据此建多设备 pool（顺序须与 umms 一致） */
+        if (tier == UMM_TIER_SSD && device_path[0] != '\0' &&
+            strncmp(device_path, "nds:", 4) != 0) {
+            UMMConfig *c   = &g_state.config;
+            uint32_t   idx = 0;
+            while (idx < c->num_ssd_devices &&
+                   strncmp(c->ssd_devices[idx].path, device_path,
+                           sizeof(c->ssd_devices[idx].path)) != 0)
+                idx++;
+            if (idx == c->num_ssd_devices) {
+                if (idx >= UMM_MAX_SSD_DEVICES) {
+                    log_error(__FILE__, __LINE__,
+                              "umm_register_storage_tier: too many SSD "
+                              "devices (max=%d)", UMM_MAX_SSD_DEVICES);
+                    return UMM_E_INVALID_ARG;
+                }
+                strncpy(c->ssd_devices[idx].path, device_path,
+                        sizeof(c->ssd_devices[idx].path) - 1);
+                c->ssd_devices[idx].size = capacity;
+                c->num_ssd_devices++;
+            } else {
+                c->ssd_devices[idx].size = capacity;  /* 容量以最新为准 */
+            }
+        }
+
         /* 2) 重建本地 tier router（含新 SSD transport） */
         if (g_state.tier_router) {
             StorageTopology topo;
@@ -1247,6 +1409,41 @@ void umm_fence(void)
 
     if (g_state.transport->fence)
         g_state.transport->fence(g_state.transport_ctx);
+}
+
+/*
+ * umm_invalidate — 丢弃本进程对指定 chunk 区域的缓存页视图（仅 SSD tier）。
+ *
+ * 共享盘读共享场景：另一节点 umm_write + umm_fence 落盘后，本节点须先
+ * invalidate 再读，否则 mmap 页缓存返回旧数据（guest/OS 页缓存不会自动
+ * 感知外部经同一后备存储的写入——这是共享盘模型最隐蔽的坑）。
+ *
+ * DRAM/CXL 等易失层无此问题（数据面本就是本进程内存），返回 UMM_OK no-op。
+ * SSD tier 但本地无 SSD 数据面（如 nds: 直驱）返回 UMM_E_UNSUPPORTED。
+ *
+ * 注意：会丢弃本进程映射在该区域的脏页——调用方须保证该区域本进程
+ * 没有未 fence 的写。
+ */
+int umm_invalidate(const ChunkDescriptor *desc, uint64_t offset, uint64_t len)
+{
+    if (!g_state.initialized)
+        return UMM_E_NOT_INITIALIZED;
+    if (!desc || len == 0)
+        return UMM_E_INVALID_ARG;
+    if (desc->user_size == 0)
+        return UMM_E_INVALID_ARG;
+    if (offset + len < offset || offset + len > desc->user_size)
+        return UMM_E_INVALID_ARG;
+
+    tier_id_t tier = gpa_to_tier(desc->base_gpa);
+    if (tier != UMM_TIER_SSD)
+        return UMM_OK;  /* 易失层：无缓存视图问题，no-op */
+
+    if (!g_state.ssd_transport_ctx)
+        return UMM_E_UNSUPPORTED;
+
+    return ssd_transport_invalidate(g_state.ssd_transport_ctx,
+                                    desc->base_gpa + offset, len);
 }
 
 void umm_barrier_all(void)

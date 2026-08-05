@@ -33,6 +33,11 @@ struct TierRouter {
      * get/put 返回 UMM_E_UNSUPPORTED 而非笼统的 INVALID_ARG */
     uint8_t              tier_local_unsupported[UMM_NUM_TIERS];
     char                 tier_unsupported_path[UMM_NUM_TIERS][256];
+    /* Phase 1：远端数据面（node 位分派）。remote_vtbl==NULL 时纯 tier
+     * 分派（旧行为）；非空时 owner!=my_node 的 GPA 路由到远端。 */
+    node_id_t            my_node;
+    MemoryTransportVtbl *remote_vtbl;
+    void                *remote_ctx;
     MemoryTransportVtbl  router_vtbl;                /* exported interface */
     pthread_mutex_t      lock;
 };
@@ -55,6 +60,14 @@ static inline void* resolve_ctx(TierRouter *tr, gpa_t gpa)
     if (t >= UMM_NUM_TIERS)
         return NULL;
     return tr->tier_ctxs[t];
+}
+
+/* Phase 1：node 位优先分派。owner != my_node 且已挂远端 transport 时
+ * 返回 1（调用方应走 remote），否则返回 0 走既有 tier 分派。 */
+static inline int route_is_remote(TierRouter *tr, gpa_t gpa)
+{
+    return (tr->remote_vtbl != NULL) &&
+           (gpa_to_node(gpa) != tr->my_node);
 }
 
 /* ------------------------------------------------------------------ */
@@ -81,6 +94,8 @@ static int tier_local_unsupported_err(TierRouter *tr, gpa_t gpa,
 static int router_get(void *ctx, gpa_t gpa, uint64_t len, void *out_buf)
 {
     TierRouter *tr  = ctx;
+    if (route_is_remote(tr, gpa))
+        return tr->remote_vtbl->get(tr->remote_ctx, gpa, len, out_buf);
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
     if (!v || !v->get) {
@@ -93,6 +108,8 @@ static int router_get(void *ctx, gpa_t gpa, uint64_t len, void *out_buf)
 static int router_put(void *ctx, gpa_t gpa, uint64_t len, const void *buf)
 {
     TierRouter *tr  = ctx;
+    if (route_is_remote(tr, gpa))
+        return tr->remote_vtbl->put(tr->remote_ctx, gpa, len, buf);
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
     if (!v || !v->put) {
@@ -111,6 +128,11 @@ static int router_atomic_cas(void *ctx, gpa_t gpa,
                               uint64_t *old)
 {
     TierRouter *tr  = ctx;
+    if (route_is_remote(tr, gpa)) {
+        umm_log_warn("tier_router: remote atomic_cas on gpa 0x%lx is "
+                     "UNSUPPORTED (Phase 1)", (unsigned long)gpa);
+        return UMM_E_UNSUPPORTED;
+    }
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
     if (!v || !v->atomic_cas)
@@ -122,6 +144,11 @@ static int router_atomic_fetch_add(void *ctx, gpa_t gpa,
                                     uint64_t value, uint64_t *result)
 {
     TierRouter *tr  = ctx;
+    if (route_is_remote(tr, gpa)) {
+        umm_log_warn("tier_router: remote atomic_fetch_add on gpa 0x%lx is "
+                     "UNSUPPORTED (Phase 1)", (unsigned long)gpa);
+        return UMM_E_UNSUPPORTED;
+    }
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
     if (!v || !v->atomic_fetch_add)
@@ -132,6 +159,11 @@ static int router_atomic_fetch_add(void *ctx, gpa_t gpa,
 static int router_atomic_set(void *ctx, gpa_t gpa, uint64_t value)
 {
     TierRouter *tr  = ctx;
+    if (route_is_remote(tr, gpa)) {
+        umm_log_warn("tier_router: remote atomic_set on gpa 0x%lx is "
+                     "UNSUPPORTED (Phase 1)", (unsigned long)gpa);
+        return UMM_E_UNSUPPORTED;
+    }
     MemoryTransportVtbl *v = resolve_vtbl(tr, gpa);
     void                *c = resolve_ctx(tr, gpa);
     if (!v || !v->atomic_set)
@@ -245,6 +277,28 @@ void tier_router_destroy(TierRouter *tr)
     if (!tr)
         return;
     router_deinit(tr);
+}
+
+void tier_router_set_remote(TierRouter *tr, node_id_t my_node,
+                            MemoryTransportVtbl *vtbl, void *ctx)
+{
+    if (!tr)
+        return;
+    tr->my_node     = my_node;
+    tr->remote_vtbl = vtbl;
+    tr->remote_ctx  = ctx;
+    umm_log_info("tier_router: remote transport attached (my_node=%u)",
+                 (unsigned)my_node);
+}
+
+void tier_router_set_dram(TierRouter *tr, MemoryTransportVtbl *vtbl,
+                          void *ctx)
+{
+    if (!tr)
+        return;
+    tr->tier_vtbls[UMM_TIER_DRAM] = vtbl;
+    tr->tier_ctxs[UMM_TIER_DRAM]  = ctx;
+    umm_log_info("tier_router: DRAM tier slot attached (local malloc backend)");
 }
 
 void tier_router_mark_local_unsupported(TierRouter *tr, tier_id_t tier,

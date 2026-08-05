@@ -268,6 +268,22 @@ int umm_parse_config(const char *filepath, UMMConfig *out_cfg)
             int v;
             if (parse_bool(value, &v) != UMM_OK) { rc = UMM_E_INVALID_ARG; break; }
             out_cfg->nds_rpc_server_keep_alive = v;
+        } else if (strcmp(key, "peer_nodes") == 0) {
+            set_str(out_cfg->peer_nodes, sizeof(out_cfg->peer_nodes), value);
+        } else if (strcmp(key, "rpc_token") == 0) {
+            set_str(out_cfg->rpc_token, sizeof(out_cfg->rpc_token), value);
+        } else if (strcmp(key, "allow_cidrs") == 0) {
+            set_str(out_cfg->allow_cidrs, sizeof(out_cfg->allow_cidrs), value);
+        } else if (strcmp(key, "ssd_owner_node") == 0) {
+            int v;
+            if (parse_int(value, &v) != UMM_OK || v < 0 || v > 255) {
+                rc = UMM_E_INVALID_ARG; break;
+            }
+            out_cfg->ssd_owner_node = (uint8_t)v;
+        } else if (strcmp(key, "data_max_io") == 0) {
+            unsigned long long v;
+            if (parse_ull(value, &v) != UMM_OK) { rc = UMM_E_INVALID_ARG; break; }
+            out_cfg->data_max_io = (uint32_t)v;
         }
         /* Unknown keys are silently ignored */
     }

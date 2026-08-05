@@ -48,6 +48,9 @@ int         ssd_backend_alloc(SsdBackend *sb, uint64_t size, uint64_t *out_offse
 void        ssd_backend_free(SsdBackend *sb, uint64_t offset, uint64_t size);
 void*       ssd_backend_get_ptr(SsdBackend *sb, uint64_t offset);
 int         ssd_backend_sync(SsdBackend *sb, uint64_t offset, uint64_t size);
+/** ssd_backend_invalidate — msync(MS_INVALIDATE)：丢弃缓存页，
+ *  后续读重新从设备取数（共享盘读共享场景）。 */
+int         ssd_backend_invalidate(SsdBackend *sb, uint64_t offset, uint64_t size);
 int         ssd_backend_recover(SsdBackend *sb);
 
 /* ------------------------------------------------------------------------
@@ -117,7 +120,7 @@ uint32_t ssd_pool_num_devices(const SsdPool *pool);
 int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset);
 
 /** ssd_pool_free — Free a virtual range. */
-void ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size);
+int ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size);
 
 /**
  * ssd_pool_translate — Translate virtual offset to (device, physical_offset).
@@ -139,8 +142,21 @@ int ssd_pool_translate(SsdPool *pool, uint64_t voffset,
  */
 void* ssd_pool_get_ptr(SsdPool *pool, uint64_t voffset);
 
+/* ssd_pool_span_in_one_device — mmap 快路径安全性判定：
+ * [voffset, voffset+len) 完全落在单个设备内返回 UMM_OK，
+ * 跨界/越界返回错误（调用方须回退 ssd_pool_pread/pwrite）。 */
+int ssd_pool_span_in_one_device(SsdPool *pool, uint64_t voffset, uint64_t len);
+
+/* ssd_pool_get_usage — 池级容量统计（total/free，字节） */
+void ssd_pool_get_usage(SsdPool *pool, uint64_t *out_total,
+                        uint64_t *out_free);
+
 /** ssd_pool_sync — msync a virtual range to disk. */
 int ssd_pool_sync(SsdPool *pool, uint64_t voffset, uint64_t size);
+
+/** ssd_pool_invalidate — 池级缓存失效（跨设备分段）。
+ *  共享盘读共享：对端写入并落盘后，本端 invalidate 再读才能看到新数据。 */
+int ssd_pool_invalidate(SsdPool *pool, uint64_t voffset, uint64_t size);
 
 /**
  * 池级主机 I/O：按虚拟偏移 pread/pwrite，自动跨设备分段。

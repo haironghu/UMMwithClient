@@ -115,3 +115,26 @@ void proto_read_str(const uint8_t *buf, size_t *pos, char *out, size_t max_len)
     out[max_len] = '\0';
     *pos += max_len;
 }
+
+/* ------------------------------------------------------------------ */
+/* Token digest（Phase 1 鉴权）：FNV-1a 64-bit，取低 6 字节              */
+/* ------------------------------------------------------------------ */
+void umm_token_digest(const char *token, uint8_t out6[6])
+{
+    uint64_t h = 14695981039346656037ULL;  /* FNV offset basis */
+
+    if (!out6)
+        return;
+    memset(out6, 0, 6);
+
+    if (!token || token[0] == '\0')
+        return;  /* 全 0 = 未启用鉴权（旧线格式） */
+
+    for (const unsigned char *p = (const unsigned char *)token; *p; p++) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;             /* FNV prime */
+    }
+
+    for (int i = 0; i < 6; i++)
+        out6[i] = (uint8_t)((h >> (8 * i)) & 0xFF);
+}

@@ -22,23 +22,55 @@ class UMMServiceClient:
     def __init__(self, meta_addr: str, mem_addr: str, node_id: int = 0,
                  ssd_device: str = "",
                  ssd_devices: List[Tuple[str, int]] = None,
-                 tier_aware: bool = False):
+                 tier_aware: bool = False,
+                 peer_nodes: str = "",
+                 rpc_token: str = "",
+                 ssd_owner_node: int = 0xFF,
+                 data_max_io: int = 0,
+                 memory_size: int = 0,
+                 local_mem_as_dram: int = 0,
+                 mem_device: str = ""):
         """
         :param ssd_device:  兼容旧版：单个 SSD 设备路径（如 "/tmp/ssd.raw"）
         :param ssd_devices: 新版多设备列表：[(path, size_bytes), ...]
         :param tier_aware:  True 时启用 tier 路由模式（transport 置空），
                             SSD tier 数据面走 tier_router → transport_ssd；
                             False 保持 legacy mock transport（仅 dram/CXL）
+        :param peer_nodes:  Phase 1 集群数据面对等表 "node:host:port,..."
+                            （跨节点部署必填，如 "0:10.0.0.11:20002"）
+        :param rpc_token:   共享密钥，须与服务端 umms 配置一致（若启用）
+        :param ssd_owner_node: 旧服务端（alloc 响应无属主）时的属主回退；
+                            0xFF = 用本节点 id（单节点旧行为）
+        :param data_max_io: 单数据面 RPC payload 上限（0 = 默认 1MB）
+        :param memory_size: 客户端本地内存数据面（malloc 后备）容量，
+                            须 >= 本进程内存层 chunk 总量（混合池实验用）；
+                            0 = 默认 64MB
+        :param local_mem_as_dram: 1 = 本地内存数据面注册 DRAM tier(tier=0)
+                            （Phase 2 混合池路线B，无 CXL 硬件）；
+                            0 = 默认注册 CXL tier（mock/malloc 后备，旧行为）
+        :param mem_device: 内存层后备设备（Phase 2.5 共享内存窗口，如
+                            virtio-pmem 的 /dev/pmem0）；空 = malloc/mock
+                            私有后备。写入 UMMConfig.cxl_device 字段（两个
+                            tier 分支都读它；复用是为避免 ABI 变更）。
+                            注意：容量须 >= memory_size，且与 umms 的
+                            memory_device 指向同一共享窗口。
         """
         self.lib = UMMLib()
         cfg = UMMConfig()
         cfg.transport = b"" if tier_aware else b"mock"
         cfg.consistency_model = b"hardware"
-        cfg.memory_size = 64 * 1024 * 1024
+        cfg.memory_size = memory_size if memory_size > 0 else 64 * 1024 * 1024
         cfg.meta_server_addr = meta_addr.encode("utf-8")
         cfg.mem_server_addr = mem_addr.encode("utf-8")
         cfg.ssd_device = ssd_device.encode("utf-8") if ssd_device else b""
         cfg.my_node_id = node_id
+        cfg.peer_nodes = peer_nodes.encode("utf-8") if peer_nodes else b""
+        cfg.rpc_token = rpc_token.encode("utf-8") if rpc_token else b""
+        cfg.ssd_owner_node = ssd_owner_node
+        cfg.data_max_io = data_max_io
+        cfg.local_mem_as_dram = 1 if local_mem_as_dram else 0
+        if mem_device:
+            cfg.cxl_device = mem_device.encode("utf-8")
 
         # 多 SSD 设备配置
         if ssd_devices:
@@ -78,6 +110,16 @@ class UMMServiceClient:
                 raise ValueError("device_idx 仅在 media_type='ssd' 时支持")
             return self.lib.alloc(size)
 
+    def create_chunk_on_tier(self, size: int, tier: int) -> ChunkDescriptor:
+        """按 tier 编号分配（0=DRAM 1=CXL 2=SSD）——混合池实验用。
+
+        RPC 模式下分配权威是 umms（全局 offset）；数据面按 GPA tier 位
+        路由：tier=1/0 落客户端本地 malloc 后备，tier=2 落本机 SSD 设备。
+        """
+        if not 0 <= tier <= 2:
+            raise ValueError(f"非法 tier: {tier}")
+        return self.lib.alloc_tiered(size, tier)
+
     def enable_ssd(self, device_path: str, capacity: int) -> None:
         """注册 SSD tier 存储设备（需 tier_aware=True 构造）。
 
@@ -96,6 +138,18 @@ class UMMServiceClient:
     def delete_chunk(self, desc: ChunkDescriptor) -> None:
         """释放一个 UMM Chunk。"""
         self.lib.free(desc)
+
+    def flush(self) -> None:
+        """落盘屏障：确保此前所有 SSD 写入到达后备存储（umm_fence）。
+
+        共享盘读共享场景：写完调用本方法后，另一节点 invalidate 再读
+        即可看到数据。"""
+        self.lib.fence()
+
+    def invalidate_chunk(self, desc: ChunkDescriptor, offset: int,
+                         size: int) -> None:
+        """丢弃对 chunk 区域的缓存页视图（对端落盘后的"刷盘"动作）。"""
+        self.lib.invalidate(desc, offset, size)
 
     def read_chunk(self, desc: ChunkDescriptor, offset: int, size: int) -> bytes:
         """从 Chunk 的指定偏移读取数据。"""

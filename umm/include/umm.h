@@ -23,6 +23,9 @@ typedef uint64_t chunk_id_t;
 typedef uint8_t  tier_id_t;
 
 #define GPA_NODE_SHIFT   58
+
+/* 哨兵值：ssd_owner_node / alloc 响应属主节点 "未知" 标识 */
+#define UMM_NODE_UNKNOWN   0xFF
 #define GPA_TIER_SHIFT   56
 #define GPA_NODE_MASK    0xFC00000000000000ULL
 #define GPA_TIER_MASK    0x0300000000000000ULL
@@ -153,6 +156,35 @@ typedef struct {
     uint32_t        nds_rpc_server_qd;          /* admin queue 深度 */
     char            nds_rpc_server_socket[256]; /* RPC unix socket */
     int             nds_rpc_server_keep_alive;  /* 1=umms 退出保留 server */
+
+    /* ---- Phase 1: 多节点远程数据面（全部可选；缺省 = 单节点行为不变） ----
+     * peer_nodes:    集群数据面对等表 "node:host:port,node:host:port,..."。
+     *                client 侧用于把"非本节点 GPA"的 I/O 路由到属主节点。
+     * rpc_token:     共享密钥（任意长度，线上只带 6 字节 FNV-1a 摘要）。
+     *                服务端配置非空后，所有 mem 协议请求逐帧校验；
+     *                client 侧配置同一密钥。空 = 不校验（旧行为）。
+     * allow_cidrs:   umms 服务端 accept 白名单 "cidr,cidr,..."（IPv4）。
+     *                空 = 全放行（旧行为）。仅 umms 使用。
+     * ssd_owner_node:旧版服务端（alloc 响应不含属主节点）时 SSD GPA 的
+     *                属主 node 回退值；UMM_NODE_UNKNOWN(0xFF) = 用 my_node_id
+     *                （保持旧行为）。新服务端下此值仅作地址解析回退。
+     * data_max_io:   单个数据面 RPC 的 payload 上限（字节）。
+     *                0 = 默认 1MB；有效范围钳位 [4KB, 16MB]。双侧需一致
+     *                （client 按它分块，server 按它拒绝超限帧）。 */
+    char            peer_nodes[1024];
+    char            rpc_token[64];
+    char            allow_cidrs[512];
+    uint8_t         ssd_owner_node;
+    /* Phase 2 混合池：客户端本地内存数据面注册为 DRAM tier(tier=0)。
+     * 0 = 默认（注册 CXL tier，旧行为；无 CXL 设备时 mock/malloc 后备）；
+     * 1 = 注册 DRAM tier（无 CXL 硬件场景；tier_router DRAM 槽位生效，
+     *     umm_alloc_tiered(size, UMM_TIER_DRAM) 的数据面落本地 malloc。
+     *     注意此模式下 legacy umm_alloc()（tier 硬编码 CXL）不可用，
+     *     请一律使用 umm_alloc_tiered。）
+     * 占用原 _reserved_phase1[0]，结构体 sizeof 与字段偏移不变。 */
+    uint8_t         local_mem_as_dram;
+    uint8_t         _reserved_phase1[2];
+    uint32_t        data_max_io;
 } UMMConfig;
 
 /* ========================================================================
@@ -219,6 +251,11 @@ int umm_write_tiered(const ChunkDescriptor *desc, uint64_t offset,
 void umm_fence(void);
 void umm_barrier_all(void);
 void umm_quiet(void);
+
+/* umm_invalidate — 丢弃本进程对 chunk 区域的缓存页视图（仅 SSD tier）。
+ * 共享盘读共享：对端 umm_write + umm_fence 落盘后，本端须先 invalidate
+ * 再读。DRAM/CXL 层为 no-op（UMM_OK）。详见 umm_api.c 注释。 */
+int umm_invalidate(const ChunkDescriptor *desc, uint64_t offset, uint64_t len);
 
 #ifdef __cplusplus
 }
