@@ -19,8 +19,8 @@ echo "=== 1. FineGrainedAllocator 演示 ==="
 python3 scripts/demo_allocator.py
 
 echo ""
-echo "=== 2. VirtualMedia 演示 ==="
-python3 scripts/demo_virtual_media.py
+echo "=== 2. VirtualMedia + 稀疏 KV 演示 ==="
+python3 scripts/demo_sparse_kv.py
 
 echo ""
 

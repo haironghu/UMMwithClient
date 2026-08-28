@@ -1,29 +1,46 @@
+# -*- coding: utf-8 -*-
 """
-bmpclient/virtual_media_strategy.py — VirtualMedia 数据打散策略抽象与内建实现。
+bmpclient/virtual_media_strategy.py — VirtualMedia 数据打散策略框架。
 
-本模块定义数据打散策略的抽象基类 DataPlacementStrategy，以及若干内建策略：
+合并重构后（docs/07），策略接口从"写入序号 -> 盘号"升级为
+**语义键 -> 盘号**：`locate(key)`，key 由各场景定义。本介质只服务稀疏
+KV cache 场景，key = (layer_id, token_idx)，内建策略为确定性位置哈希：
 
-- RoundRobinStrategy：顺序 round-robin 打散（默认）
-- ConsistentHashStrategy：基于一致性哈希的打散，支持虚拟节点配置
-- CustomStrategyPlugin：通过 importlib 加载用户自定义策略类
+    device(t, l) = ((t * STEP_IDX + l * STEP_LAYER) % PRIME) % N_SSD
 
-使用 create_strategy() 工厂函数根据策略名和配置构造策略实例。
+性质与参数约束见 docs/06_稀疏注意力KV卸载数据排布设计.md §3：
+- 性质一：连续 N_SSD 个 token 恰好覆盖全部盘（适配 topk 局部性）；
+- 性质二：同一 token 连续 N_SSD 层恰好覆盖全部盘（适配层间相似性）。
 """
 
-import hashlib
-import importlib
 import inspect
 from abc import ABC, abstractmethod
-from bisect import bisect_right
-from typing import Dict, List, Type
+from typing import Any, Dict, List, Type
+
+DEFAULT_STEP_IDX = 17
+DEFAULT_STEP_LAYER = 23
+DEFAULT_PRIME = 2147483647  # 2^31 - 1，梅森质数
 
 
-class DataPlacementStrategy(ABC):
+def is_prime(n: int) -> bool:
+    """试除法判质数（参数校验用，非热路径）。"""
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+class PlacementStrategy(ABC):
     """
-    数据打散策略抽象基类。
+    打散策略抽象基类：locate(key) -> device_idx。
 
-    子类需要实现 locate(index) -> device_idx，用于根据全局条目索引
-    决定该条目应写入哪个 SSD 设备。
+    key 由场景定义；稀疏 KV 场景为 (layer_id, token_idx)。
     """
 
     def __init__(self, num_devices: int, config: dict):
@@ -34,163 +51,95 @@ class DataPlacementStrategy(ABC):
 
     @property
     def num_devices(self) -> int:
-        """底层 SSD 设备数量。"""
         return self._num_devices
 
     @property
     def name(self) -> str:
-        """策略名称，默认使用类名小写并去掉 Strategy 后缀。"""
         return self.__class__.__name__.lower().replace("strategy", "")
 
     @abstractmethod
-    def locate(self, index: int) -> int:
-        """
-        根据条目索引返回目标设备索引。
-
-        :param index: 全局条目索引（非负整数）
-        :return: 目标 SSD 设备索引，0 <= device_idx < num_devices
-        """
+    def locate(self, key: Any) -> int:
+        """计算 key 的目标盘号，0 <= device_idx < num_devices。"""
         raise NotImplementedError
 
+    def locate_batch(self, keys: List[Any]) -> List[int]:
+        """批量 locate；子类可覆写做向量化优化。"""
+        return [self.locate(k) for k in keys]
 
-class RoundRobinStrategy(DataPlacementStrategy):
+
+class PositionHashStrategy(PlacementStrategy):
     """
-    顺序 round-robin 打散策略。
+    确定性位置哈希打散（稀疏 KV 场景默认策略）。
 
-    第 index 条数据写入设备 index % num_devices。
-    该策略与改造前 VirtualMedia 的默认行为完全一致。
-    """
-
-    def locate(self, index: int) -> int:
-        if index < 0:
-            raise ValueError("index must be non-negative")
-        return index % self._num_devices
-
-
-class ConsistentHashStrategy(DataPlacementStrategy):
-    """
-    一致性哈希打散策略。
-
-    为每个设备创建若干虚拟节点（默认 150 个），构造有序哈希环。
-    对条目索引计算哈希后，在环上顺时针找到最近的虚拟节点，
-    返回该虚拟节点所属的设备索引。
+    key = (layer_id, token_idx)。凭 key 无状态计算盘号，读路径
+    "数据在哪块盘"零元数据。
 
     配置项：
-    - virtual_nodes: 每个设备的虚拟节点数，默认 150
-    - hash_seed: 哈希种子字符串前缀，默认 "vm_slot"
+    - step_idx / step_layer：大于 num_devices 的互异质数
+    - prime：更大的质数；若同时给出 max_token_idx / max_layer_id，
+      要求 prime > max_token_idx*step_idx + max_layer_id*step_layer
+      （定义域内无取模回绕）
     """
 
     def __init__(self, num_devices: int, config: dict):
         super().__init__(num_devices, config)
-        self._virtual_nodes = int(self._config.get("virtual_nodes", 150))
-        if self._virtual_nodes <= 0:
-            raise ValueError("virtual_nodes must be positive")
-        self._hash_seed = str(self._config.get("hash_seed", "vm_slot"))
-        self._ring: Dict[int, int] = {}
-        self._keys: List[int] = []
-        self._build_ring()
+        self._step_idx = int(self._config.get("step_idx", DEFAULT_STEP_IDX))
+        self._step_layer = int(self._config.get("step_layer", DEFAULT_STEP_LAYER))
+        self._prime = int(self._config.get("prime", DEFAULT_PRIME))
 
-    def _build_ring(self) -> None:
-        """构建一致性哈希环。"""
-        for device_idx in range(self._num_devices):
-            for vnode in range(self._virtual_nodes):
-                key = self._hash(f"{self._hash_seed}:{device_idx}:{vnode}")
-                self._ring[key] = device_idx
-        self._keys = sorted(self._ring.keys())
+        n = num_devices
+        for name, step in (("step_idx", self._step_idx),
+                           ("step_layer", self._step_layer)):
+            if not is_prime(step):
+                raise ValueError(f"{name} 必须是质数: {step}")
+            if step <= n:
+                raise ValueError(f"{name} ({step}) 必须大于盘数 ({n})")
+        if self._step_idx == self._step_layer:
+            raise ValueError("step_idx 与 step_layer 必须互异")
+        if not is_prime(self._prime):
+            raise ValueError(f"prime 必须是质数: {self._prime}")
+        if self._prime <= max(self._step_idx, self._step_layer):
+            raise ValueError(f"prime ({self._prime}) 必须大于两个步进参数")
 
-    @staticmethod
-    def _hash(value: str) -> int:
-        """计算字符串的 32 位无符号哈希值。"""
-        return int(hashlib.md5(value.encode("utf-8")).hexdigest(), 16) % (2 ** 32)
+        max_t = self._config.get("max_token_idx")
+        max_l = self._config.get("max_layer_id")
+        if max_t is not None and max_l is not None:
+            domain_max = int(max_t) * self._step_idx + int(max_l) * self._step_layer
+            if self._prime <= domain_max:
+                raise ValueError(
+                    f"prime ({self._prime}) 不大于定义域上界 {domain_max}，"
+                    "定义域内会发生取模回绕，性质一/二不再严格成立"
+                )
 
-    def locate(self, index: int) -> int:
-        if index < 0:
-            raise ValueError("index must be non-negative")
-        if not self._keys:
-            raise RuntimeError("consistent hash ring is empty")
+    def locate(self, key) -> int:
+        layer_id, token_idx = key
+        if token_idx < 0 or layer_id < 0:
+            raise ValueError("token_idx / layer_id 必须非负")
+        return ((token_idx * self._step_idx + layer_id * self._step_layer)
+                % self._prime) % self._num_devices
 
-        h = self._hash(f"{self._hash_seed}:slot:{index}")
-        pos = bisect_right(self._keys, h)
-        if pos == len(self._keys):
-            pos = 0
-        key = self._keys[pos]
-        return self._ring[key]
-
-
-class CustomStrategyPlugin(DataPlacementStrategy):
-    """
-    通过 importlib 动态加载用户自定义策略类。
-
-    配置项：
-    - module: 自定义策略类所在的 Python 模块路径（如 my_package.my_strategy）
-    - class: 自定义策略类名（如 MyStrategy）
-    - options: 传递给自定义策略构造函数的额外配置字典（可选）
-    """
-
-    def __init__(self, num_devices: int, config: dict):
-        super().__init__(num_devices, config)
-        self._module_path = self._config.get("module")
-        self._class_name = self._config.get("class")
-        if not self._module_path or not self._class_name:
-            raise ValueError(
-                "custom strategy requires both 'module' and 'class' in config"
-            )
-
-        self._inner = self._load_strategy()
-
-    def _load_strategy(self) -> DataPlacementStrategy:
-        """动态加载用户策略类并实例化。"""
-        try:
-            module = importlib.import_module(self._module_path)
-        except Exception as e:
-            raise ImportError(
-                f"failed to import custom strategy module {self._module_path}: {e}"
-            ) from e
-
-        strategy_cls = getattr(module, self._class_name, None)
-        if strategy_cls is None:
-            raise ImportError(
-                f"custom strategy class {self._class_name} not found in module {self._module_path}"
-            )
-
-        if not inspect.isclass(strategy_cls) or not issubclass(
-            strategy_cls, DataPlacementStrategy
-        ):
-            raise TypeError(
-                f"custom strategy class {self._class_name} must be a subclass of DataPlacementStrategy"
-            )
-
-        options = self._config.get("options", {})
-        return strategy_cls(self._num_devices, options)
-
-    @property
-    def name(self) -> str:
-        """返回内部策略的名称。"""
-        return f"custom:{self._inner.name}"
-
-    def locate(self, index: int) -> int:
-        return self._inner.locate(index)
+    def locate_batch(self, keys) -> List[int]:
+        """同一层的批量 key 可复用 layer 项（decode 定位第①步）。"""
+        step_t, step_l, prime, n = (
+            self._step_idx, self._step_layer, self._prime, self._num_devices)
+        out = []
+        for layer_id, token_idx in keys:
+            out.append(((token_idx * step_t + layer_id * step_l) % prime) % n)
+        return out
 
 
 # 内建策略注册表
-_STRATEGY_REGISTRY: Dict[str, Type[DataPlacementStrategy]] = {
-    "round_robin": RoundRobinStrategy,
-    "consistent_hash": ConsistentHashStrategy,
-    "custom": CustomStrategyPlugin,
+_STRATEGY_REGISTRY: Dict[str, Type[PlacementStrategy]] = {
+    "position_hash": PositionHashStrategy,
 }
 
 
-def register_strategy(name: str, strategy_cls: Type[DataPlacementStrategy]) -> None:
-    """
-    注册自定义策略类到工厂。
-
-    :param name: 策略名
-    :param strategy_cls: DataPlacementStrategy 子类
-    """
+def register_strategy(name: str, strategy_cls: Type[PlacementStrategy]) -> None:
+    """注册自定义策略类到工厂。"""
     if not inspect.isclass(strategy_cls) or not issubclass(
-        strategy_cls, DataPlacementStrategy
+        strategy_cls, PlacementStrategy
     ):
-        raise TypeError("strategy_cls must be a subclass of DataPlacementStrategy")
+        raise TypeError("strategy_cls must be a subclass of PlacementStrategy")
     _STRATEGY_REGISTRY[name] = strategy_cls
 
 
@@ -201,16 +150,8 @@ def list_strategies() -> List[str]:
 
 def create_strategy(
     name: str, num_devices: int, config: dict = None
-) -> DataPlacementStrategy:
-    """
-    根据策略名构造策略实例。
-
-    :param name: 策略名，如 "round_robin"、"consistent_hash"、"custom"
-    :param num_devices: SSD 设备数量
-    :param config: 策略配置字典
-    :return: DataPlacementStrategy 实例
-    :raises ValueError: 策略名未知
-    """
+) -> PlacementStrategy:
+    """根据策略名构造策略实例。"""
     config = config or {}
     if name not in _STRATEGY_REGISTRY:
         raise ValueError(

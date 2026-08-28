@@ -8,6 +8,10 @@
 - **分层抽象**：从底层 C API → Chunk 管理 → 细粒度分配，层层递进
 - **多介质支持**：统一处理 CXL（含 DRAM mock）和 SSD 两种存储介质
 - **多设备 SSD**：支持将多个物理 SSD 设备注册为统一的 SSD tier，并允许指定设备分配
+- **稀疏 KV cache 卸载**：VirtualMedia + SparseKVStore 两层栈，为稀疏注意力
+  LLM 推理提供位置哈希打散、super page 聚合写与 GPU 直通加载地址映射
+  （详见 `docs/06_稀疏注意力KV卸载数据排布设计.md` 与
+  `docs/07_VirtualMedia合并设计_稀疏KV专用介质.md`）
 - **线程安全**：所有状态变更均受锁保护，支持多线程并发访问
 - **自动资源管理**：空闲 Chunk 自动回收
 
@@ -17,30 +21,36 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          用户层 (User Code)                                  │
+│                    推理框架 / GPU 直通算子（decode 图内）                       │
 │                                                                             │
-│   allocator.alloc(size, "ssd", device_idx=1)                                │
-│   vm.save(data)              vm.read(index)                                 │
+│   store.offload(blocks)        plan = store.plan(layer, topk_tokens)        │
+│        CPU 写路径                   ↓ descriptor buffer                    │
+│                               GPU 按 (ssd_id, lba_offset) 直通加载           │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        bmpclient 内部模块                                    │
 │  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────────┐
-│  │ FineGrainedAllocator│  │    VirtualMedia     │  │    UMMServiceClient     │
-│  │   (细粒度分配器)     │  │ (跨 SSD 定长存储)   │  │   (Chunk 生命周期管理)   │
-│  │                     │  │                     │  │                         │
-│  │ • ChunkBuffer 池    │  │ • 多设备条带化      │  │ • create_chunk()        │
-│  │ • 空闲链表 + 首次适应│  │ • 可插拔打散策略    │  │ • delete_chunk()        │
-│  │ • 自动扩展 / 回收   │  │ • round-robin /     │  │ • read/write chunk      │
-│  │ • 线程锁保护        │  │   consistent_hash   │  │ • get_topology()        │
-│  │                     │  │ • 定长粒度          │  │                         │
-│  │                     │  │ • 线程锁保护        │  │                         │
-│  └─────────────────────┘  └─────────────────────┘  └─────────────────────────┘
-│           │                         │                                      │
-│           └─────────────────────────┘                                      │
-│                         │                                                  │
-│                         ▼                                                  │
+│  │ FineGrainedAllocator│  │ SparseKVStore       │  │    UMMServiceClient     │
+│  │   (细粒度分配器)     │  │ (框架对接层)         │  │   (Chunk 生命周期管理)   │
+│  │                     │  │ • KVBlockRef 展开    │  │                         │
+│  │ • ChunkBuffer 池    │  │ • slot_table 元数据  │  │ • create_chunk()        │
+│  │ • 空闲链表 + 首次适应│  │ • plan() 地址映射    │  │ • delete_chunk()        │
+│  │ • 自动扩展 / 回收   │  │ • fetch() CPU 兜底   │  │ • read/write chunk      │
+│  │ • 线程锁保护        │  │                     │  │ • get_topology()        │
+│  └─────────────────────┘  └──────────┬──────────┘  └─────────────────────────┘
+│                                      │
+│                                      ▼
+│                           ┌─────────────────────┐
+│                           │    VirtualMedia     │
+│                           │   （介质层）         │
+│                           │ • 盘感知 / 拓扑      │
+│                           │ • position_hash 打散 │
+│                           │ • 段聚合写路径       │
+│                           └──────────┬──────────┘
+│                                      │
+│                                      ▼
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                           UMMLib (ctypes)                            │   │
 │  │  • 加载 libumm.so                                                    │   │
@@ -84,15 +94,20 @@ Python 侧使用 `ctypes.Structure` 逐字段映射 C 头文件中的结构体�
 | `StorageTopology` | 完整拓扑信息 | `node_id`, `num_resources`, `resources[20]` |
 | `UMMConfig` | 客户端初始化配置 | transport, server 地址, ssd_devices[16], `num_ssd_devices` 等 |
 
-> ⚠️ **对齐敏感性**：`UMMConfig` 在 Python 侧的 `sizeof` 必须与 C 侧完全一致（当前为 **5312 字节**）。任何字段增减都需要重新验证 ctypes 对齐。
+> ⚠️ **对齐敏感性**：`UMMConfig` 在 Python 侧的 `sizeof` 必须与 C 侧完全一致（当前为 **7448 字节**）。任何字段增减都需要重新验证 ctypes 对齐（`umm_init` 内部按 `sizeof(UMMConfig)` memcpy，缺字段 = 越界读 Python 堆）。
 
 #### `UMMLib` 类
 
 - **动态库加载**：通过 `find_libumm_so()` 按优先级查找 `.so` 文件：
-  1. `UMM_BUILD_DIR` 环境变量
-  2. `../UMM/build/libumm.so`
-  3. `../../UMM/build/libumm.so`
+  1. `UMM_BUILD_DIR` 环境变量（**推荐**，本仓库指向 `umm/build`）
+  2. `../UMM/build/libumm.so`（旧布局候选）
+  3. `../../UMM/build/libumm.so`（旧布局候选）
+
+  注意默认候选是历史遗留的 `UMM/` 大写目录；本仓库实际为 `umm/`，
+  因此在仓库内直接使用时应显式设置 `UMM_BUILD_DIR=$PWD/umm/build`。
 - **签名绑定**：在 `_setup_signatures()` 中为每个 C 函数声明 `argtypes` 和 `restype`，防止 ctypes 默认推断带来的类型不匹配问题。
+- **可选符号绑定**：`umm_alloc_on_device` / `umm_get_topology` / `umm_invalidate`
+  用 `getattr` 做可选绑定，缺失时调用处再报 `RuntimeError`，不影响其他 API 加载。
 - **异常转换**：所有分配/读写操作在 `rc != UMM_OK` 时抛出 `RuntimeError`，并附加 `umm_error_string()` 的错误描述。
 
 #### 支持的 C API 映射
@@ -103,11 +118,15 @@ Python 侧使用 `ctypes.Structure` 逐字段映射 C 头文件中的结构体�
 | `umm_deinit` | `UMMLib.deinit()` | 关闭会话 |
 | `umm_alloc` | `UMMLib.alloc(size)` | 默认 tier（CXL）分配 |
 | `umm_alloc_tiered` | `UMMLib.alloc_tiered(size, tier)` | 按 tier 分配（任意设备） |
-| `umm_alloc_on_device` | `UMMLib.alloc_on_device(size, tier, device_idx)` | **指定设备分配**（SSD 多设备） |
+| `umm_alloc_on_device` | `UMMLib.alloc_on_device(size, tier, device_idx)` | **指定设备分配**（可选绑定；当前 libumm.so 未导出该符号，属已知基线问题） |
 | `umm_free` | `UMMLib.free(desc)` | 释放 Chunk |
 | `umm_read` / `umm_write` | `UMMLib.read/write(desc, offset, size/data)` | 字节级读写 |
+| `umm_read` / `umm_write` | `UMMLib.read_into/write_from(desc, offset, buf)` | 零拷贝读写（调用方 buffer 直取指针） |
 | `umm_lookup_chunk` | `UMMLib.lookup_chunk(name)` | 按名称查找 |
-| `umm_get_topology` | `UMMLib.get_topology()` | **查询拓扑** |
+| `umm_get_topology` | `UMMLib.get_topology()` | 查询拓扑（可选绑定） |
+| `umm_register_storage_tier` | `UMMLib.register_storage_tier(tier, path, capacity)` | 注册 tier 存储设备（tier_router 重建） |
+| `umm_fence` | `UMMLib.fence()` | 落盘屏障（共享盘读共享场景） |
+| `umm_invalidate` | `UMMLib.invalidate(desc, offset, size)` | 丢弃缓存页视图（可选绑定） |
 
 ---
 
@@ -123,17 +142,29 @@ client = UMMServiceClient(
     mem_addr="127.0.0.1:20002",
     node_id=0,
     ssd_device="/tmp/ssd.raw",        # 兼容旧版：单 SSD
-    ssd_devices=[("/tmp/ssd1.raw", 1<<30), ("/tmp/ssd2.raw", 1<<30)]  # 新版：多 SSD
+    ssd_devices=[("/tmp/ssd1.raw", 1<<30), ("/tmp/ssd2.raw", 1<<30)],  # 多 SSD
+    tier_aware=True,                  # tier 路由模式（SSD 数据面走 tier_router）
+    peer_nodes="0:10.0.0.11:20002",   # Phase 1 跨节点对等表
+    rpc_token="lab-token",            # 共享密钥（须与服务端一致）
+    ssd_owner_node=0xFF,              # 属主回退（0xFF=本节点）
+    data_max_io=0,                    # 数据面 RPC payload 上限（0=默认 1MB）
+    memory_size=0,                    # 本地内存数据面容量（0=默认 64MB）
+    local_mem_as_dram=0,              # 1=本地内存注册 DRAM tier（Phase 2）
+    mem_device="",                    # 内存层后备设备（Phase 2.5 共享窗口）
 )
 ```
 
 1. 实例化 `UMMLib`，加载 `libumm.so`
 2. 构造 `UMMConfig`：
-   - `transport = b"mock"`（本地 mock 模式，也支持 `"rpc"` 等）
-   - 填充 server 地址、node_id
+   - `transport = b"" if tier_aware else b"mock"`；`consistency_model = b"hardware"`
+   - 填充 server 地址、node_id、Phase 1 远程数据面字段
+     （`peer_nodes` / `rpc_token` / `ssd_owner_node` / `data_max_io`）
    - 若传 `ssd_devices`，最多取 16 个设备写入 `cfg.ssd_devices[]`，设置 `num_ssd_devices`
    - 若传 `ssd_device`（旧版单设备），写入 `cfg.ssd_device`
+   - `mem_device` 非空时写入 `cfg.cxl_device`（两个 tier 分支复用该字段，避免 ABI 变更）
 3. 调用 `umm_init()`，失败则抛出 `RuntimeError`
+4. `tier_aware=True` 时还需在 init 之后、任何数据 I/O 之前调用
+   `enable_ssd()`（即 `umm_register_storage_tier`）注册 SSD tier
 
 #### `create_chunk()` 的 tier 路由逻辑
 
@@ -262,201 +293,136 @@ def free(self, offset: int, size: int) -> None:
 
 ---
 
-### 3.4 `virtual_media.py` — VirtualMedia
+### 3.4 `virtual_media.py` / `_vm_segment.py` / `sparse_kv/store.py` — 稀疏 KV 专用介质与对接层
 
-**职责**：抽象底层多段 SSD 设备，提供定长数据的条带化存储，并通过可插拔策略决定数据落盘位置。
+合并重构后，原 `virtual_media` 与 `sparse_kv/media.py` 合并为统一栈，
+按职责拆为两层：
 
-#### 设计要点
+- **VirtualMedia（介质层）**：只负责"盘与数据路径"；
+- **SparseKVStore（框架对接层）**：只负责"框架语义与地址映射输出"。
 
-- **直接调用底层 UMM API**：不经过 `FineGrainedAllocator` 的 `Block` 层，直接使用 `UMLLib.alloc_on_device()`、`UMLLib.read()`、`UMLLib.write()`、`UMLLib.free()`
-- **均匀分配**：创建时按 `size` 在所有在线 SSD 设备间均分，要求 `size % num_devices == 0`
-- **定长条目**：每条数据长度固定为 `granularity`，总槽位数 `slot_count = size // granularity`
-- **可插拔数据打散策略**：第 `i` 条数据写入哪个设备由 `DataPlacementStrategy.locate(i)` 决定，默认 `round_robin`
-- **索引映射表**：维护 `_index_map`，记录每个全局索引对应的 `(device_idx, slot_within_device)`，保证任意策略下都能正确定位读取
-- **元数据仅内存保存**：每个设备段保存 `DeviceExtent`（含 `device_idx` 和 `ChunkDescriptor`）
-- **写满保护**：所有槽位写满后再次 `save()` 抛出 `VirtualMediaFullError`
+#### VirtualMedia 职责
+
+- **盘感知**：通过 `umm_get_topology` 发现在线 SSD，用 `umm_alloc_on_device`
+  为每盘分配 extent；
+- **可插拔语义键打散策略**：策略接口从 `locate(index)` 升级为 `locate(key)`，
+  稀疏 KV 场景 `key = (layer_id, token_idx)`；
+- **段聚合写路径**：同盘单元在主机侧缓冲，满则以 super page 粒度一次连续
+  IO 下盘；读路径只供地址规划与 CPU 兜底，不执行生产加载。
+
+#### SparseKVStore 职责
+
+- **vllm block 语义**：`offload()` 把 `KVBlockRef` 按 token 展开为定长单元；
+- **slot_table 元数据**：`(layer, token) -> 8B packed entry`，只保留 `VALID`
+  flag，IN_BUF/ON_SSD 判定下沉到 `VirtualMedia.is_buffered()`；
+- **地址规划 `plan()`**：把 `(layer_id, topk_tokens)` 翻译成 descriptor buffer
+  供 GPU 直通算子入图加载；
+- **CPU 兜底 `fetch()`**：无直通硬件环境的数据校验与降级读。
 
 #### 核心数据结构
 
-```python
-@dataclass
-class DeviceExtent:
-    device_idx: int           # SSD 设备索引
-    desc: ChunkDescriptor     # UMM ChunkDescriptor（含 GPA、size）
+**Descriptor buffer**（GPU 直通算子与本项目的唯一契约，32B/entry）：
+
+```
+header:  { count : u32, layer_id : u32, reserved : u64 }
+entry[i]: { ssd_id : u32, flags : u32, lba_offset : u64,
+            length : u64, dst_offset : u64 }
 ```
 
-#### 索引机制
+- `ssd_id`：目标 SSD 设备索引；
+- `flags`：`0=DISK`（算子从盘直通读），`1=HOST_READY`（CPU 已兜底回填 staging，
+  算子跳过该条 IO）；
+- `lba_offset`：盘侧字节地址 = `extent_base(ssd_id) + slot_table offset`；
+- `dst_offset`：固定 staging buffer 内偏移 = `i * unit_size`。
 
-VirtualMedia 的索引分为两层：**全局逻辑索引**和**物理设备内索引**。
-
-**1. 全局逻辑索引**
-
-`save()` 每次写入返回一个从 0 开始递增的全局索引 `index`；`read(index)` 基于该索引读取。
-
-```python
-index = self._next_slot
-self._next_slot += 1
-return index
-```
-
-**2. 设备选择：策略定位**
-
-全局索引通过数据打散策略映射到目标 SSD 设备：
+#### 写路径流程
 
 ```python
-device_idx = self._strategy.locate(index)
+# 1. 分盘：key=(layer, token)
+device_idx = vm.locate(key)
+
+# 2. 追加到该盘段缓冲，返回 extent 内偏移
+offset = vm.write(key, unit_data)
+
+# 3. 记录到 slot_table
+slot_table.set(layer, token, offset, FLAG_VALID)
+
+# 4. 请求边界 / prefill->decode 切换时 flush
+vm.flush()   # 半满段也整段下盘
 ```
 
-策略可以是 `round_robin`、`consistent_hash` 或用户自定义策略，策略只返回设备索引，不感知设备内部写入进度。
-
-**3. 设备内槽位：顺序填充**
-
-每个设备容量相同，可容纳的条目数也相同：
+#### 地址规划（读路径）流程
 
 ```python
-slots_per_device = self.slot_count // num_devices
+# 1. 算盘号（零元数据，纯哈希）
+devices = vm.locate_batch([(layer, t) for t in topk])
+
+# 2. 批量取 slot_table 偏移
+entries = slot_table.gather(layer, topk)
+
+# 3. 组装 descriptor buffer
+for i, (t, e) in enumerate(zip(topk, entries)):
+    off = entry_offset(e)
+    if vm.is_buffered(devices[i], off):
+        # CPU 兜底：数据 memcpy 到 staging，entry 标记 HOST_READY
+        staging[i*unit_size:] = vm.read_buffered(devices[i], off)
+        flags = HOST_READY
+    else:
+        flags = DISK
+    pack entry(devices[i], flags, extent_base + off, unit_size, i*unit_size)
 ```
-
-`VirtualMedia` 维护 `_device_write_counts` 数组记录每个设备已写入的条数。新数据在该设备内的槽位即为当前计数：
-
-```python
-slot_within_device = self._device_write_counts[device_idx]
-offset_within_device = slot_within_device * self._granularity
-```
-
-写入后该设备计数加 1：
-
-```python
-self._device_write_counts[device_idx] += 1
-```
-
-**4. 索引映射表 `_index_map`**
-
-由于策略可以是任意映射（尤其是一致性哈希等非均匀策略），不能仅靠数学公式反推设备内槽位。因此 `save()` 时将全局索引到物理位置的映射持久化到内存：
-
-```python
-self._index_map.append((device_idx, slot_within_device))
-```
-
-`read(index)` 直接查表定位：
-
-```python
-device_idx, slot_within_device = self._index_map[index]
-offset_within_device = slot_within_device * self._granularity
-extent = self._extents[device_idx]
-return self._lib.read(extent.desc, offset_within_device, self._granularity)
-```
-
-**5. 写满保护**
-
-每个设备容量固定，写入前检查该设备是否还有空槽：
-
-```python
-if slot_within_device >= slots_per_device:
-    raise VirtualMediaFullError(
-        f"device {device_idx} is full: {slot_within_device}/{slots_per_device} slots used"
-    )
-```
-
-对于非均匀策略，某些设备可能先满，此时会提前抛出 `VirtualMediaFullError`。
-
-#### 写入流程
-
-```python
-index = self._next_slot
-device_idx = self._strategy.locate(index)
-slot_within_device = self._device_write_counts[device_idx]
-
-if slot_within_device >= slots_per_device:
-    raise VirtualMediaFullError(...)
-
-offset_within_device = slot_within_device * self._granularity
-extent = self._extents[device_idx]
-self._lib.write(extent.desc, offset_within_device, data)
-
-self._device_write_counts[device_idx] += 1
-self._index_map.append((device_idx, slot_within_device))
-self._next_slot += 1
-return index
-```
-
-#### 读取流程
-
-```python
-device_idx, slot_within_device = self._index_map[index]
-offset_within_device = slot_within_device * self._granularity
-extent = self._extents[device_idx]
-return self._lib.read(extent.desc, offset_within_device, self._granularity)
-```
-
-#### 策略解析流程
-
-`VirtualMedia.__init__` 的 `strategy` 参数支持三种形式：
-
-```python
-strategy = None                         # 读取配置文件
-strategy = "round_robin"                # 策略名字符串
-strategy = DataPlacementStrategy(...)   # 策略实例
-```
-
-优先级：显式传入 > 配置文件 `bmpclient/config/virtual_media.json` > 默认 `round_robin`。
 
 #### 线程安全
 
-使用 `threading.Lock` 保护 `next_slot`、`extents`、`_index_map`、`_device_write_counts`。`save()` 的索引分配、策略定位、写入、映射表更新必须原子完成，防止多线程下同一槽位被重复写入或映射表不一致。
+- `VirtualMedia.write()` 单写者串行化（`self._write_lock`），保证同盘段缓冲
+  追加与 flush 的原子性；
+- `slot_table` 读路径无锁，写路径（`set/invalidate`）在细粒度锁内完成；
+- `SparseKVStore.plan()` 仅在 CPU 侧做 ALU 与内存访问，µs 级，可在 graph
+  replay 之前同步完成。
 
 ---
 
 ### 3.5 `virtual_media_strategy.py` — 数据打散策略
 
-**职责**：定义 VirtualMedia 数据打散策略的抽象，提供内建策略实现和插件加载机制。
+**职责**：定义语义键到 SSD 设备的打散策略抽象，稀疏 KV 场景内建
+`position_hash`。
 
 #### 抽象基类
 
 ```python
-class DataPlacementStrategy(ABC):
+class PlacementStrategy(ABC):
     @abstractmethod
-    def locate(self, index: int) -> int:
-        """根据条目索引返回目标 SSD 设备索引。"""
+    def locate(self, key) -> int:
+        """根据语义键返回目标 SSD 设备索引。"""
 ```
+
+稀疏 KV 场景键为 `(layer_id, token_idx)`。
 
 #### 内建策略
 
 | 策略类 | 策略名 | 说明 |
 |--------|--------|------|
-| `RoundRobinStrategy` | `round_robin` | 顺序打散，第 `i` 条写入设备 `i % num_devices` |
-| `ConsistentHashStrategy` | `consistent_hash` | 一致性哈希，支持 `virtual_nodes` 配置 |
-| `CustomStrategyPlugin` | `custom` | 通过 `importlib` 加载用户模块/类 |
+| `PositionHashStrategy` | `position_hash` | 确定性位置哈希：`((t*STEP_IDX + l*STEP_LAYER) % PRIME) % N_SSD` |
 
-#### 一致性哈希
+#### 位置哈希参数约束
 
-- 为每个设备创建 `virtual_nodes` 个虚拟节点（默认 150）
-- 构造 32 位无符号整数哈希环
-- 对 `index` 计算哈希后顺时针找最近的虚拟节点，返回对应设备
-- 相同 `index` 永远映射到同一设备，保证读写一致性
-
-#### 插件机制
-
-配置示例：
-
-```json
-{
-  "strategy": "custom",
-  "module": "my_package.my_strategy",
-  "class": "MyStrategy",
-  "options": {}
-}
-```
-
-`CustomStrategyPlugin` 使用 `importlib.import_module()` 加载模块，反射获取类，校验其为 `DataPlacementStrategy` 子类后实例化。自定义策略类必须实现 `locate(index)`。
+- `STEP_IDX`、`STEP_LAYER` 为大于 `N_SSD` 的互异质数；
+- `PRIME` 为更大质数，推荐在最大 `token_idx` / `layer_id` 范围内无回绕；
+- 性质一：任意连续 `N_SSD` 个 token 恰好覆盖全部盘；
+- 性质二：同一 token 连续 `N_SSD` 层恰好覆盖全部盘。
 
 #### 策略工厂
 
 ```python
-create_strategy("consistent_hash", num_devices=8, {"virtual_nodes": 200})
+create_strategy("position_hash", num_devices=8, {
+    "step_idx": 17,
+    "step_layer": 23,
+    "prime": 2229299,
+})
 ```
 
-内建策略注册在 `_STRATEGY_REGISTRY` 中，用户也可通过 `register_strategy()` 在运行时注册自定义类。
+内建策略注册在 `_STRATEGY_REGISTRY` 中，用户可通过 `register_strategy()`
+在运行时注册自定义 `PlacementStrategy` 子类。
 
 ---
 
@@ -466,9 +432,9 @@ create_strategy("consistent_hash", num_devices=8, {"virtual_nodes": 200})
 
 ```python
 from bmpclient import (
-    FineGrainedAllocator, Block, VirtualMedia,
-    DataPlacementStrategy, RoundRobinStrategy,
-    ConsistentHashStrategy, create_strategy,
+    FineGrainedAllocator, Block,
+    VirtualMedia, SparseKVStore, KVBlockRef,
+    PlacementStrategy, PositionHashStrategy, create_strategy,
 )
 ```
 
@@ -485,10 +451,12 @@ UMM 内存服务支持注册多个 SSD 设备（如 `/tmp/ssd1.raw`, `/tmp/ssd2.
 
 ### 4.2 实现机制
 
-**C 侧扩展**：
+**C 侧**：
 - `UMMConfig` 新增 `ssd_devices[16]` 数组和 `num_ssd_devices` 字段
-- 新增 `umm_alloc_on_device(size, tier, device_idx, desc)` API
-- 新增 `umm_get_topology()` API，返回每个设备作为独立的 `StorageResource`
+- `umm_get_topology()` 已实现并导出，返回每个设备作为独立的 `StorageResource`
+- `umm_alloc_on_device(size, tier, device_idx, desc)`：**当前 libumm.so 未导出
+  （已知基线问题，见 `README_交付说明.md`）**；Python 侧按 `getattr` 可选绑定，
+  缺失时调用 `alloc_on_device()` 才报错
 
 **Python 侧扩展**：
 - `UMMServiceClient.__init__()` 新增 `ssd_devices` 参数：
@@ -496,7 +464,8 @@ UMM 内存服务支持注册多个 SSD 设备（如 `/tmp/ssd1.raw`, `/tmp/ssd2.
   ssd_devices=[("/tmp/ssd1.raw", 1<<30), ("/tmp/ssd2.raw", 1<<30)]
   ```
 - `create_chunk(size, "ssd", device_idx=N)` 路由到 `umm_alloc_on_device()`
-- `get_device_list()` 返回所有设备的详细信息
+- `get_device_list()` 遍历拓扑全部槽位并过滤 `online`（ummD 按 tier 稀疏
+  存放、mem_service 返回紧凑数组，故不能仅取前 `num_resources` 项）
 
 **虚拟地址布局**：
 - 设备 0 的虚拟偏移从 0 开始
@@ -515,7 +484,8 @@ UMM 内存服务支持注册多个 SSD 设备（如 `/tmp/ssd1.raw`, `/tmp/ssd2.
 | 模块 | 同步机制 | 保护范围 |
 |------|----------|----------|
 | `FineGrainedAllocator` | `threading.Lock` | `chunks_by_type` 的增删改、`alloc()` / `free()` 的完整流程 |
-| `VirtualMedia` | `threading.Lock` | `extents`、`next_slot`，保证 `save()` 索引分配与写入的原子性 |
+| `VirtualMedia` | `threading.Lock` | 段缓冲追加与 flush 串行化 |
+| `SparseKVStore` | `threading.Lock` | `offload` 写路径串行化；`plan/fetch` 读路径无锁（slot_table 写锁保护 set/invalidate） |
 | `UMMLib` | 无（C 库内部同步） | `libumm.so` 内部使用 `pthread_mutex` 保护全局状态 |
 
 ---
@@ -525,9 +495,9 @@ UMM 内存服务支持注册多个 SSD 设备（如 `/tmp/ssd1.raw`, `/tmp/ssd2.
 ```
 RuntimeError            ← UMMLib 在 C API 返回错误时抛出
     ├── MemoryExhaustedError  ← FineGrainedAllocator 在 UMM 内存不足时转换抛出
-    └── VirtualMediaFullError ← VirtualMedia 写满时抛出
+    └── SegmentFullError      ← VirtualMedia 段耗尽时抛出
 
-ValueError              ← 参数校验失败（如 device_idx 用于 DRAM、读写越界、VirtualMedia 索引越界等）
+ValueError              ← 参数校验失败（如 device_idx 用于 DRAM、读写越界、slot 越界等）
 FileNotFoundError       ← find_libumm_so() 找不到 libumm.so
 ```
 
@@ -535,12 +505,19 @@ FileNotFoundError       ← find_libumm_so() 找不到 libumm.so
 
 ## 7. 测试架构
 
-### 7.1 自包含测试
+### 7.1 两类测试形态
 
-测试不依赖外部已启动的服务，而是在 `setUpClass()` 中通过 `subprocess.Popen` 自动启动 UMM 服务端：
+**FakeUMMLib 形态（无依赖，CI 可跑）**：`test_concurrent_io.py`、
+`test_virtual_media.py`、`test_sparse_kv.py` 全部基于
+`bmpclient/testing.py` 的 `FakeUMMLib`（内存 dict 模拟 C 库，含
+`alloc_on_device` / `get_topology` 模拟与读写日志），不需要启动任何服务。
+
+**真实服务形态**：`test_allocator.py` 在 `setUpClass()` 中通过
+`subprocess.Popen` 自动启动 UMM 服务端：
 
 ```python
-# 启动 metadata service
+# 启动 metadata service（注意：当前用例仍引用旧二进制名/旧目录布局，
+# 属已知基线问题，实际二进制是 umm/bin/ummd 与 umm/bin/umms）
 ummd_proc = Popen(["umm-metadata-service", "-p", "20001", "-b", "127.0.0.1"])
 
 # 启动 memory service
@@ -562,20 +539,24 @@ umms_proc = Popen(["umm-memory-server", "-p", "20002", "-b", "127.0.0.1",
 - 多线程并发 alloc/free
 - Block 级 read/write（含偏移、越界检查、SSD 介质）
 
-**`test_virtual_media.py`**：
-- 创建参数校验（非法 size/granularity、无 SSD 设备、不能整除）
-- 多设备均匀分配
-- save 返回索引递增
-- round-robin 条带化写入
-- read 按索引读取一致性
-- 写满后抛 `VirtualMediaFullError`
-- close 释放底层 Chunk
-- 多线程并发 save
-- 默认策略为 round-robin
-- 显式指定 round_robin / consistent_hash 策略
-- 传入自定义策略实例
-- 配置文件驱动策略加载
-- 策略工厂构造与未知策略异常
+**`test_virtual_media.py`**（`FakeUMMLib`）：
+- 初始化与默认 `position_hash` 策略
+- 位置哈希性质（确定性、连续 N_SSD token/层覆盖全盘）
+- `locate` 与 `locate_batch` 一致性
+- 写返回 offset、flush 后段粒度连续 IO
+- `read_batch` 数据一致性、IN_BUF 未下盘读零盘 IO
+- 相邻 offset 合并为一次读
+- `release` 段回收复用
+- 段满抛 `SegmentFullError`
+- 按盘异构段大小
+- close 后写操作失败
+
+**`test_sparse_kv.py`**（`FakeUMMLib`）：
+- `offload/flush/release/fetch` 数据一致性
+- `plan()` descriptor buffer 地址映射正确性
+- `HOST_READY` 兜底与 staging 数据回填
+- `max_topk` 限制、未卸载 token 报错
+- `prefetch` 缓存命中避免盘读
 
 ---
 
@@ -587,21 +568,28 @@ bmpclient/
 ├── umm_client.py                # ctypes 绑定：C 结构体 + UMMLib
 ├── client.py                    # UMMServiceClient：Chunk 生命周期 + 拓扑查询
 ├── allocator.py                 # FineGrainedAllocator + ChunkBuffer + Block
-├── virtual_media.py             # VirtualMedia + DeviceExtent + VirtualMediaFullError
-├── virtual_media_strategy.py    # 数据打散策略抽象与内建实现
-├── virtual_media_config.py      # 策略配置文件加载
+├── virtual_media.py             # VirtualMedia（稀疏 KV 专用介质层）
+├── _vm_segment.py               # 段（super page）分配器与聚合写缓冲
+├── virtual_media_strategy.py    # 语义键打散策略抽象（position_hash 内建）
+├── virtual_media_config.py      # VirtualMedia 配置加载
 ├── config/
 │   └── virtual_media.json       # 默认策略配置
+├── sparse_kv/                   # 稀疏 KV 框架对接层
+│   ├── __init__.py
+│   ├── store.py                 # SparseKVStore + PlanView
+│   ├── slot_table.py            # (layer, token) -> 偏移 packed entry
+│   └── vllm_adapter.py          # KVBlockRef
 ├── README.md                    # 用户文档
 ├── DESIGN.md                    # 本设计文档
 ├── scripts/
 │   ├── _common.py               # 服务状态检查辅助
 │   ├── demo_allocator.py        # 分配器功能演示
-│   ├── demo_virtual_media.py    # 虚拟介质功能演示
+│   ├── demo_sparse_kv.py        # 稀疏 KV 卸载/地址规划演示
 │   └── run_all_demos.sh         # 一键运行所有演示
 └── tests/
     ├── test_allocator.py        # 分配器测试
-    └── test_virtual_media.py    # 虚拟介质测试
+    ├── test_virtual_media.py    # VirtualMedia 介质层测试
+    └── test_sparse_kv.py        # SparseKVStore 对接层测试
 ```
 
 ---
@@ -627,9 +615,10 @@ bmpclient/
 - **不混淆 0**：`device_idx=0` 明确指向第一个 SSD 设备，不会与 "未指定" 混淆
 - **仅 SSD 支持**：CXL tier 是统一地址空间，无需指定设备
 
-### 9.4 为什么 VirtualMedia 要抽象数据打散策略？
+### 9.4 为什么读路径不经过本项目而是输出地址映射？
 
-- **解耦**：将 "数据如何分布" 与 "如何读写 Chunk" 分离，策略变更不影响核心读写逻辑
-- **可扩展**：用户可通过配置文件切换策略，或实现 `DataPlacementStrategy` 插入自定义策略
-- **向后兼容**：默认 round-robin 策略与改造前行为完全一致，不破坏现有 API
-- **策略与容量的关系**：当前 VirtualMedia 仍按 `size / num_devices` 为每个设备分配固定 Chunk。非均匀策略（如 consistent_hash）可能导致某些设备先满，此时 save() 会抛出 `VirtualMediaFullError`。若需支持高度不均匀策略，应配合策略提供设备权重/容量比例，当前版本保持简单。
+- **图模式兼容**：decode 加载必须在 CUDA/ACL Graph 内执行，CPU 侧无法入图；
+- **性能**：GPU 直通存储（NDS / GPUDirect 等）延迟远低于 CPU 转发；
+- **契约最小化**：与 GPU 算子之间只有一块固定地址 descriptor buffer 的内存布局契约，
+  便于算子侧固化到 kernel 元数据；
+- **写路径仍由 CPU 完成**：KV cache 卸载对延迟不敏感，保留 CPU 接口并按打散策略落盘。

@@ -1,207 +1,224 @@
+# -*- coding: utf-8 -*-
+"""
+bmpclient/tests/test_virtual_media.py — VirtualMedia（稀疏 KV 专用介质层）单测。
+
+全部基于 FakeUMMLib，无需启动真实 UMM 服务。
+"""
+
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import threading
-import time
 import unittest
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-UMM_ROOT = os.path.join(PROJECT_ROOT, "UMM")
-sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from bmpclient.umm_client import UMMLib, UMMConfig, UMM_TIER_SSD
-from bmpclient.virtual_media import VirtualMedia, VirtualMediaFullError
+from bmpclient.testing import FakeUMMLib
+from bmpclient.virtual_media import VirtualMedia, SegmentFullError
 from bmpclient.virtual_media_config import load_config
-from bmpclient.virtual_media_strategy import (
-    ConsistentHashStrategy,
-    CustomStrategyPlugin,
-    DataPlacementStrategy,
-    RoundRobinStrategy,
-    create_strategy,
-)
+from bmpclient.virtual_media_strategy import PlacementStrategy, PositionHashStrategy
+
+UNIT = 4096
+SP = 4 * UNIT
+N_SSD = 4
+CAPACITY = 4 * SP  # 每盘 4 段，每段 4 单元
 
 
-META_PORT = 20001
-MEM_PORT = 20002
-META_ADDR = f"127.0.0.1:{META_PORT}"
-MEM_ADDR = f"127.0.0.1:{MEM_PORT}"
-SSD_DIR = "/tmp/umm_test_ssd"
-SSD_MOCK_DEVICE = "/tmp/umm_mock_ssd.raw"
+def make_unit(layer: int, token: int) -> bytes:
+    """生成可辨识的 4KB 单元数据。"""
+    tag = (layer << 20) | token
+    return tag.to_bytes(8, "little").ljust(UNIT, b"\x00")
+
+
+def unit_tag(data: bytes) -> int:
+    return int.from_bytes(data[:8], "little")
 
 
 class TestVirtualMedia(unittest.TestCase):
-    _ummd_proc = None
-    _umms_proc = None
-    _lib = None
-
-    @classmethod
-    def setUpClass(cls):
-        os.makedirs(SSD_DIR, exist_ok=True)
-        cls._devnull = open(os.devnull, "w")
-
-        ummd_bin = os.path.join(UMM_ROOT, "bin", "umm-metadata-service")
-        umms_bin = os.path.join(UMM_ROOT, "bin", "umm-memory-server")
-
-        cls._ummd_proc = subprocess.Popen(
-            [ummd_bin, "-p", str(META_PORT), "-b", "127.0.0.1"],
-            stdout=cls._devnull, stderr=cls._devnull,
+    def _make(self, **kw):
+        lib = FakeUMMLib(num_ssd_devices=N_SSD)
+        cfg = dict(
+            unit_size=UNIT,
+            capacity_per_device=CAPACITY,
+            sp_bytes=SP,
+            sp_bytes_per_device={},
         )
-        time.sleep(0.5)
+        cfg.update(kw)
+        vm = VirtualMedia(lib, **cfg)
+        return lib, vm
 
-        cls._umms_proc = subprocess.Popen(
-            [umms_bin, "-p", str(MEM_PORT), "-b", "127.0.0.1",
-             "-n", "0", "-s", str(128 * 1024 * 1024), "-d", SSD_DIR],
-            stdout=cls._devnull, stderr=cls._devnull,
-        )
-        time.sleep(0.5)
-
-        for _ in range(20):
-            import socket
-            try:
-                with socket.create_connection(("127.0.0.1", META_PORT), timeout=0.5):
-                    with socket.create_connection(("127.0.0.1", MEM_PORT), timeout=0.5):
-                        break
-            except Exception:
-                time.sleep(0.2)
-        else:
-            cls.tearDownClass()
-            raise RuntimeError("UMM services failed to start")
-
-        # 初始化 UMMLib
-        cls._lib = UMMLib()
-        cfg = UMMConfig()
-        cfg.transport = b"mock"
-        cfg.consistency_model = b"hardware"
-        cfg.memory_size = 64 * 1024 * 1024
-        cfg.meta_server_addr = META_ADDR.encode("utf-8")
-        cfg.mem_server_addr = MEM_ADDR.encode("utf-8")
-        cfg.ssd_device = SSD_MOCK_DEVICE.encode("utf-8")
-        cfg.my_node_id = 0
-
-        rc = cls._lib.init(cfg)
-        if rc != 0:
-            cls.tearDownClass()
-            raise RuntimeError(f"umm_init failed: rc={rc}")
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._lib:
-            cls._lib.deinit()
-            cls._lib = None
-
-        if cls._umms_proc:
-            cls._umms_proc.terminate()
-            try:
-                cls._umms_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                cls._umms_proc.kill()
-                cls._umms_proc.wait()
-        if cls._ummd_proc:
-            cls._ummd_proc.terminate()
-            try:
-                cls._ummd_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                cls._ummd_proc.kill()
-                cls._ummd_proc.wait()
-        cls._devnull.close()
-
-    def setUp(self):
-        pass
-
-    def test_create_invalid_size(self):
-        """size 不能被设备数整除或每设备大小不能被粒度整除时应抛 ValueError。"""
-        # 先查询在线 SSD 设备数
-        topo = self._lib.get_topology()
-        ssd_count = sum(
-            1 for i in range(topo.num_resources)
-            if topo.resources[i].tier == UMM_TIER_SSD and topo.resources[i].online
-        )
-
-        # 情况 1：总 size 不能被设备数整除（仅在多设备环境下有意义）
-        if ssd_count > 1:
-            with self.assertRaises(ValueError):
-                VirtualMedia(self._lib, size=31 * 1024 * 1024, granularity=1024 * 1024)
-
-        # 情况 2：每设备大小不能被粒度整除
-        # 当只有 1 个 SSD 设备时，30M / 1 = 30M，30M % 7M = 2M，不整除
-        with self.assertRaises(ValueError):
-            VirtualMedia(self._lib, size=30 * 1024 * 1024, granularity=7 * 1024 * 1024)
-
-    def test_create_invalid_granularity(self):
-        """size 不能被 granularity 整除时应抛 ValueError。"""
-        with self.assertRaises(ValueError):
-            VirtualMedia(self._lib, size=30 * 1024 * 1024, granularity=7 * 1024 * 1024)
-
-    def test_capacity_and_slot_count(self):
-        """验证容量、粒度、槽位数和设备数。"""
-        # mock 模式下通常只有 1 个 SSD 设备
-        vm = VirtualMedia(self._lib, size=8 * 1024 * 1024, granularity=1024 * 1024)
-        self.assertEqual(vm.capacity, 8 * 1024 * 1024)
-        self.assertEqual(vm.granularity, 1024 * 1024)
-        self.assertEqual(vm.slot_count, 8)
-        self.assertGreaterEqual(vm.device_count, 1)
+    def test_init_properties_and_default_strategy(self):
+        _, vm = self._make()
+        self.assertEqual(vm.unit_size, UNIT)
+        self.assertEqual(vm.device_count, N_SSD)
+        self.assertIsInstance(vm.strategy, PositionHashStrategy)
+        self.assertEqual(vm.strategy.name, "positionhash")
         vm.close()
 
-    def test_save_and_read_round_robin(self):
-        """save 返回递增索引，read 能正确读取。"""
-        vm = VirtualMedia(self._lib, size=8 * 1024 * 1024, granularity=1024)
-        records = []
-        for i in range(vm.slot_count):
-            data = f"record-{i:08d}".encode().ljust(vm.granularity, b'\0')
-            idx = vm.save(data)
-            self.assertEqual(idx, i)
-            records.append(data)
-
-        for i, expected in enumerate(records):
-            self.assertEqual(vm.read(i), expected)
-
+    def test_locate_basic(self):
+        _, vm = self._make()
+        for l in range(4):
+            for t in (0, 1, 37, 255):
+                d = vm.locate((l, t))
+                self.assertIn(d, range(N_SSD))
         vm.close()
 
-    def test_full_exception(self):
-        """写满后再次 save 应抛 VirtualMediaFullError。"""
-        vm = VirtualMedia(self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024)
-        for i in range(vm.slot_count):
-            vm.save(b"x" * vm.granularity)
-
-        self.assertEqual(vm.written_count, vm.slot_count)
-
-        with self.assertRaises(VirtualMediaFullError):
-            vm.save(b"x" * vm.granularity)
-
+    def test_position_hash_properties(self):
+        _, vm = self._make()
+        strat = vm.strategy
+        # 确定性
+        for l in range(4):
+            for t in (0, 1, 37, 255):
+                self.assertEqual(strat.locate((l, t)), strat.locate((l, t)))
+        # 性质一：连续 N_SSD 个 token 覆盖全部盘
+        for l in range(4):
+            for start in (0, 5, 100, 200):
+                devs = {strat.locate((l, t)) for t in range(start, start + N_SSD)}
+                self.assertEqual(devs, set(range(N_SSD)), f"layer={l} start={start}")
+        # 性质二：同一 token 连续 N_SSD 层覆盖全部盘
+        for t in (0, 7, 128, 200):
+            devs = {strat.locate((l, t)) for l in range(N_SSD)}
+            self.assertEqual(devs, set(range(N_SSD)), f"token={t}")
         vm.close()
 
-    def test_read_unwritten_index(self):
-        """读取未写入的索引应抛 ValueError。"""
-        vm = VirtualMedia(self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024)
-        vm.save(b"x" * vm.granularity)
+    def test_locate_batch_matches_single(self):
+        _, vm = self._make()
+        keys = [(l, t) for l in range(4) for t in range(16)]
+        batch = vm.locate_batch(keys)
+        self.assertEqual(batch, [vm.locate(k) for k in keys])
+        vm.close()
 
-        with self.assertRaises(ValueError):
-            vm.read(1)
+    def test_write_returns_offset_and_flush_segment_io(self):
+        lib, vm = self._make()
+        for t in range(16):
+            off = vm.write((0, t), make_unit(0, t))
+            self.assertEqual(off % UNIT, 0)
+            self.assertGreaterEqual(off, 0)
 
+        # flush 前无盘写（全部在段缓冲）
+        self.assertEqual(lib.fake.write_log, [])
+        vm.flush()
+        # 4 盘各 1 段 => 4 次段大小连续 IO
+        self.assertEqual(len(lib.fake.write_log), N_SSD)
+        for _, off, size in lib.fake.write_log:
+            self.assertEqual(size, SP)
+            self.assertEqual(off % SP, 0)
+        vm.close()
+
+    def test_read_batch_roundtrip(self):
+        lib, vm = self._make()
+        keys = [(l, t) for l in range(2) for t in range(16)]
+        offsets = {}
+        for k in keys:
+            offsets[k] = vm.write(k, make_unit(*k))
+        vm.flush()
+
+        items = [(vm.locate(k), offsets[k]) for k in keys]
+        outs = [memoryview(bytearray(UNIT)) for _ in keys]
+        vm.read_batch(items, outs)
+        for k, out in zip(keys, outs):
+            self.assertEqual(unit_tag(out.tobytes()), (k[0] << 20) | k[1], k)
+        vm.close()
+
+    def test_in_buf_read_before_flush_no_disk_io(self):
+        lib, vm = self._make()
+        keys = [(0, t) for t in range(8)]
+        offsets = {k: vm.write(k, make_unit(*k)) for k in keys}
+        lib.fake.reset_stats()
+
+        items = [(vm.locate(k), offsets[k]) for k in keys]
+        outs = [memoryview(bytearray(UNIT)) for _ in keys]
+        vm.read_batch(items, outs)
+        self.assertEqual(lib.fake.read_log, [])
+        for k, out in zip(keys, outs):
+            self.assertEqual(unit_tag(out.tobytes()), (k[0] << 20) | k[1])
+        vm.close()
+
+    def test_release_recycles_segment(self):
+        lib, vm = self._make()
+        keys = [(0, t) for t in range(16)]
+        offsets = {}
+        for k in keys:
+            offsets[k] = vm.write(k, make_unit(*k))
+        vm.flush()
+
+        # 释放 device 0 上所有单元
+        dev0 = 0
+        dev0_keys = [k for k in keys if vm.locate(k) == dev0]
+        free_before = vm.stats()["free_segments"][dev0]
+        for k in dev0_keys:
+            vm.release(dev0, offsets[k])
+        self.assertEqual(vm.stats()["free_segments"][dev0], free_before + 1)
+
+        # 复用回收段：再写入 device 0 会命中同一段，不抛满盘
+        reused = 0
+        for t in range(256):
+            k = (1, t)
+            if vm.locate(k) == dev0:
+                offsets[k] = vm.write(k, make_unit(*k))
+                reused += 1
+                if reused == len(dev0_keys):
+                    break
+        vm.flush()
+        # 只要复用成功，device 0 空闲段数应回到之前
+        self.assertEqual(vm.stats()["free_segments"][dev0], free_before)
+        vm.close()
+
+    def test_segment_full_raises(self):
+        # 每盘只有 1 段（4 单元）
+        lib, vm = self._make(capacity_per_device=SP)
+        dev0 = 0
+        written = 0
+        with self.assertRaises(SegmentFullError):
+            for t in range(256):
+                if vm.locate((0, t)) == dev0:
+                    vm.write((0, t), make_unit(0, t))
+                    written += 1
+                    # 第 5 次同盘写入时，第 4 个单元所在的段被 flush 后无空闲段
+        self.assertGreaterEqual(written, 4)
+        vm.close()
+
+    def test_per_device_segment_size(self):
+        lib, vm = self._make(sp_bytes_per_device={0: 2 * SP, 2: SP // 2})
+        keys = [(0, t) for t in range(16)]
+        for k in keys:
+            vm.write(k, make_unit(*k))
+        vm.flush()
+
+        # 数据一致性不受影响
+        offsets = {k: vm.write(k, make_unit(1, k[1])) for k in keys}  # 会分配新段
+        vm.flush()
+        for k in keys:
+            items = [(vm.locate(k), offsets[k])]
+            outs = [memoryview(bytearray(UNIT))]
+            vm.read_batch(items, outs)
+            self.assertEqual(unit_tag(outs[0].tobytes()), (1 << 20) | k[1], k)
+
+        # device 2 的段大小为 SP/2；device 0 为 2*SP
+        for cid, off, size in lib.fake.write_log:
+            dev = lib.fake._chunk_device[cid]
+            if dev == 2:
+                self.assertEqual(size, SP // 2)
+            elif dev == 0:
+                self.assertEqual(size, 2 * SP)
         vm.close()
 
     def test_close_releases_chunks(self):
-        """close 后应能正常结束，不泄露 Chunk。"""
-        vm = VirtualMedia(self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024)
-        vm.save(b"x" * vm.granularity)
+        lib, vm = self._make()
+        vm.write((0, 0), make_unit(0, 0))
         vm.close()
-        # 关闭后再操作应因底层已释放而失败
+        # close 后底层 chunk 已释放，再操作应失败
         with self.assertRaises(Exception):
-            vm.save(b"x" * vm.granularity)
+            vm.write((0, 1), make_unit(0, 1))
 
-    def test_thread_safety_save(self):
-        """多线程并发 save 不应冲突或重复。"""
-        vm = VirtualMedia(self._lib, size=8 * 1024 * 1024, granularity=1024)
+    def test_thread_safety_write(self):
+        lib, vm = self._make()
         errors = []
         lock = threading.Lock()
 
-        def worker(start):
+        def worker(layer):
             try:
-                for i in range(vm.slot_count // 4):
-                    data = f"t{start:02d}-{i:08d}".encode().ljust(vm.granularity, b'\0')
-                    vm.save(data)
+                for t in range(16):
+                    vm.write((layer, t), make_unit(layer, t))
             except Exception as e:
                 with lock:
                     errors.append(e)
@@ -212,152 +229,40 @@ class TestVirtualMedia(unittest.TestCase):
         for t in threads:
             t.join()
 
-        self.assertEqual(len(errors), 0)
-        self.assertEqual(vm.written_count, vm.slot_count)
+        self.assertEqual(errors, [])
+        vm.flush()
+        # 每个 thread 写了 16 单元，共 64 单元；平均每盘 16 单元 = 4 段
+        self.assertEqual(len(lib.fake.write_log), N_SSD * 4)
         vm.close()
 
-    def test_default_strategy_is_round_robin(self):
-        """默认策略应为 round-robin。"""
-        vm = VirtualMedia(self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024)
-        self.assertIsInstance(vm.strategy, RoundRobinStrategy)
-        vm.close()
+    def test_explicit_strategy_instance(self):
+        class ReverseStrategy(PlacementStrategy):
+            def locate(self, key):
+                return (self.num_devices - 1) - (key[1] % self.num_devices)
 
-    def test_explicit_round_robin_strategy(self):
-        """显式传入 round_robin 策略名，行为与默认一致。"""
-        vm = VirtualMedia(
-            self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024,
-            strategy="round_robin",
-        )
-        self.assertIsInstance(vm.strategy, RoundRobinStrategy)
-
-        records = []
-        for i in range(vm.slot_count):
-            data = f"rr-{i:04d}".encode().ljust(vm.granularity, b'\0')
-            idx = vm.save(data)
-            self.assertEqual(idx, i)
-            records.append(data)
-
-        for i, expected in enumerate(records):
-            self.assertEqual(vm.read(i), expected)
-        vm.close()
-
-    def test_explicit_consistent_hash_strategy(self):
-        """显式传入 consistent_hash 策略名，读写应保持一致。"""
-        vm = VirtualMedia(
-            self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024,
-            strategy="consistent_hash",
-        )
-        self.assertIsInstance(vm.strategy, ConsistentHashStrategy)
-
-        records = []
-        for i in range(vm.slot_count):
-            data = f"ch-{i:04d}".encode().ljust(vm.granularity, b'\0')
-            idx = vm.save(data)
-            self.assertEqual(idx, i)
-            records.append(data)
-
-        for i, expected in enumerate(records):
-            self.assertEqual(vm.read(i), expected)
-        vm.close()
-
-    def test_custom_strategy_instance(self):
-        """传入自定义策略实例，应被直接使用。"""
-        class ReverseStrategy(DataPlacementStrategy):
-            def locate(self, index: int) -> int:
-                return (self._num_devices - 1) - (index % self._num_devices)
-
-        topo = self._lib.get_topology()
-        ssd_count = sum(
-            1 for i in range(topo.num_resources)
-            if topo.resources[i].tier == UMM_TIER_SSD and topo.resources[i].online
-        )
-
-        strategy = ReverseStrategy(ssd_count, {})
-        vm = VirtualMedia(
-            self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024,
-            strategy=strategy,
-        )
+        _, vm = self._make(strategy=ReverseStrategy(N_SSD, {}))
         self.assertIsInstance(vm.strategy, ReverseStrategy)
-
-        records = []
-        for i in range(vm.slot_count):
-            data = f"cs-{i:04d}".encode().ljust(vm.granularity, b'\0')
-            idx = vm.save(data)
-            self.assertEqual(idx, i)
-            records.append(data)
-
-        for i, expected in enumerate(records):
-            self.assertEqual(vm.read(i), expected)
+        for t in range(8):
+            self.assertEqual(vm.locate((0, t)), (N_SSD - 1) - (t % N_SSD))
         vm.close()
 
     def test_config_file_strategy(self):
-        """通过配置文件指定策略，VirtualMedia 应正确加载。"""
-        # mock 单设备环境下，consistent_hash 也能正常工作
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
-            f.write('{"strategy": "consistent_hash", "virtual_nodes": 50}')
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write('{"step_idx": 19, "step_layer": 29, "prime": 2229299}')
             config_path = f.name
-
         try:
             cfg = load_config(config_path)
-            self.assertEqual(cfg["strategy"], "consistent_hash")
-            self.assertEqual(cfg["virtual_nodes"], 50)
-
-            vm = VirtualMedia(
-                self._lib, size=4 * 1024 * 1024, granularity=1024 * 1024,
-                strategy="consistent_hash",
-            )
-            self.assertIsInstance(vm.strategy, ConsistentHashStrategy)
-            data = b"config-driven" + b"\0" * (vm.granularity - len(b"config-driven"))
-            idx = vm.save(data)
-            self.assertEqual(vm.read(idx), data)
+            self.assertEqual(cfg["step_idx"], 19)
+            lib, vm = self._make(config_path=config_path)
+            self.assertIsInstance(vm.strategy, PositionHashStrategy)
+            # step_idx=19 改变了哈希结果，但仍应在合法范围
+            for t in range(32):
+                self.assertIn(vm.locate((0, t)), range(N_SSD))
             vm.close()
         finally:
             os.unlink(config_path)
 
-    def test_strategy_factory(self):
-        """策略工厂 create_strategy 应能构造已知策略。"""
-        rr = create_strategy("round_robin", 4, {})
-        self.assertIsInstance(rr, RoundRobinStrategy)
-        self.assertEqual(rr.locate(5), 1)
-
-        ch = create_strategy("consistent_hash", 4, {"virtual_nodes": 10})
-        self.assertIsInstance(ch, ConsistentHashStrategy)
-        self.assertIn(ch.locate(12345), range(4))
-
-        with self.assertRaises(ValueError):
-            create_strategy("unknown", 4, {})
-
-    def test_custom_strategy_plugin(self):
-        """custom 策略通过 importlib 动态加载用户模块/类。"""
-        module_dir = tempfile.mkdtemp()
-        module_name = "always_first_strategy"
-        module_file = os.path.join(module_dir, f"{module_name}.py")
-
-        try:
-            with open(module_file, "w", encoding="utf-8") as f:
-                f.write(
-                    "from bmpclient.virtual_media_strategy import DataPlacementStrategy\n"
-                    "\n"
-                    "class AlwaysFirstStrategy(DataPlacementStrategy):\n"
-                    "    def locate(self, index: int) -> int:\n"
-                    "        return 0\n"
-                )
-
-            sys.path.insert(0, module_dir)
-            try:
-                plugin = CustomStrategyPlugin(4, {
-                    "module": module_name,
-                    "class": "AlwaysFirstStrategy",
-                })
-                self.assertEqual(plugin.locate(0), 0)
-                self.assertEqual(plugin.locate(100), 0)
-            finally:
-                sys.path.remove(module_dir)
-        finally:
-            shutil.rmtree(module_dir, ignore_errors=True)
-
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

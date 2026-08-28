@@ -1,259 +1,289 @@
+# -*- coding: utf-8 -*-
 """
-bmpclient/virtual_media.py — 跨多 SSD 设备的定长数据存储抽象。
+bmpclient/virtual_media.py — VirtualMedia：稀疏 KV cache 专用介质层。
 
-VirtualMedia 将总容量 size 均匀分布在所有在线 SSD 设备上，
-以固定粒度 granularity 保存数据，并通过可插拔的数据打散策略
-决定每条数据落到的具体 SSD 设备。
+合并重构后（docs/07），VirtualMedia 只服务稀疏注意力 KV cache 卸载/加载
+场景，职责三件套：
 
-默认策略为 round-robin，与改造前行为完全一致。其他可选策略包括：
-- consistent_hash：一致性哈希
-- custom：通过配置文件加载用户自定义策略
+- 盘感知：umm_get_topology 发现在线 SSD、alloc_on_device 分配每盘 extent；
+- 打散策略：可插拔 PlacementStrategy（默认 position_hash），
+  key -> device_idx；稀疏 KV 场景 key = (layer_id, token_idx)；
+- 数据路径：同盘单元聚合成段（super page）缓冲，写满以一次段大小连续
+  IO 下盘；读侧 IN_BUF 透明（缓冲 memcpy）+ 偏移相邻合并 + 跨盘并行。
+
+寻址一律 (device, offset)，与 UMM 数据面同构；不再有旧版"全局自增索引"
+的 save/read API（已删除，见 docs/07 §6）。
+
+设计文档：bmpclient/docs/06_稀疏注意力KV卸载数据排布设计.md、
+         bmpclient/docs/07_VirtualMedia合并设计_稀疏KV专用介质.md。
 """
 
 import threading
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from bmpclient.umm_client import UMMLib, ChunkDescriptor, UMM_TIER_SSD
-from bmpclient.virtual_media_config import get_strategy_name, get_strategy_options, load_config
-from bmpclient.virtual_media_strategy import DataPlacementStrategy, create_strategy
+from bmpclient._vm_segment import DeviceSegmentManager, SegmentFullError
+from bmpclient.concurrent_io import ConcurrentIOEngine, IOAddress, IORequest
+from bmpclient.umm_client import ChunkDescriptor, UMMLib, UMM_TIER_SSD
+from bmpclient.virtual_media_config import (
+    get_strategy_name,
+    get_strategy_options,
+    load_config,
+)
+from bmpclient.virtual_media_strategy import PlacementStrategy, create_strategy
 
-
-class VirtualMediaFullError(Exception):
-    """VirtualMedia 的所有条目槽位已写满。"""
-    pass
-
-
-@dataclass
-class DeviceExtent:
-    """VirtualMedia 在单个 SSD 设备上占用的一段空间。"""
-    device_idx: int           # SSD 设备索引
-    desc: ChunkDescriptor     # UMM 分配返回的 ChunkDescriptor（含 GPA、size）
+__all__ = ["VirtualMedia", "SegmentFullError"]
 
 
 class VirtualMedia:
     """
-    抽象底层多段 SSD 设备提供的定长数据存储空间。
+    稀疏 KV cache 专用介质：盘感知 + 打散策略 + 段聚合写路径。
 
-    创建时按 size 在所有在线 SSD 设备间均匀分配；
-    写入时通过配置的数据打散策略将每条数据映射到不同 SSD 设备；
-    读取时按保存时返回的索引定位数据。
-
-    数据打散策略可通过以下三种方式指定（优先级从高到低）：
-    1. VirtualMedia 构造函数传入 strategy 参数（策略实例或策略名）
-    2. 读取 bmpclient/config/virtual_media.json 配置文件
-    3. 默认使用 round-robin 策略
+    :param lib: 已初始化的 UMMLib 实例（或 FakeUMMLib）
+    :param unit_size: 排布单元定长（4KB 对齐）
+    :param capacity_per_device: 每盘 extent 字节数（必须是本盘段大小整数倍）
+    :param strategy: 打散策略。None 读配置文件；str 为策略名；
+        PlacementStrategy 实例直接使用
+    :param sp_bytes: 段（super page）全局默认大小；None 读配置
+    :param sp_bytes_per_device: 按盘覆盖段大小 {device_idx: bytes}
+    :param num_workers: read_batch 兜底读的跨盘并行线程数
+    :param config_path: 配置文件路径（None 用默认 virtual_media.json）
     """
 
     def __init__(
         self,
         lib: UMMLib,
-        size: int,
-        granularity: int,
-        strategy: Union[str, DataPlacementStrategy, None] = None,
+        unit_size: int,
+        capacity_per_device: int,
+        strategy: Union[str, PlacementStrategy, None] = None,
+        sp_bytes: Optional[int] = None,
+        sp_bytes_per_device: Optional[Dict[int, int]] = None,
+        num_workers: int = 4,
+        config_path: Optional[str] = None,
     ):
-        """
-        :param lib: 已初始化的 UMMLib 实例
-        :param size: VirtualMedia 总容量（字节），必须能被在线 SSD 设备数整除
-        :param granularity: 单条数据固定长度（字节），必须能整除每设备分配大小
-        :param strategy: 数据打散策略。可选：
-            - None：读取配置文件决定策略
-            - str：策略名，如 "round_robin"、"consistent_hash"、"custom"
-            - DataPlacementStrategy 实例：用户自定义策略对象
-        """
-        if size <= 0:
-            raise ValueError("size must be positive")
-        if granularity <= 0:
-            raise ValueError("granularity must be positive")
-        if size % granularity != 0:
-            raise ValueError(
-                f"size ({size}) must be divisible by granularity ({granularity})"
-            )
-
+        cfg = load_config(config_path)
         self._lib = lib
-        self._size = size
-        self._granularity = granularity
-        self._lock = threading.Lock()
-        self._next_slot = 0
-        self._extents: List[DeviceExtent] = []
-        self._index_map: List[Tuple[int, int]] = []
-        self._device_write_counts: List[int] = []
+        self._unit_size = unit_size
+        self._cfg = cfg
 
-        # 查询在线 SSD 设备
-        ssd_devices = self._list_ssd_devices()
-        num_devices = len(ssd_devices)
-        if num_devices == 0:
-            raise RuntimeError("No online SSD devices available")
+        devices = self._list_ssd_devices()
+        if not devices:
+            raise RuntimeError("无在线 SSD 设备")
+        self._devices = devices
 
-        if size % num_devices != 0:
-            raise ValueError(
-                f"size ({size}) must be divisible by SSD device count ({num_devices})"
+        default_sp = sp_bytes if sp_bytes is not None else int(cfg.get("super_page_bytes"))
+        sp_override = sp_bytes_per_device if sp_bytes_per_device is not None else {
+            int(k): int(v)
+            for k, v in cfg.get("super_page_bytes_per_device", {}).items()
+        }
+        self._mgrs: List[DeviceSegmentManager] = []
+        for d in devices:
+            desc = lib.alloc_on_device(capacity_per_device, UMM_TIER_SSD, d)
+            self._mgrs.append(
+                DeviceSegmentManager(
+                    lib, desc, d, sp_override.get(d, default_sp), unit_size
+                )
             )
 
-        device_size = size // num_devices
-        if device_size % granularity != 0:
-            raise ValueError(
-                f"per-device size ({device_size}) must be divisible by granularity ({granularity})"
-            )
+        self._strategy = self._resolve_strategy(strategy, cfg, len(devices))
+        self._engine = ConcurrentIOEngine(lib, num_workers=num_workers)
+        self._write_lock = threading.Lock()   # write 单写者串行化
+        self._closed = False
 
-        # 在每个 SSD 设备上分配 device_size 空间
-        for device_idx in sorted(ssd_devices):
-            desc = lib.alloc_on_device(device_size, UMM_TIER_SSD, device_idx)
-            self._extents.append(DeviceExtent(device_idx=device_idx, desc=desc))
-
-        # 按 device_idx 排序，确保设备顺序稳定
-        self._extents.sort(key=lambda e: e.device_idx)
-        self._device_write_counts = [0] * num_devices
-
-        # 初始化数据打散策略
-        self._strategy = self._resolve_strategy(strategy, num_devices)
+    # ------------------------------------------------------------------
+    # 初始化辅助
+    # ------------------------------------------------------------------
 
     def _list_ssd_devices(self) -> List[int]:
-        """查询当前在线的 SSD 设备索引列表（从 0 开始编号）。"""
+        """查询当前在线 SSD 设备索引列表（从 0 开始编号）。"""
         topo = self._lib.get_topology()
-        ssd_count = 0
+        count = 0
         for i in range(topo.num_resources):
             res = topo.resources[i]
             if res.tier == UMM_TIER_SSD and res.online:
-                ssd_count += 1
-        return list(range(ssd_count))
+                count += 1
+        return list(range(count))
 
-    def _resolve_strategy(
-        self,
-        strategy: Union[str, DataPlacementStrategy, None],
-        num_devices: int,
-    ) -> DataPlacementStrategy:
-        """根据用户输入或配置文件解析最终使用的数据打散策略。"""
+    def _resolve_strategy(self, strategy, cfg, num_devices) -> PlacementStrategy:
         if strategy is None:
-            cfg = load_config()
-            name = get_strategy_name(cfg)
-            options = get_strategy_options(cfg)
-            return create_strategy(name, num_devices, options)
-
+            return create_strategy(
+                get_strategy_name(cfg), num_devices, get_strategy_options(cfg)
+            )
         if isinstance(strategy, str):
             return create_strategy(strategy, num_devices, {})
-
-        if isinstance(strategy, DataPlacementStrategy):
+        if isinstance(strategy, PlacementStrategy):
             if strategy.num_devices != num_devices:
                 raise ValueError(
-                    f"strategy num_devices ({strategy.num_devices}) does not match "
-                    f"online SSD device count ({num_devices})"
+                    f"strategy num_devices ({strategy.num_devices}) != "
+                    f"在线 SSD 数 ({num_devices})"
                 )
             return strategy
+        raise TypeError("strategy 必须是 None / 策略名 / PlacementStrategy 实例")
 
-        raise TypeError(
-            "strategy must be None, a strategy name string, or a DataPlacementStrategy instance"
-        )
-
-    @property
-    def capacity(self) -> int:
-        """VirtualMedia 总容量（字节）。"""
-        return self._size
+    # ------------------------------------------------------------------
+    # 打散策略（key -> device）
+    # ------------------------------------------------------------------
 
     @property
-    def granularity(self) -> int:
-        """单条数据固定长度（字节）。"""
-        return self._granularity
-
-    @property
-    def slot_count(self) -> int:
-        """可存储的条目总数。"""
-        return self._size // self._granularity
-
-    @property
-    def written_count(self) -> int:
-        """已写入条目数。"""
-        with self._lock:
-            return self._next_slot
+    def strategy(self) -> PlacementStrategy:
+        return self._strategy
 
     @property
     def device_count(self) -> int:
-        """底层 SSD 设备数量。"""
-        return len(self._extents)
+        return len(self._devices)
 
     @property
-    def strategy(self) -> DataPlacementStrategy:
-        """当前使用的数据打散策略。"""
-        return self._strategy
+    def unit_size(self) -> int:
+        return self._unit_size
 
-    def save(self, data: bytes) -> int:
+    def locate(self, key: Any) -> int:
+        """由策略计算 key 的目标盘号。稀疏 KV 场景 key = (layer_id, token_idx)。"""
+        return self._strategy.locate(key)
+
+    def locate_batch(self, keys: List[Any]) -> List[int]:
+        """批量 locate（地址规划流水线第①步）。"""
+        return self._strategy.locate_batch(keys)
+
+    # ------------------------------------------------------------------
+    # 写路径（CPU 提交，不入图）
+    # ------------------------------------------------------------------
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("VirtualMedia 已关闭")
+
+    def write(self, key: Any, data: bytes) -> int:
         """
-        保存一条定长数据。
-
-        :param data: 待保存数据，长度必须等于 granularity
-        :return: 本次写入的条目索引
-        :raises ValueError: 数据长度不等于 granularity
-        :raises VirtualMediaFullError: 所有槽位已满
+        写一个单元：locate(key) 分盘 → 追加该盘段缓冲（满则一次段大小
+        连续 IO 下盘）。返回 extent 内字节偏移（调用方入元数据）。
+        段耗尽抛 SegmentFullError。
         """
-        if len(data) != self._granularity:
-            raise ValueError(
-                f"data length ({len(data)}) must equal granularity ({self._granularity})"
-            )
+        self._ensure_open()
+        d = self._strategy.locate(key)
+        with self._write_lock:
+            return self._mgrs[d].append(data)
 
-        with self._lock:
-            if self._next_slot >= self.slot_count:
-                raise VirtualMediaFullError(
-                    f"VirtualMedia is full: {self._next_slot}/{self.slot_count} slots used"
-                )
+    def flush(self) -> None:
+        """强制刷所有盘的半满段缓冲。"""
+        self._ensure_open()
+        with self._write_lock:
+            for mgr in self._mgrs:
+                mgr.flush()
 
-            index = self._next_slot
-            num_devices = len(self._extents)
-            device_idx = self._strategy.locate(index)
-            slot_within_device = self._device_write_counts[device_idx]
-            slots_per_device = self.slot_count // num_devices
+    # ------------------------------------------------------------------
+    # 读路径支撑（生产读由 GPU 直通算子执行；这里供地址规划与兜底）
+    # ------------------------------------------------------------------
 
-            if slot_within_device >= slots_per_device:
-                raise VirtualMediaFullError(
-                    f"device {device_idx} is full: "
-                    f"{slot_within_device}/{slots_per_device} slots used"
-                )
+    def extent_base(self, device: int) -> int:
+        """该盘 extent 在存储侧的基址（盘侧地址 = extent_base + offset）。
 
-            offset_within_device = slot_within_device * self._granularity
-
-            extent = self._extents[device_idx]
-            self._lib.write(extent.desc, offset_within_device, data)
-
-            self._device_write_counts[device_idx] += 1
-            self._index_map.append((device_idx, slot_within_device))
-            self._next_slot += 1
-            return index
-
-    def read(self, index: int) -> bytes:
+        当前返回 0 占位：chunk 级盘侧基址需从 ChunkDescriptor.base_gpa
+        解出，依赖 libumm 补齐 umm_alloc_on_device 后一并提供
+        （docs/07 §5.3 规则 4）；FakeUMMLib 阶段以设备内偏移验证。
         """
-        按条目索引读取数据。
+        self._check_device(device)
+        return 0
 
-        :param index: 条目索引，必须 0 <= index < written_count
-        :return: 读取到的数据（长度为 granularity）
-        :raises ValueError: 索引越界
+    def is_buffered(self, device: int, offset: int) -> bool:
+        """该偏移是否仍在主机段聚合缓冲（未下盘）。plan 兜底判定用。"""
+        self._ensure_open()
+        self._check_device(device)
+        return self._mgrs[device].is_buffered(offset)
+
+    def read_buffered(self, device: int, offset: int) -> Optional[bytes]:
+        """读未下盘单元（在缓冲返回数据，否则 None——调用方回退盘读）。"""
+        self._check_device(device)
+        return self._mgrs[device].read_buffer(offset, self._unit_size)
+
+    def read_batch(
+        self, items: List[Tuple[int, int]], outs: List[memoryview]
+    ) -> None:
         """
-        if index < 0:
-            raise ValueError("index must be non-negative")
+        CPU 兜底批量读（联调/无直通硬件环境用；生产读路径不走这里）。
+        items = [(device, offset)]，outs[i] 对应 items[i]，长度 >= unit_size。
+        内部：IN_BUF 从缓冲 memcpy；盘读按盘分桶、offset 排序、相邻合并、
+        ConcurrentIOEngine 跨盘并行。
+        """
+        self._ensure_open()
+        if len(items) != len(outs):
+            raise ValueError("items 与 outs 长度不一致")
+        buckets: Dict[int, List[Tuple[int, int]]] = {}
+        for pos, (d, off) in enumerate(items):
+            self._check_device(d)
+            if outs[pos].nbytes < self._unit_size:
+                raise ValueError("out buffer 不足 unit_size")
+            data = self._mgrs[d].read_buffer(off, self._unit_size)
+            if data is not None:
+                outs[pos][: self._unit_size] = data
+            else:
+                buckets.setdefault(d, []).append((pos, off))
 
-        with self._lock:
-            if index >= self._next_slot:
-                raise ValueError(
-                    f"index {index} not written yet (written_count={self._next_slot})"
-                )
+        requests: List[IORequest] = []
+        staged: List[Tuple[bytearray, List[Tuple[int, int]]]] = []
+        for d, group in buckets.items():
+            group.sort(key=lambda x: x[1])
+            desc = self._mgrs[d].desc
+            for run in self._merge_runs(group):
+                start_off = run[0][1]
+                staging = bytearray(run[-1][1] + self._unit_size - start_off)
+                requests.append(IORequest(
+                    IOAddress.from_descriptor(desc, start_off, len(staging)),
+                    memoryview(staging),
+                ))
+                staged.append((staging, [(p, o - start_off) for p, o in run]))
+        if requests:
+            self._engine.read_batch(requests)
+            for staging, pieces in staged:
+                for pos, local in pieces:
+                    outs[pos][: self._unit_size] = staging[
+                        local:local + self._unit_size
+                    ]
 
-            device_idx, slot_within_device = self._index_map[index]
-            offset_within_device = slot_within_device * self._granularity
+    def _merge_runs(
+        self, items: List[Tuple[int, int]]
+    ) -> List[List[Tuple[int, int]]]:
+        """把按 offset 排序的 (pos, offset) 列表中相邻单元合并为连续读段。"""
+        runs: List[List[Tuple[int, int]]] = []
+        for pos, off in items:
+            if runs and off == runs[-1][-1][1] + self._unit_size:
+                runs[-1].append((pos, off))
+            else:
+                runs.append([(pos, off)])
+        return runs
 
-            extent = self._extents[device_idx]
-            return self._lib.read(extent.desc, offset_within_device, self._granularity)
+    def _check_device(self, device: int) -> None:
+        if not 0 <= device < len(self._mgrs):
+            raise ValueError(f"device 越界: {device}")
+
+    # ------------------------------------------------------------------
+    # 回收与生命周期
+    # ------------------------------------------------------------------
+
+    def release(self, device: int, offset: int) -> None:
+        """释放一个单元：递减所属段引用计数，归零段回空闲池。"""
+        self._ensure_open()
+        self._check_device(device)
+        self._mgrs[device].release(offset)
+
+    def stats(self) -> dict:
+        """各盘空闲段数与缓冲单元数（观测用）。"""
+        return {
+            "devices": len(self._mgrs),
+            "free_segments": [m.num_free_segments for m in self._mgrs],
+            "buffered_units": [m.buffered_units for m in self._mgrs],
+        }
 
     def close(self) -> None:
-        """释放 VirtualMedia 占用的所有底层 SSD Chunk。"""
-        with self._lock:
-            for extent in self._extents:
-                self._lib.free(extent.desc)
-            self._extents.clear()
-            self._index_map.clear()
-            self._device_write_counts.clear()
-            self._next_slot = 0
+        """释放各盘 extent 与并发引擎（未 flush 的半满段数据随之丢失）。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._engine.close()
+        for mgr in self._mgrs:
+            self._lib.free(mgr.desc)
 
-    def __enter__(self):
+    def __enter__(self) -> "VirtualMedia":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False

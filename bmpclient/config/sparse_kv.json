@@ -1,10 +1,9 @@
 {
-  "strategy": "position_hash",
   "step_idx": 17,
   "step_layer": 23,
   "prime": 2229299,
+  "unit_size": 4096,
   "super_page_bytes": 2097152,
   "super_page_bytes_per_device": { "0": 4194304, "2": 1048576 },
-  "flush_policy": "on_request_end",
-  "max_topk": 512
+  "flush_policy": "on_request_end"
 }

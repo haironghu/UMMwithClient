@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333"/>
+    </marker>
+  </defs>
+  <text x="450.0" y="30" text-anchor="middle" font-size="16" fill="#000" font-weight="bold">图 1：全量 KV cache 按位置哈希打散到 8 块 SSD，并以 super page 对齐</text>
+  <text x="60" y="45" text-anchor="start" font-size="12" fill="#000" font-weight="normal">layer 0 的 token 序列（按位置哈希决定目标盘）</text>
+  <rect x="60" y="60" width="24" height="28" fill="#a8d5e5" stroke="#333" stroke-width="1"/>
+  <text x="72.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">0</text>
+  <rect x="90" y="60" width="24" height="28" fill="#f9d89c" stroke="#333" stroke-width="1"/>
+  <text x="102.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">1</text>
+  <rect x="120" y="60" width="24" height="28" fill="#b8e6b8" stroke="#333" stroke-width="1"/>
+  <text x="132.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">2</text>
+  <rect x="150" y="60" width="24" height="28" fill="#e2b8e2" stroke="#333" stroke-width="1"/>
+  <text x="162.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">3</text>
+  <rect x="180" y="60" width="24" height="28" fill="#f7b7a3" stroke="#333" stroke-width="1"/>
+  <text x="192.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">4</text>
+  <rect x="210" y="60" width="24" height="28" fill="#c9c9ff" stroke="#333" stroke-width="1"/>
+  <text x="222.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">5</text>
+  <rect x="240" y="60" width="24" height="28" fill="#ffdfba" stroke="#333" stroke-width="1"/>
+  <text x="252.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">6</text>
+  <rect x="270" y="60" width="24" height="28" fill="#b5e7a0" stroke="#333" stroke-width="1"/>
+  <text x="282.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">7</text>
+  <rect x="300" y="60" width="24" height="28" fill="#a8d5e5" stroke="#333" stroke-width="1"/>
+  <text x="312.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">8</text>
+  <rect x="330" y="60" width="24" height="28" fill="#f9d89c" stroke="#333" stroke-width="1"/>
+  <text x="342.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">9</text>
+  <rect x="360" y="60" width="24" height="28" fill="#b8e6b8" stroke="#333" stroke-width="1"/>
+  <text x="372.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">10</text>
+  <rect x="390" y="60" width="24" height="28" fill="#e2b8e2" stroke="#333" stroke-width="1"/>
+  <text x="402.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">11</text>
+  <rect x="420" y="60" width="24" height="28" fill="#f7b7a3" stroke="#333" stroke-width="1"/>
+  <text x="432.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">12</text>
+  <rect x="450" y="60" width="24" height="28" fill="#c9c9ff" stroke="#333" stroke-width="1"/>
+  <text x="462.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">13</text>
+  <rect x="480" y="60" width="24" height="28" fill="#ffdfba" stroke="#333" stroke-width="1"/>
+  <text x="492.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">14</text>
+  <rect x="510" y="60" width="24" height="28" fill="#b5e7a0" stroke="#333" stroke-width="1"/>
+  <text x="522.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">15</text>
+  <rect x="540" y="60" width="24" height="28" fill="#a8d5e5" stroke="#333" stroke-width="1"/>
+  <text x="552.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">16</text>
+  <rect x="570" y="60" width="24" height="28" fill="#f9d89c" stroke="#333" stroke-width="1"/>
+  <text x="582.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">17</text>
+  <rect x="600" y="60" width="24" height="28" fill="#b8e6b8" stroke="#333" stroke-width="1"/>
+  <text x="612.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">18</text>
+  <rect x="630" y="60" width="24" height="28" fill="#e2b8e2" stroke="#333" stroke-width="1"/>
+  <text x="642.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">19</text>
+  <rect x="660" y="60" width="24" height="28" fill="#f7b7a3" stroke="#333" stroke-width="1"/>
+  <text x="672.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">20</text>
+  <rect x="690" y="60" width="24" height="28" fill="#c9c9ff" stroke="#333" stroke-width="1"/>
+  <text x="702.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">21</text>
+  <rect x="720" y="60" width="24" height="28" fill="#ffdfba" stroke="#333" stroke-width="1"/>
+  <text x="732.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">22</text>
+  <rect x="750" y="60" width="24" height="28" fill="#b5e7a0" stroke="#333" stroke-width="1"/>
+  <text x="762.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">23</text>
+  <rect x="780" y="60" width="24" height="28" fill="#a8d5e5" stroke="#333" stroke-width="1"/>
+  <text x="792.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">24</text>
+  <rect x="810" y="60" width="24" height="28" fill="#f9d89c" stroke="#333" stroke-width="1"/>
+  <text x="822.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">25</text>
+  <rect x="840" y="60" width="24" height="28" fill="#b8e6b8" stroke="#333" stroke-width="1"/>
+  <text x="852.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">26</text>
+  <rect x="870" y="60" width="24" height="28" fill="#e2b8e2" stroke="#333" stroke-width="1"/>
+  <text x="882.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">27</text>
+  <rect x="900" y="60" width="24" height="28" fill="#f7b7a3" stroke="#333" stroke-width="1"/>
+  <text x="912.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">28</text>
+  <rect x="930" y="60" width="24" height="28" fill="#c9c9ff" stroke="#333" stroke-width="1"/>
+  <text x="942.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">29</text>
+  <rect x="960" y="60" width="24" height="28" fill="#ffdfba" stroke="#333" stroke-width="1"/>
+  <text x="972.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">30</text>
+  <rect x="990" y="60" width="24" height="28" fill="#b5e7a0" stroke="#333" stroke-width="1"/>
+  <text x="1002.0" y="78.0" text-anchor="middle" font-size="12" fill="#333">31</text>
+  <text x="85.0" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD0</text>
+  <rect x="50.0" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="85.0" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="50.0" y1="158" x2="50.0" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="67.5" y1="158" x2="67.5" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="85.0" y1="158" x2="85.0" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="102.5" y1="158" x2="102.5" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="50.0" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="85.0" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="50.0" y1="184" x2="50.0" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="67.5" y1="184" x2="67.5" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="85.0" y1="184" x2="85.0" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="102.5" y1="184" x2="102.5" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="50.0" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="85.0" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="50.0" y1="210" x2="50.0" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="67.5" y1="210" x2="67.5" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="85.0" y1="210" x2="85.0" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="102.5" y1="210" x2="102.5" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="189.28571428571428" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD1</text>
+  <rect x="154.28571428571428" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="189.28571428571428" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="154.28571428571428" y1="158" x2="154.28571428571428" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="171.78571428571428" y1="158" x2="171.78571428571428" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="189.28571428571428" y1="158" x2="189.28571428571428" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="206.78571428571428" y1="158" x2="206.78571428571428" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="154.28571428571428" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="189.28571428571428" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="154.28571428571428" y1="184" x2="154.28571428571428" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="171.78571428571428" y1="184" x2="171.78571428571428" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="189.28571428571428" y1="184" x2="189.28571428571428" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="206.78571428571428" y1="184" x2="206.78571428571428" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="154.28571428571428" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="189.28571428571428" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="154.28571428571428" y1="210" x2="154.28571428571428" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="171.78571428571428" y1="210" x2="171.78571428571428" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="189.28571428571428" y1="210" x2="189.28571428571428" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="206.78571428571428" y1="210" x2="206.78571428571428" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="293.57142857142856" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD2</text>
+  <rect x="258.57142857142856" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="293.57142857142856" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="258.57142857142856" y1="158" x2="258.57142857142856" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="276.07142857142856" y1="158" x2="276.07142857142856" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="293.57142857142856" y1="158" x2="293.57142857142856" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="311.07142857142856" y1="158" x2="311.07142857142856" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="258.57142857142856" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="293.57142857142856" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="258.57142857142856" y1="184" x2="258.57142857142856" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="276.07142857142856" y1="184" x2="276.07142857142856" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="293.57142857142856" y1="184" x2="293.57142857142856" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="311.07142857142856" y1="184" x2="311.07142857142856" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="258.57142857142856" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="293.57142857142856" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="258.57142857142856" y1="210" x2="258.57142857142856" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="276.07142857142856" y1="210" x2="276.07142857142856" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="293.57142857142856" y1="210" x2="293.57142857142856" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="311.07142857142856" y1="210" x2="311.07142857142856" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="397.85714285714283" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD3</text>
+  <rect x="362.85714285714283" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="397.85714285714283" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="362.85714285714283" y1="158" x2="362.85714285714283" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="380.35714285714283" y1="158" x2="380.35714285714283" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="397.85714285714283" y1="158" x2="397.85714285714283" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="415.35714285714283" y1="158" x2="415.35714285714283" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="362.85714285714283" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="397.85714285714283" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="362.85714285714283" y1="184" x2="362.85714285714283" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="380.35714285714283" y1="184" x2="380.35714285714283" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="397.85714285714283" y1="184" x2="397.85714285714283" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="415.35714285714283" y1="184" x2="415.35714285714283" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="362.85714285714283" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="397.85714285714283" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="362.85714285714283" y1="210" x2="362.85714285714283" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="380.35714285714283" y1="210" x2="380.35714285714283" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="397.85714285714283" y1="210" x2="397.85714285714283" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="415.35714285714283" y1="210" x2="415.35714285714283" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="502.1428571428571" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD4</text>
+  <rect x="467.1428571428571" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="502.1428571428571" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="467.1428571428571" y1="158" x2="467.1428571428571" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="484.6428571428571" y1="158" x2="484.6428571428571" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="502.1428571428571" y1="158" x2="502.1428571428571" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="519.6428571428571" y1="158" x2="519.6428571428571" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="467.1428571428571" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="502.1428571428571" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="467.1428571428571" y1="184" x2="467.1428571428571" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="484.6428571428571" y1="184" x2="484.6428571428571" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="502.1428571428571" y1="184" x2="502.1428571428571" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="519.6428571428571" y1="184" x2="519.6428571428571" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="467.1428571428571" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="502.1428571428571" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="467.1428571428571" y1="210" x2="467.1428571428571" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="484.6428571428571" y1="210" x2="484.6428571428571" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="502.1428571428571" y1="210" x2="502.1428571428571" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="519.6428571428571" y1="210" x2="519.6428571428571" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="606.4285714285713" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD5</text>
+  <rect x="571.4285714285713" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="606.4285714285713" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="571.4285714285713" y1="158" x2="571.4285714285713" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="588.9285714285713" y1="158" x2="588.9285714285713" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="606.4285714285713" y1="158" x2="606.4285714285713" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="623.9285714285713" y1="158" x2="623.9285714285713" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="571.4285714285713" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="606.4285714285713" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="571.4285714285713" y1="184" x2="571.4285714285713" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="588.9285714285713" y1="184" x2="588.9285714285713" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="606.4285714285713" y1="184" x2="606.4285714285713" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="623.9285714285713" y1="184" x2="623.9285714285713" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="571.4285714285713" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="606.4285714285713" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="571.4285714285713" y1="210" x2="571.4285714285713" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="588.9285714285713" y1="210" x2="588.9285714285713" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="606.4285714285713" y1="210" x2="606.4285714285713" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="623.9285714285713" y1="210" x2="623.9285714285713" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="710.7142857142857" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD6</text>
+  <rect x="675.7142857142857" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="710.7142857142857" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="675.7142857142857" y1="158" x2="675.7142857142857" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="693.2142857142857" y1="158" x2="693.2142857142857" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="710.7142857142857" y1="158" x2="710.7142857142857" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="728.2142857142857" y1="158" x2="728.2142857142857" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="675.7142857142857" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="710.7142857142857" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="675.7142857142857" y1="184" x2="675.7142857142857" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="693.2142857142857" y1="184" x2="693.2142857142857" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="710.7142857142857" y1="184" x2="710.7142857142857" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="728.2142857142857" y1="184" x2="728.2142857142857" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="675.7142857142857" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="710.7142857142857" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="675.7142857142857" y1="210" x2="675.7142857142857" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="693.2142857142857" y1="210" x2="693.2142857142857" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="710.7142857142857" y1="210" x2="710.7142857142857" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="728.2142857142857" y1="210" x2="728.2142857142857" y2="232" stroke="#aaa" stroke-width="1"/>
+  <text x="815.0" y="148" text-anchor="middle" font-size="13" fill="#000" font-weight="bold">SSD7</text>
+  <rect x="780.0" y="158" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="815.0" y="173.0" text-anchor="middle" font-size="12" fill="#666">seg@0</text>
+  <line x1="780.0" y1="158" x2="780.0" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="797.5" y1="158" x2="797.5" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="815.0" y1="158" x2="815.0" y2="180" stroke="#aaa" stroke-width="1"/>
+  <line x1="832.5" y1="158" x2="832.5" y2="180" stroke="#aaa" stroke-width="1"/>
+  <rect x="780.0" y="184" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="815.0" y="199.0" text-anchor="middle" font-size="12" fill="#666">seg@16384</text>
+  <line x1="780.0" y1="184" x2="780.0" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="797.5" y1="184" x2="797.5" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="815.0" y1="184" x2="815.0" y2="206" stroke="#aaa" stroke-width="1"/>
+  <line x1="832.5" y1="184" x2="832.5" y2="206" stroke="#aaa" stroke-width="1"/>
+  <rect x="780.0" y="210" width="70" height="22" fill="#f5f5f5" stroke="#333" stroke-width="1"/>
+  <text x="815.0" y="225.0" text-anchor="middle" font-size="12" fill="#666">seg@32768</text>
+  <line x1="780.0" y1="210" x2="780.0" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="797.5" y1="210" x2="797.5" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="815.0" y1="210" x2="815.0" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="832.5" y1="210" x2="832.5" y2="232" stroke="#aaa" stroke-width="1"/>
+  <line x1="72.0" y1="88" x2="85.0" y2="148" stroke="#a8d5e5" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="102.0" y1="88" x2="189.28571428571428" y2="148" stroke="#f9d89c" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="282.0" y1="88" x2="815.0" y2="148" stroke="#b5e7a0" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="312.0" y1="88" x2="85.0" y2="148" stroke="#a8d5e5" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="522.0" y1="88" x2="815.0" y2="148" stroke="#b5e7a0" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="552.0" y1="88" x2="85.0" y2="148" stroke="#a8d5e5" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="762.0" y1="88" x2="815.0" y2="148" stroke="#b5e7a0" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="1002.0" y1="88" x2="815.0" y2="148" stroke="#b5e7a0" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <text x="60" y="460" text-anchor="start" font-size="12" fill="#000" font-weight="normal">哈希公式：device = ((token_idx * STEP_IDX + layer_id * STEP_LAYER) % PRIME) % N_SSD</text>
+  <text x="60" y="480" text-anchor="start" font-size="12" fill="#000" font-weight="normal">同盘内连续 token 按追加顺序填入 segment，满 super page 后以整段连续 IO 下盘</text>
+  <text x="60" y="500" text-anchor="start" font-size="12" fill="#000" font-weight="normal">super page 对齐保证 topk 加载时能从不同 channel/die/plane 并行读取</text>
+</svg>

@@ -35,19 +35,26 @@ bmpclient/
 ├── __init__.py                  # 包入口，导出公共 API
 ├── client.py                    # UMMServiceClient
 ├── allocator.py                 # FineGrainedAllocator + ChunkBuffer + Block
-├── virtual_media.py             # VirtualMedia + DeviceExtent + VirtualMediaFullError
-├── virtual_media_strategy.py    # 数据打散策略抽象与内建实现
-├── virtual_media_config.py      # 策略配置文件加载
+├── virtual_media.py             # VirtualMedia（稀疏 KV 专用介质层）
+├── _vm_segment.py               # 段（super page）分配器与聚合写缓冲
+├── virtual_media_strategy.py    # 语义键打散策略抽象（position_hash 内建）
+├── virtual_media_config.py      # VirtualMedia 配置加载
 ├── config/
-│   └── virtual_media.json       # 默认策略配置
+│   └── virtual_media.json       # VirtualMedia 默认配置
+├── sparse_kv/                   # 稀疏 KV 框架对接层
+│   ├── __init__.py
+│   ├── store.py                 # SparseKVStore + PlanView
+│   ├── slot_table.py            # (layer, token) -> 偏移 packed entry
+│   └── vllm_adapter.py          # KVBlockRef
 ├── scripts/                     # 手动验证脚本
 │   ├── _common.py               # 服务状态检查辅助
 │   ├── demo_allocator.py        # 分配器功能演示
-│   ├── demo_virtual_media.py    # 虚拟介质功能演示
+│   ├── demo_sparse_kv.py        # 稀疏 KV 卸载/地址规划演示
 │   └── run_all_demos.sh         # 一键运行所有演示
 └── tests/                       # 单元测试
     ├── test_allocator.py        # 分配器测试
-    └── test_virtual_media.py    # 虚拟介质测试
+    ├── test_virtual_media.py    # VirtualMedia 介质层测试
+    └── test_sparse_kv.py        # SparseKVStore 对接层测试
 ```
 
 ## 依赖
@@ -95,111 +102,80 @@ allocator.free(block)
 allocator.close()
 ```
 
-### 3. VirtualMedia
+### 3. VirtualMedia + SparseKVStore（稀疏 KV cache 专用）
 
-跨多块 SSD 设备的定长数据存储抽象：
+合并重构后，`VirtualMedia` 只服务稀疏注意力 KV cache 卸载/加载场景，
+按职责拆为两层：
 
-- **均匀分配**：创建时按 `size` 在所有在线 SSD 设备间均分空间
-- **定长条目**：每条数据长度固定为 `granularity`，总条目数 `size // granularity`
-- **可插拔打散策略**：通过策略决定第 `i` 条数据写入哪个 SSD 设备
-- **按索引读取**：`save(data)` 返回条目索引，`read(index)` 按索引读取
-- **直接调用 UMM**：不经过 `FineGrainedAllocator`，直接调用 `umm_alloc_on_device` / `umm_read` / `umm_write` / `umm_free`
-- **写满保护**：所有槽位写满后再次 `save()` 抛出 `VirtualMediaFullError`
+- **VirtualMedia（介质层）**：盘感知 + 可插拔语义键打散策略
+  （默认 `position_hash`）+ 段（super page）聚合写路径。
+- **SparseKVStore（框架对接层）**：vllm `KVBlockRef` 逐 token 展开、
+  `slot_table` 元数据、`plan()` 地址映射输出。
+
+关键架构决策：
+
+- 卸载（写）由 CPU 执行，**不入图**；
+- 加载（读）不经过本项目，只由 `SparseKVStore.plan()` 产出固定地址的
+  **descriptor buffer**（`(ssd_id, lba_offset, length, dst_offset)`），
+  供 GPU 直通存储算子在图内直接加载。
 
 #### 数据打散策略
 
-VirtualMedia 的数据打散策略通过 `bmpclient/config/virtual_media.json` 配置，也可在构造函数中显式指定。
+`VirtualMedia` 的策略从 "索引 -> 盘号" 升级为 "语义键 -> 盘号"。
+稀疏 KV 场景的键为 `(layer_id, token_idx)`，内建策略为确定性位置哈希：
 
-内建策略：
+```
+device = ((token_idx * STEP_IDX + layer_id * STEP_LAYER) % PRIME) % N_SSD
+```
 
-| 策略名 | 说明 | 配置项 |
-|--------|------|--------|
-| `round_robin` | 顺序 round-robin 打散（默认） | 无 |
-| `consistent_hash` | 一致性哈希打散 | `virtual_nodes`（默认 150） |
-| `custom` | 动态加载用户自定义策略类 | `module`、`class`、`options` |
-
-默认配置文件 `bmpclient/config/virtual_media.json`：
+配置示例 `bmpclient/config/virtual_media.json`：
 
 ```json
 {
-  "strategy": "round_robin"
+  "strategy": "position_hash",
+  "step_idx": 17,
+  "step_layer": 23,
+  "prime": 2229299,
+  "super_page_bytes": 2097152,
+  "max_topk": 512
 }
-```
-
-一致性哈希配置示例：
-
-```json
-{
-  "strategy": "consistent_hash",
-  "virtual_nodes": 150
-}
-```
-
-自定义策略配置示例：
-
-```json
-{
-  "strategy": "custom",
-  "module": "my_package.my_strategy",
-  "class": "MyStrategy",
-  "options": {}
-}
-```
-
-自定义策略类需要继承 `DataPlacementStrategy` 并实现 `locate(index) -> device_idx`：
-
-```python
-from bmpclient.virtual_media_strategy import DataPlacementStrategy
-
-class MyStrategy(DataPlacementStrategy):
-    def locate(self, index: int) -> int:
-        # 返回目标 SSD 设备索引
-        return index % self._num_devices
 ```
 
 #### 使用示例
 
 ```python
-from bmpclient.client import UMMServiceClient
+from bmpclient.sparse_kv import KVBlockRef, SparseKVStore
+from bmpclient.testing import FakeUMMLib
 from bmpclient.virtual_media import VirtualMedia
 
-# 客户端需要配置与 umms 服务端相同的 SSD 设备列表，
-# 以便本地 transport 能够正确映射 SSD 地址空间
-ssd_devices = [
-    ("/tmp/umm_ssd0.raw", 10 * 1024 * 1024),
-    ("/tmp/umm_ssd1.raw", 10 * 1024 * 1024),
-    ("/tmp/umm_ssd2.raw", 10 * 1024 * 1024),
-]
-
-client = UMMServiceClient(
-    "127.0.0.1:20001",
-    "127.0.0.1:20002",
-    ssd_devices=ssd_devices,
+lib = FakeUMMLib(num_ssd_devices=4)
+vm = VirtualMedia(
+    lib,
+    unit_size=4096,
+    capacity_per_device=64 * 1024 * 1024,
+    sp_bytes=16 * 4096,
 )
+store = SparseKVStore(vm, num_layers=4, max_tokens=256, max_topk=64)
 
-# 30M 总容量，3 块 SSD 各 10M，单条 1M
-# 不传 strategy 时读取 bmpclient/config/virtual_media.json
-vm = VirtualMedia(client.lib, size=30 * 1024 * 1024, granularity=1024 * 1024)
-print(vm.slot_count)  # 30
+# 构造 vllm block：layer 0, token [0,16), 每 token 4KB
+buf = bytearray(16 * 4096)
+block = KVBlockRef(layer_id=0, block_idx=0, token_start=0,
+                   token_count=16, buffer=buf)
+store.offload([block])
+store.flush()
 
-# 也可显式指定策略名
-vm_ch = VirtualMedia(
-    client.lib,
-    size=30 * 1024 * 1024,
-    granularity=1024 * 1024,
-    strategy="consistent_hash",
-)
+# decode 阶段：对 layer 0 的 topk token 做地址规划
+plan = store.plan(0, [0, 4, 7, 12])
+print(f"descriptor buffer 地址: 0x{plan.address:x}")
+for i in range(plan.count):
+    ssd_id, flags, lba_off, length, dst_off = plan.entry(i)
+    print(f"entry[{i}]: ssd={ssd_id} flags={flags} lba={lba_off} len={length}")
 
-# 顺序写入
-for i in range(30):
-    data = f"record-{i:04d}".encode().ljust(1024 * 1024, b'\0')
-    idx = vm.save(data)
+# CPU 兜底读（无 GPU 直通硬件的验证/降级场景）
+out = [memoryview(bytearray(4096)) for _ in range(4)]
+store.fetch(0, [0, 4, 7, 12], out)
 
-# 读取第 5 条
-print(vm.read(5))
-
-vm.close()
-client.close()
+store.close()
 ```
 
 ## 运行测试
@@ -212,22 +188,20 @@ cd bmpclient
 # 运行分配器测试
 PYTHONPATH=.. python3 tests/test_allocator.py
 
-# 运行虚拟介质测试
+# 运行虚拟介质 / 稀疏 KV 测试（均使用 FakeUMMLib，无需真实服务）
 PYTHONPATH=.. python3 tests/test_virtual_media.py
+PYTHONPATH=.. python3 tests/test_sparse_kv.py
 ```
 
 测试覆盖：
 - 单 Chunk 内多次细粒度分配与释放
-- 跨 Chunk 自动扩容
-- Chunk 完全空闲后自动回收
-- 相邻空闲块合并
-- DRAM / SSD 隔离与容量耗尽
-- 批量预分配
-- 多线程并发 alloc/free
+- 跨 Chunk 自动扩容、Chunk 回收与相邻空闲块合并
+- DRAM / SSD 隔离与容量耗尽、批量预分配、多线程并发 alloc/free
 - Block 级 read/write（含偏移、越界检查、SSD 介质）
-- VirtualMedia 多设备均匀分配、round-robin 写入、按索引读取、写满异常
-- VirtualMedia 数据打散策略抽象（round-robin、consistent_hash、自定义策略）
-- VirtualMedia 配置文件驱动策略加载
+- VirtualMedia 位置哈希性质、段聚合写 IO 连续性、段回收复用、异构段大小
+- VirtualMedia `is_buffered` / `extent_base` / `read_batch` 正确性
+- SparseKVStore `offload/flush/release/fetch` 数据一致性
+- `plan()` 产出的 descriptor buffer 地址映射、HOST_READY 兜底、`max_topk` 语义
 
 ## 手动验证
 
@@ -248,7 +222,7 @@ cd UMM
 # 2. 运行演示
 cd ../bmpclient
 python3 scripts/demo_allocator.py
-python3 scripts/demo_virtual_media.py
+python3 scripts/demo_sparse_kv.py
 
 # 3. 停止服务
 cd ../UMM

@@ -5,3 +5,5 @@ bin/umms
 *.o
 bin/ssd_sim_test
 bin/umm_nds_rpc_server
+bin/libnvm_host*.so
+bin/libnds_aiv.so
