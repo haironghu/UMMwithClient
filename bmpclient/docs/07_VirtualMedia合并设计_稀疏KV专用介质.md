@@ -195,8 +195,8 @@ entry[i]（i < count，定长 32B）:
 4. **地址翻译依赖 C 侧**：`lba_offset = extent_base + offset` 要求
    extent 的盘侧基址可查询。`umm_get_topology` 只有设备级
    `base_offset`，chunk 级基址需从 `ChunkDescriptor.base_gpa` 解出——
-   依赖 `umm_alloc_on_device` 符号补齐后一并提供（基线已知问题，
-   FakeUMMLib 阶段以设备内偏移占位验证）。
+   `umm_alloc_on_device` 已恢复，但 `extent_base()` 的盘侧地址导出尚未实现，
+   当前 plan 描述符仍按设备内偏移占位；CPU fetch 不依赖此函数。
 
 ## 6. 文件迁移映射
 
@@ -220,8 +220,8 @@ entry[i]（i < count，定长 32B）:
 - 旧 VirtualMedia 的 `save/read` API 删除：其单测约 13 项失败本就是
   基线既有问题（libumm 未导出 `umm_alloc_on_device`），删除无额外损失；
   引用旧 API 的脚本同步迁移。
-- `umm_alloc_on_device` 缺失的基线约束不变；GPU 直通加载所需的 chunk
-  级盘侧基址查询随该符号补齐一并落地（§5.3 规则 4）。
+- `umm_alloc_on_device` 已恢复，见 [08_指定SSD分配接口.md](08_指定SSD分配接口.md)；
+  GPU 直通加载所需的盘侧基址导出仍为后续工作（§5.3 规则 4）。
 - CPU 兜底 `fetch` 长期保留：无直通硬件环境（仿真、CI）的验证手段。
 
 ## 8. 验证方案（迁移后）

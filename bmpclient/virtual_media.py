@@ -177,8 +177,8 @@ class VirtualMedia:
         """该盘 extent 在存储侧的基址（盘侧地址 = extent_base + offset）。
 
         当前返回 0 占位：chunk 级盘侧基址需从 ChunkDescriptor.base_gpa
-        解出，依赖 libumm 补齐 umm_alloc_on_device 后一并提供
-        （docs/07 §5.3 规则 4）；FakeUMMLib 阶段以设备内偏移验证。
+        解出并转换到后端盘侧地址。umm_alloc_on_device 已恢复，但本函数的
+        地址导出仍待实现（docs/07 §5.3 规则 4）；CPU read_batch 不依赖此函数。
         """
         self._check_device(device)
         return 0

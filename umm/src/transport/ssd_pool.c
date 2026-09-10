@@ -937,6 +937,60 @@ uint32_t ssd_pool_num_devices(const SsdPool *pool)
 /* ssd_pool_alloc — allocate from global virtual address space              */
 /* ------------------------------------------------------------------------ */
 
+int ssd_pool_device_info(SsdPool *pool, uint32_t device_idx, StorageResource *out)
+{
+    if (!pool || !out)
+        return UMM_E_INVALID_ARG;
+    pthread_mutex_lock(&pool->lock);
+    if (device_idx >= pool->num_devices) {
+        pthread_mutex_unlock(&pool->lock);
+        return UMM_E_INVALID_ARG;
+    }
+    const SsdDevice *dev = &pool->devices[device_idx];
+    memset(out, 0, sizeof(*out));
+    out->tier = UMM_TIER_SSD;
+    out->capacity = dev->capacity;
+    out->base_offset = dev->virtual_base;
+    out->online = 1;
+    snprintf(out->device_path, sizeof(out->device_path), "%s",
+             dev->backend->device_path);
+    pthread_mutex_unlock(&pool->lock);
+    return UMM_OK;
+}
+
+int ssd_pool_alloc_on_device(SsdPool *pool, uint32_t device_idx,
+                             uint64_t size, uint64_t *out_voffset)
+{
+    if (!pool || !out_voffset || size == 0 ||
+        size > UINT64_MAX - (SSD_POOL_PAGE_SIZE - 1))
+        return UMM_E_INVALID_ARG;
+    uint64_t npages = (size + SSD_POOL_PAGE_SIZE - 1) / SSD_POOL_PAGE_SIZE;
+    pthread_mutex_lock(&pool->lock);
+    if (device_idx >= pool->num_devices) {
+        pthread_mutex_unlock(&pool->lock);
+        return UMM_E_INVALID_ARG;
+    }
+    const SsdDevice *dev = &pool->devices[device_idx];
+    uint64_t start = dev->virtual_base / SSD_POOL_PAGE_SIZE;
+    uint64_t pages = dev->capacity / SSD_POOL_PAGE_SIZE;
+    uint64_t end = start + pages;
+    if (npages > pages || npages > pool->free_pages) {
+        pthread_mutex_unlock(&pool->lock);
+        return UMM_E_NO_MEMORY;
+    }
+    uint64_t page = bm_find_free(pool->bitmap, end, start, npages);
+    if (page >= end) {
+        pthread_mutex_unlock(&pool->lock);
+        return UMM_E_NO_MEMORY;
+    }
+    for (uint64_t i = 0; i < npages; i++)
+        bm_set(pool->bitmap, page + i);
+    pool->free_pages -= npages;
+    *out_voffset = page * SSD_POOL_PAGE_SIZE;
+    pthread_mutex_unlock(&pool->lock);
+    return UMM_OK;
+}
+
 int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset)
 {
     if (!pool || !out_voffset || size == 0)

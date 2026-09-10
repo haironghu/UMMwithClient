@@ -352,6 +352,9 @@ TEST_REMOTE_PHASE1_OBJ := \
 $(BIN_DIR)/test_remote_phase1: $(TEST_DIR)/test_remote_phase1.c $(TEST_REMOTE_PHASE1_OBJ) | dirs
 	$(CC) $(CFLAGS) $< $(TEST_REMOTE_PHASE1_OBJ) -o $@ $(LDFLAGS)
 
+$(BIN_DIR)/test_alloc_on_device: $(TEST_DIR)/test_alloc_on_device.c $(BUILD_DIR)/libumm.a | dirs
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/libumm.a -o $@ $(LDFLAGS) -Wl,--wrap=meta_service_direct_create
+
 TEST_SSD_DIST_OBJ := $(TEST_TIER_OBJ)
 
 $(BIN_DIR)/test_ssd_dist: $(TEST_DIR)/test_ssd_dist.c $(TEST_SSD_DIST_OBJ) | dirs
@@ -410,7 +413,7 @@ TEST_BINS := \
       $(BIN_DIR)/test_p0_concurrent $(BIN_DIR)/test_ssd_pool_io \
       $(BIN_DIR)/test_ssd_libnvm $(BIN_DIR)/test_ssd_nds \
       $(BIN_DIR)/test_nds_rpc_disconnect \
-      $(BIN_DIR)/test_remote_phase1
+      $(BIN_DIR)/test_remote_phase1 $(BIN_DIR)/test_alloc_on_device
 
 # 只编译测试二进制，不运行（CI 构建/交叉编译场景用）
 test-build: dirs $(TEST_BINS)
@@ -449,6 +452,7 @@ test: test-build
 	@$(BIN_DIR)/test_ssd_pool_io
 	@echo ""
 	@$(BIN_DIR)/test_remote_phase1
+	@$(BIN_DIR)/test_alloc_on_device
 	@echo ""
 	@cd $(BIN_DIR) && env -u UMM_TEST_LIBNVM_CTRL -u UMM_TEST_LIBNVM_OFF \
 	      -u UMM_TEST_LIBNVM_INITONLY \

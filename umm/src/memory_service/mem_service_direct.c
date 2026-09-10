@@ -125,6 +125,37 @@ static int ensure_cxl_mmap(TierMemCtx *tier)
  * VTable: tier-aware allocation
  * ======================================================================== */
 
+static int memsvc_alloc_on_device(void *ctx, tier_id_t tier, uint32_t device_idx,
+                                   uint64_t size, uint64_t *out_offset)
+{
+    if (!ctx || !out_offset || !size || !tier_is_valid(tier))
+        return UMM_E_INVALID_ARG;
+    if (tier != UMM_TIER_SSD)
+        return UMM_E_UNSUPPORTED;
+    MemServiceCtx *m = ctx;
+    pthread_mutex_lock(&m->lock);
+    TierMemCtx *t = &m->tiers[tier];
+    int rc = UMM_E_NOT_INITIALIZED;
+    if (t->online && t->ssd_pool) {
+        uint64_t voffset;
+        rc = ssd_pool_alloc_on_device(t->ssd_pool, device_idx, size, &voffset);
+        if (rc == UMM_OK) {
+            /* Pool bitmap is the allocation authority; do not reserve in ba. */
+            if (t->base_offset > GPA_OFFSET_MASK ||
+                voffset > GPA_OFFSET_MASK - t->base_offset ||
+                size - 1 > GPA_OFFSET_MASK - t->base_offset - voffset) {
+                ssd_pool_free(t->ssd_pool, voffset, size);
+                rc = UMM_E_INVALID_ARG;
+            } else {
+                *out_offset = t->base_offset + voffset;
+                m->alloc_count++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&m->lock);
+    return rc;
+}
+
 static int memsvc_alloc_tiered(void *ctx, tier_id_t tier, uint64_t size,
                                 uint64_t *out_offset)
 {
@@ -490,11 +521,30 @@ static int memsvc_get_topology(void *ctx, StorageTopology *out)
 
     pthread_mutex_lock(&m->lock);
 
+    memset(out, 0, sizeof(*out));
     out->node_id = m->node_id;
     out->num_resources = 0;
 
     for (int i = 0; i < UMM_NUM_TIERS; i++) {
         TierMemCtx *t = &m->tiers[i];
+        if (t->online && i == UMM_TIER_SSD && t->ssd_pool) {
+            uint32_t count = ssd_pool_num_devices(t->ssd_pool);
+            for (uint32_t d = 0; d < count; d++) {
+                if (out->num_resources >= UMM_MAX_TOPOLOGY_RESOURCES) {
+                    pthread_mutex_unlock(&m->lock);
+                    return UMM_E_NO_MEMORY;
+                }
+                StorageResource *r = &out->resources[out->num_resources];
+                int rc = ssd_pool_device_info(t->ssd_pool, d, r);
+                if (rc != UMM_OK) {
+                    pthread_mutex_unlock(&m->lock);
+                    return rc;
+                }
+                r->base_offset += t->base_offset;
+                out->num_resources++;
+            }
+            continue;
+        }
         if (t->online) {
             StorageResource *r = &out->resources[out->num_resources];
             r->tier        = (tier_id_t)i;
@@ -673,6 +723,7 @@ static MemoryServiceVtbl g_direct_vtbl = {
     .free_local        = memsvc_free_local,
     .get_stats         = memsvc_get_stats,
     .alloc_tiered      = memsvc_alloc_tiered,
+    .alloc_on_device   = memsvc_alloc_on_device,
     .free_tiered       = memsvc_free_tiered,
     .get_tier_stats    = memsvc_get_tier_stats,
     .register_storage  = memsvc_register_storage,

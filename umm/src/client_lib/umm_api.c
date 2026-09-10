@@ -102,6 +102,10 @@ extern int mem_rpc_alloc_tiered(MemRpcClient *c, tier_id_t tier, uint64_t size,
 extern int mem_rpc_alloc_tiered2(MemRpcClient *c, tier_id_t tier,
                                  uint64_t size, uint32_t flags,
                                  uint64_t *out_offset, uint8_t *out_owner);
+extern int mem_rpc_alloc_on_device(MemRpcClient *c, tier_id_t tier,
+                                    uint32_t device_idx, uint64_t size,
+                                    uint32_t flags, uint64_t *out_offset,
+                                    uint8_t *out_owner);
 extern int mem_rpc_free_tiered(MemRpcClient *c, tier_id_t tier, uint64_t offset,
                                uint64_t size);
 
@@ -288,7 +292,34 @@ static int configure_transports_from_topology(const UMMConfig *cfg,
     int  ssd_local_skip_nds = 0;
     char ssd_local_skip_path[256] = {0};
 
-    if (topo && topo->num_resources > 0) {
+    SsdDeviceConfig topo_devices[16] = {0};
+    uint32_t topo_device_count = 0;
+    if (topo && cfg->num_ssd_devices == 0) {
+        for (uint32_t i = 0; i < UMM_MAX_TOPOLOGY_RESOURCES; i++) {
+            const StorageResource *res = &topo->resources[i];
+            if (!res->online || res->tier != UMM_TIER_SSD) continue;
+            if (strncmp(res->device_path, "nds:", 4) == 0) {
+                ssd_local_skip_nds = 1;
+                snprintf(ssd_local_skip_path, sizeof(ssd_local_skip_path), "%s",
+                         res->device_path);
+                break;
+            }
+            if (topo_device_count >= 16) return UMM_E_INVALID_ARG;
+            snprintf(topo_devices[topo_device_count].path,
+                     sizeof(topo_devices[topo_device_count].path), "%s", res->device_path);
+            topo_devices[topo_device_count++].size = res->capacity;
+        }
+    }
+    if (topo_device_count > 1 && !ssd_local_skip_nds) {
+        ssd_vtbl = ssd_transport_create_multi(topo_devices, topo_device_count, &ssd_ctx);
+        if (!ssd_vtbl) {
+            if (cxl_vtbl && cxl_vtbl->deinit) cxl_vtbl->deinit(cxl_ctx);
+            free(cxl_ctx);
+            return UMM_E_TRANSPORT_ERROR;
+        }
+    }
+
+    if (topo && topo->num_resources > 0 && !ssd_vtbl && !ssd_local_skip_nds) {
         /* 遍历全部槽位而非 num_resources——兼容两种拓扑布局:
          * mem_service_direct 返回紧凑数组, ummD 按 tier 稀疏存放 */
         for (uint32_t i = 0; i < UMM_NUM_TIERS; i++) {
@@ -863,15 +894,19 @@ int umm_alloc(uint64_t size, ChunkDescriptor *out)
 /* umm_alloc_tiered  --  Allocate on a specific storage tier                 */
 /* ------------------------------------------------------------------------ */
 
-int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
+static int alloc_tier_impl(uint64_t size, tier_id_t tier, int on_device,
+                           uint32_t device_idx, ChunkDescriptor *out)
 {
     if (!g_state.initialized)
         return UMM_E_NOT_INITIALIZED;
 
-    if (size == 0 || !out || tier >= UMM_NUM_TIERS)
+    if (size == 0 || !out || tier >= UMM_NUM_TIERS ||
+        size > UINT64_MAX - (UMM_PAGE_SIZE - 1))
         return UMM_E_INVALID_ARG;
 
     memset(out, 0, sizeof(ChunkDescriptor));
+    if (on_device && tier != UMM_TIER_SSD)
+        return UMM_E_UNSUPPORTED;
 
     uint64_t alloc_size = (size + UMM_PAGE_SIZE - 1) & ~(UMM_PAGE_SIZE - 1);
     uint64_t offset = 0;
@@ -883,7 +918,13 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
     node_id_t gpa_node = g_state.config.my_node_id;
 
     /* Step 1: Allocate physical memory from the specified tier */
-    if (g_state.local_mem_vtbl && g_state.local_mem_vtbl->alloc_tiered) {
+    if (on_device && g_state.local_mem_vtbl) {
+        if (!g_state.local_mem_vtbl->alloc_on_device)
+            return UMM_E_UNSUPPORTED;
+        rc = g_state.local_mem_vtbl->alloc_on_device(g_state.local_mem_ctx,
+                                                      tier, device_idx,
+                                                      alloc_size, &offset);
+    } else if (g_state.local_mem_vtbl && g_state.local_mem_vtbl->alloc_tiered) {
         /* Direct mode with tier support */
         rc = g_state.local_mem_vtbl->alloc_tiered(g_state.local_mem_ctx,
                                                    tier, alloc_size, &offset);
@@ -900,8 +941,12 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
     } else if (g_state.mem_client_buf) {
         /* RPC mode: use tiered alloc RPC（v2 响应携带属主 node） */
         uint8_t owner = UMM_NODE_UNKNOWN;
-        rc = mem_rpc_alloc_tiered2(g_state.mem_client_buf, tier,
-                                    alloc_size, 0, &offset, &owner);
+        if (on_device)
+            rc = mem_rpc_alloc_on_device(g_state.mem_client_buf, tier, device_idx,
+                                          alloc_size, 0, &offset, &owner);
+        else
+            rc = mem_rpc_alloc_tiered2(g_state.mem_client_buf, tier,
+                                        alloc_size, 0, &offset, &owner);
         if (rc == UMM_OK && tier == UMM_TIER_SSD) {
             /* 属主解析：新服务端响应 > ssd_owner_node 配置 > my_node_id
              *（旧服务端/旧行为） */
@@ -986,6 +1031,18 @@ int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
              (unsigned long)gpa, (unsigned long)alloc_size);
     return UMM_OK;
 }
+
+int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out)
+{
+    return alloc_tier_impl(size, tier, 0, 0, out);
+}
+
+int umm_alloc_on_device(uint64_t size, tier_id_t tier, uint32_t device_idx,
+                        ChunkDescriptor *out)
+{
+    return alloc_tier_impl(size, tier, 1, device_idx, out);
+}
+
 
 /* ------------------------------------------------------------------------ */
 /* umm_free                                                                  */
@@ -1343,6 +1400,10 @@ int umm_get_topology(StorageTopology *out)
     if (g_state.local_mem_vtbl && g_state.local_mem_vtbl->get_topology)
         return g_state.local_mem_vtbl->get_topology(g_state.local_mem_ctx,
                                                      out);
+    if (g_state.mem_client_buf) {
+        int rc = mem_rpc_get_topology(g_state.mem_client_buf, out);
+        if (rc != UMM_E_UNSUPPORTED) return rc;
+    }
     if (g_state.meta_client_buf) {
         int rc = meta_rpc_get_storage_topology(g_state.meta_client_buf,
                                                 g_state.config.my_node_id,

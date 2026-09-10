@@ -36,6 +36,9 @@ struct MemoryServiceVtbl {
                     uint64_t offset, uint64_t len, void *buf);
     int (*ssd_write)(void *ctx, tier_id_t tier, node_id_t node,
                      uint64_t offset, uint64_t len, const void *buf);
+    /* Optional, strict device allocation. Appended to preserve field order. */
+    int (*alloc_on_device)(void *ctx, tier_id_t tier, uint32_t device_idx,
+                            uint64_t size, uint64_t *out_offset);
 };
 
 #endif

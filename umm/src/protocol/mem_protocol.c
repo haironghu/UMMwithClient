@@ -148,6 +148,31 @@ static size_t unpack_storage_resource(const uint8_t *buf, size_t p, StorageResou
 /*   Resp: status(i32) + offset(u64)                  = 4 + 8 = 12      */
 /* ==================================================================== */
 
+int mem_pack_alloc_on_device(uint8_t tier, uint32_t device_idx,
+                             uint64_t size, uint32_t flags, UmmProtoBody *body)
+{
+    if (!body) return UMM_E_INVALID_ARG;
+    body_init(body);
+    size_t p = 0;
+    proto_write_u8(body->data, &p, tier);
+    proto_write_u32(body->data, &p, device_idx);
+    proto_write_u64(body->data, &p, size);
+    proto_write_u32(body->data, &p, flags);
+    body->len = (uint16_t)p;
+    return UMM_OK;
+}
+
+int mem_unpack_alloc_on_device(const UmmProtoBody *body, MemAllocOnDeviceReq *out)
+{
+    if (!body || !out || body->len != 17) return UMM_E_INVALID_ARG;
+    size_t p = 0;
+    out->tier = proto_read_u8(body->data, &p);
+    out->device_idx = proto_read_u32(body->data, &p);
+    out->size = proto_read_u64(body->data, &p);
+    out->flags = proto_read_u32(body->data, &p);
+    return UMM_OK;
+}
+
 int mem_pack_alloc_tiered(uint8_t tier, uint64_t size, uint32_t flags, UmmProtoBody *body)
 {
     size_t p = 0;
@@ -305,6 +330,7 @@ int mem_pack_get_topology_resp(const StorageTopology *topo, UmmProtoBody *body)
         return UMM_E_INVALID_ARG;
 
     uint32_t count = topo->num_resources;
+    if (count > UMM_MAX_TOPOLOGY_RESOURCES) return UMM_E_INVALID_ARG;
     uint32_t max_fit = (UMM_PROTO_MAX_BODY - STORAGE_TOPOLOGY_HEADER_SIZE)
                        / STORAGE_RESOURCE_SERIALIZED_SIZE;
     if (count > max_fit)
@@ -340,10 +366,8 @@ int mem_unpack_get_topology_resp(const UmmProtoBody *body, StorageTopology *out)
 
     uint32_t avail = (body->len - STORAGE_TOPOLOGY_HEADER_SIZE)
                      / STORAGE_RESOURCE_SERIALIZED_SIZE;
-    if (count > avail)
-        count = avail;
-    if (count > UMM_NUM_TIERS)
-        count = UMM_NUM_TIERS;
+    if (count > avail || count > UMM_MAX_TOPOLOGY_RESOURCES)
+        return UMM_E_INVALID_ARG;
 
     out->num_resources = count;
     for (uint32_t i = 0; i < count; i++)

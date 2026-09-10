@@ -28,6 +28,7 @@
 
 ## 已知遗留
 - R6：libnvm 单队列并发/多队列支持（docs/R6，含给同事的 API 草案）
-- VirtualMedia 依赖 `umm_alloc_on_device`（libumm 未导出，上游 API 漂移，
-  13 项单测失败为基线既有问题）
+- `umm_alloc_on_device` 已恢复（direct/RPC、每盘拓扑、真实 C 库集成验证）；
+  重新编译要求见 [指定 SSD 分配接口](bmpclient/docs/08_指定SSD分配接口.md)。
+  NPU 直通所需的 `VirtualMedia.extent_base()` 仍待实现。
 - 建议同事在 nvm_host_disk_info_t 补 NSZE 总容量字段

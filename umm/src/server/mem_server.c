@@ -373,6 +373,10 @@ static MemServer* create_multi_impl(const char *bind_addr, int port,
             if (rc != UMM_OK) {
                 MEM_LOG_WARN("mem_server: failed to register SSD device[%u] %s "
                              "(rc=%d)", i, devices[i].path, rc);
+                /* Device indices must retain configured order. A partial pool
+                 * would silently shift all subsequent device_idx values. */
+                mem_server_destroy(srv);
+                return NULL;
             } else {
                 MEM_LOG_INFO("mem_server: registered SSD device[%u] %s, size=%lu MB",
                              i, devices[i].path,

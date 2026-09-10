@@ -119,8 +119,8 @@ def find_libumm_so() -> str:
     """
     按优先级查找 libumm.so：
       1. UMM_BUILD_DIR 环境变量
-      2. ../UMM/build/libumm.so
-      3. ../../UMM/build/libumm.so
+      2. ../umm/build/libumm.so（当前集成仓库）
+      3. ../UMM 或 ../../UMM/build/libumm.so（旧目录）
     """
     candidates = []
     env = os.environ.get("UMM_BUILD_DIR")
@@ -128,6 +128,7 @@ def find_libumm_so() -> str:
         candidates.append(os.path.join(env, "libumm.so"))
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, "..", "umm", "build", "libumm.so"))
     candidates.append(os.path.join(script_dir, "..", "UMM", "build", "libumm.so"))
     candidates.append(os.path.join(script_dir, "..", "..", "UMM", "build", "libumm.so"))
 
@@ -177,7 +178,7 @@ class UMMLib:
         ]
         lib.umm_register_storage_tier.restype = ctypes.c_int
 
-        # umm_alloc_on_device 是较新版本 libumm 才导出的符号；
+        # umm_alloc_on_device 已恢复；可选绑定仍允许加载未升级的库。
         # 对缺失该符号的旧库做可选绑定（调用时才报错，不影响其他 API）
         self._fn_alloc_on_device = getattr(lib, "umm_alloc_on_device", None)
         if self._fn_alloc_on_device is not None:
@@ -282,6 +283,10 @@ class UMMLib:
             )
 
     def alloc_on_device(self, size: int, tier: int, device_idx: int) -> ChunkDescriptor:
+        """在分配服务端的指定 SSD 上分配；device_idx 按 SSD 拓扑顺序编号。
+
+        当前仅支持 SSD tier；盘满/不支持时明确报错，不回退到其他盘。
+        """
         if self._fn_alloc_on_device is None:
             raise RuntimeError(
                 "当前 libumm.so 未导出 umm_alloc_on_device（需较新版本 UMM）"

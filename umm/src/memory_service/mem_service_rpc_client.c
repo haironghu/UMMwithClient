@@ -368,6 +368,54 @@ int mem_rpc_alloc_tiered2(MemRpcClient *c, tier_id_t tier, uint64_t size,
     return UMM_OK;
 }
 
+int mem_rpc_alloc_on_device(MemRpcClient *c, tier_id_t tier, uint32_t device_idx, uint64_t size,
+                          uint32_t flags, uint64_t *out_offset,
+                          uint8_t *out_owner)
+{
+    if (!c || !out_offset || size == 0 || tier >= UMM_NUM_TIERS)
+        return UMM_E_INVALID_ARG;
+
+    if (out_owner)
+        *out_owner = UMM_NODE_UNKNOWN;
+
+    pthread_mutex_lock(&c->lock);
+
+    UmmProtoBody req_body;
+    int rc = mem_pack_alloc_on_device((uint8_t)tier, device_idx, size, flags, &req_body);
+    if (rc != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return rc;
+    }
+
+    UmmProtoHeader resp_hdr;
+    UmmProtoBody   resp_body;
+    rc = memrpc_do_call(c, MEM_OP_ALLOC_ON_DEVICE, &req_body, &resp_hdr, &resp_body);
+    if (rc != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return rc;
+    }
+
+    if (resp_body.len == 0) {
+        pthread_mutex_unlock(&c->lock);
+        return UMM_E_UNSUPPORTED;
+    }
+    MemAllocTieredResp resp;
+    rc = mem_unpack_alloc_tiered_resp2(&resp_body, &resp, out_owner);
+    if (rc != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return rc;
+    }
+
+    if (resp.status != UMM_OK) {
+        pthread_mutex_unlock(&c->lock);
+        return resp.status;
+    }
+
+    *out_offset = resp.offset;
+    pthread_mutex_unlock(&c->lock);
+    return UMM_OK;
+}
+
 /* ======================================================================== */
 /* Tier-aware free (MEM_OP_FREE_TIERED = 6)                                */
 /* ======================================================================== */
@@ -414,33 +462,39 @@ int mem_rpc_free_tiered(MemRpcClient *c, tier_id_t tier, uint64_t offset,
 
 int mem_rpc_get_topology(MemRpcClient *c, StorageTopology *out)
 {
-    if (!c || !out)
-        return UMM_E_INVALID_ARG;
-
-    memset(out, 0, sizeof(StorageTopology));
-
+    if (!c || !out) return UMM_E_INVALID_ARG;
+    StorageTopology result = {0};
+    int rc = UMM_OK;
     pthread_mutex_lock(&c->lock);
-
-    /* Pack request (empty body for GET_TOPOLOGY) */
-    UmmProtoBody req_body;
-    int rc = mem_pack_get_topology(&req_body);
-    if (rc != UMM_OK) {
-        pthread_mutex_unlock(&c->lock);
-        return rc;
+    for (;;) {
+        UmmProtoBody req_body, resp_body;
+        UmmProtoHeader resp_hdr;
+        mem_pack_get_topology(&req_body);
+        if (result.num_resources) {
+            size_t p = 0;
+            proto_write_u32(req_body.data, &p, result.num_resources);
+            req_body.len = (uint16_t)p;
+        }
+        rc = memrpc_do_call(c, MEM_OP_GET_TOPOLOGY, &req_body, &resp_hdr, &resp_body);
+        if (rc != UMM_OK) break;
+        if (!resp_body.len) { rc = UMM_E_UNSUPPORTED; break; }
+        StorageTopology page = {0};
+        rc = mem_unpack_get_topology_resp(&resp_body, &page);
+        if (rc != UMM_OK) break;
+        if (page.num_resources > UMM_MAX_TOPOLOGY_RESOURCES - result.num_resources ||
+            (result.num_resources && result.node_id != page.node_id)) {
+            rc = UMM_E_INVALID_ARG;
+            break;
+        }
+        result.node_id = page.node_id;
+        memcpy(result.resources + result.num_resources, page.resources,
+               page.num_resources * sizeof(StorageResource));
+        result.num_resources += page.num_resources;
+        if (page.num_resources < MEM_TOPOLOGY_PAGE_CAP ||
+            result.num_resources == UMM_MAX_TOPOLOGY_RESOURCES) break;
     }
-
-    /* Send and receive */
-    UmmProtoHeader resp_hdr;
-    UmmProtoBody   resp_body;
-    rc = memrpc_do_call(c, MEM_OP_GET_TOPOLOGY, &req_body, &resp_hdr, &resp_body);
-    if (rc != UMM_OK) {
-        pthread_mutex_unlock(&c->lock);
-        return rc;
-    }
-
-    /* Unpack response */
-    rc = mem_unpack_get_topology_resp(&resp_body, out);
-
     pthread_mutex_unlock(&c->lock);
+    memset(out, 0, sizeof(*out));
+    if (rc == UMM_OK) *out = result;
     return rc;
 }

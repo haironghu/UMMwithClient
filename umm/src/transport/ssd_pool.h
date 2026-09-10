@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../../include/umm.h"
 
 #include "ssd_backend_nds.h"   /* UmmNdsIOVec（纯 C 头，无循环包含） */
 
@@ -118,6 +119,12 @@ uint32_t ssd_pool_num_devices(const SsdPool *pool);
  * @return             UMM_OK on success.
  */
 int ssd_pool_alloc(SsdPool *pool, uint64_t size, uint64_t *out_voffset);
+
+/* Strict device-local allocation using the SAME bitmap as ordinary alloc. */
+int ssd_pool_alloc_on_device(SsdPool *pool, uint32_t device_idx,
+                             uint64_t size, uint64_t *out_voffset);
+/* Snapshot one device, including its pool-relative base_offset. */
+int ssd_pool_device_info(SsdPool *pool, uint32_t device_idx, StorageResource *out);
 
 /** ssd_pool_free — Free a virtual range. */
 int ssd_pool_free(SsdPool *pool, uint64_t voffset, uint64_t size);

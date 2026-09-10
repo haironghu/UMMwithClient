@@ -141,13 +141,18 @@ int umm_parse_config(const char *filepath, UMMConfig *out_cfg)
     if (!fp)
         return UMM_E_NOT_FOUND;
 
-    char line[512];
+    /* 16 SSD paths plus sizes must fit on a single configuration line. */
+    char line[8192];
     int line_no = 0;
     int rc = UMM_OK;
 
     while (fgets(line, sizeof(line), fp)) {
         line_no++;
         line[sizeof(line) - 1] = '\0';
+        if (!strchr(line, '\n') && !feof(fp)) {
+            rc = UMM_E_INVALID_ARG;
+            break;  /* Never interpret a truncated device list. */
+        }
 
         /* Remove trailing newline if present */
         size_t ll = strlen(line);

@@ -97,10 +97,13 @@ typedef struct {
     int         online;             /* 1=available, 0=offline */
 } StorageResource;
 
+#define UMM_MAX_TOPOLOGY_RESOURCES (UMM_NUM_TIERS + 16)
+
+/* ABI: rebuild C callers with this header; matches the Python ctypes layout. */
 typedef struct {
     node_id_t          node_id;
     uint32_t           num_resources;
-    StorageResource    resources[UMM_NUM_TIERS];  /* one per tier */
+    StorageResource    resources[UMM_MAX_TOPOLOGY_RESOURCES];  /* SSD entries in pool order */
 } StorageTopology;
 
 /* ChunkDescriptor — client-facing handle for a chunk */
@@ -213,6 +216,11 @@ void umm_deinit(void);
 /* Chunk allocation */
 int umm_alloc(uint64_t size, ChunkDescriptor *out);
 int umm_alloc_ex(uint64_t size, uint32_t flags, ChunkDescriptor *out);
+/* Allocate wholly on device_idx in the allocation service's SSD pool.
+ * SSD only; unsupported services never fall back to an arbitrary device.
+ * device_idx follows SSD resource order returned by umm_get_topology(). */
+int umm_alloc_on_device(uint64_t size, tier_id_t tier, uint32_t device_idx,
+                        ChunkDescriptor *out);
 int umm_alloc_tiered(uint64_t size, tier_id_t tier, ChunkDescriptor *out);
 int umm_free(ChunkDescriptor *desc);
 

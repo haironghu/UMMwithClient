@@ -387,6 +387,56 @@ int mem_service_rpc_handle(int client_sock, void *ctx, MemoryServiceVtbl *vtbl)
         break;
     }
 
+    case MEM_OP_GET_TOPOLOGY: {
+        StorageTopology topo = {0};
+        uint32_t start = 0;
+        if (body.len != 0 && body.len != 4) {
+            svc_rc = UMM_E_INVALID_ARG;
+        } else {
+            if (body.len == 4) {
+                size_t p = 0;
+                start = proto_read_u32(body.data, &p);
+            }
+            svc_rc = vtbl->get_topology ? vtbl->get_topology(ctx, &topo)
+                                        : UMM_E_UNSUPPORTED;
+            if (svc_rc == UMM_OK) {
+                if (start > topo.num_resources) {
+                    svc_rc = UMM_E_INVALID_ARG;
+                } else {
+                    topo.num_resources -= start;
+                    memmove(topo.resources, topo.resources + start,
+                            topo.num_resources * sizeof(StorageResource));
+                    svc_rc = mem_pack_get_topology_resp(&topo, &resp_body);
+                }
+            }
+        }
+        if (svc_rc != UMM_OK) {
+            size_t p = 0;
+            proto_write_i32(resp_body.data, &p, svc_rc);
+            proto_write_u32(resp_body.data, &p, g_srv_node_id);
+            proto_write_u32(resp_body.data, &p, 0);
+            resp_body.len = (uint16_t)p;
+        }
+        break;
+    }
+
+    case MEM_OP_ALLOC_ON_DEVICE: {
+        MemAllocOnDeviceReq req;
+        uint64_t offset = 0;
+        svc_rc = mem_unpack_alloc_on_device(&body, &req);
+        if (svc_rc == UMM_OK) {
+            if (req.flags != 0)
+                svc_rc = UMM_E_INVALID_ARG;
+            else if (vtbl->alloc_on_device)
+                svc_rc = vtbl->alloc_on_device(ctx, req.tier, req.device_idx,
+                                               req.size, &offset);
+            else
+                svc_rc = UMM_E_UNSUPPORTED;
+        }
+        pack_alloc_resp2(svc_rc, offset, g_srv_node_id, &resp_body);
+        break;
+    }
+
     case MEM_OP_ALLOC_TIERED: {
         MemAllocTieredReq req;
         svc_rc = mem_unpack_alloc_tiered(&body, &req);

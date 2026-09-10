@@ -14,6 +14,7 @@ extern "C" {
 /* Opcodes for memory service RPC                                      */
 /* ------------------------------------------------------------------ */
 enum {
+    MEM_OP_ALLOC_ON_DEVICE  = 12, /* tier(u8), device(u32), size(u64), flags(u32) */
     MEM_OP_ALLOC            = 1,
     MEM_OP_FREE             = 2,
     MEM_OP_GET_STATS        = 3,
@@ -23,7 +24,7 @@ enum {
     MEM_OP_FREE_TIERED      = 6,   /* tier(u8) + offset(u64) + size(u64) */
     MEM_OP_GET_TIER_STATS   = 7,   /* tier(u8) */
     MEM_OP_REGISTER_STORAGE = 8,   /* StorageResource serialized */
-    MEM_OP_GET_TOPOLOGY     = 9,   /* no request body */
+    MEM_OP_GET_TOPOLOGY     = 9,   /* empty=first page; optional start(u32) */
     /* --- Phase 1: 跨节点数据面（payload 走流式传输，不占 4KB body） --- */
     MEM_OP_DATA_READ        = 10,  /* req: gpa(u64)+len(u64)；
                                       resp: status(i32)+len(u64)，随后 len 字节
@@ -123,6 +124,16 @@ int mem_unpack_stats_resp(const UmmProtoBody *body, MemStatsResp *out);
 /* ------------------------------------------------------------------ */
 /* Pack / Unpack — Tiered alloc                                       */
 /* ------------------------------------------------------------------ */
+typedef struct {
+    uint8_t tier;
+    uint32_t device_idx;
+    uint64_t size;
+    uint32_t flags;
+} MemAllocOnDeviceReq;
+int mem_pack_alloc_on_device(uint8_t tier, uint32_t device_idx,
+                             uint64_t size, uint32_t flags, UmmProtoBody *body);
+int mem_unpack_alloc_on_device(const UmmProtoBody *body, MemAllocOnDeviceReq *out);
+
 int mem_pack_alloc_tiered(uint8_t tier, uint64_t size, uint32_t flags, UmmProtoBody *body);
 int mem_unpack_alloc_tiered(const UmmProtoBody *body, MemAllocTieredReq *out);
 int mem_unpack_alloc_tiered_resp(const UmmProtoBody *body, MemAllocTieredResp *out);
@@ -155,6 +166,8 @@ int mem_unpack_register_storage(const UmmProtoBody *body, StorageResource *out);
 /* ------------------------------------------------------------------ */
 /* Pack / Unpack — Topology query                                     */
 /* ------------------------------------------------------------------ */
+/* Existing response format, paginated to fit a control frame. */
+#define MEM_TOPOLOGY_PAGE_CAP ((UMM_PROTO_MAX_BODY - 12) / 274)
 int mem_pack_get_topology(UmmProtoBody *body);
 int mem_pack_get_topology_resp(const StorageTopology *topo, UmmProtoBody *body);
 int mem_unpack_get_topology_resp(const UmmProtoBody *body, StorageTopology *out);

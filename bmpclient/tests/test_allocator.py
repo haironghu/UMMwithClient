@@ -6,7 +6,7 @@ import time
 import unittest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-UMM_ROOT = os.path.join(PROJECT_ROOT, "UMM")
+UMM_ROOT = os.environ.get("UMM_ROOT", os.path.join(PROJECT_ROOT, "umm"))
 sys.path.insert(0, PROJECT_ROOT)
 
 from bmpclient.allocator import FineGrainedAllocator, MemoryExhaustedError
@@ -29,8 +29,8 @@ class TestAllocator(unittest.TestCase):
         os.makedirs(SSD_DIR, exist_ok=True)
         cls._devnull = open(os.devnull, "w")
 
-        ummd_bin = os.path.join(UMM_ROOT, "bin", "umm-metadata-service")
-        umms_bin = os.path.join(UMM_ROOT, "bin", "umm-memory-server")
+        ummd_bin = os.path.join(UMM_ROOT, "bin", "ummd")
+        umms_bin = os.path.join(UMM_ROOT, "bin", "umms")
 
         cls._ummd_proc = subprocess.Popen(
             [ummd_bin, "-p", str(META_PORT), "-b", "127.0.0.1"],
