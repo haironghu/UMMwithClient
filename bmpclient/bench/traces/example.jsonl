@@ -1,0 +1,4 @@
+{"request_id":"example","step_id":0,"layer_id":0,"context_length":128,"topk_token_indices":[0,1,2,15,16,17,63,100]}
+{"request_id":"example","step_id":0,"layer_id":1,"context_length":128,"topk_token_indices":[1,2,3,16,17,18,64,101]}
+{"request_id":"example","step_id":1,"layer_id":0,"context_length":129,"topk_token_indices":[128,100,63,17,16,2,1,0]}
+{"request_id":"example","step_id":1,"layer_id":1,"context_length":129,"topk_token_indices":[0,2,18,64,101,127,128,128]}

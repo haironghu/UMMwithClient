@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "ssd_backend_direct.h"
 #include "../../include/umm.h"
 
 #include "ssd_backend_nds.h"   /* UmmNdsIOVec（纯 C 头，无循环包含） */
@@ -87,6 +88,9 @@ int ssd_backend_batch_write(SsdBackend *sb, const UmmNdsIOVec *iovs, size_t n_io
 
 /** ssd_pool_create — Create an empty SSD pool. */
 SsdPool* ssd_pool_create(void);
+/* Returns UNSUPPORTED unless the device uses the explicit direct: backend. */
+int ssd_pool_direct_stats(SsdPool *pool, uint32_t device_idx,
+                          SsdDirectStats *out, int reset);
 
 /** ssd_pool_destroy — Destroy pool and all underlying devices. */
 void ssd_pool_destroy(SsdPool *pool);

@@ -53,13 +53,20 @@ class VirtualMedia:
         self,
         lib: UMMLib,
         unit_size: int,
-        capacity_per_device: int,
+        capacity_per_device: Union[int, Dict[int, int]],
         strategy: Union[str, PlacementStrategy, None] = None,
         sp_bytes: Optional[int] = None,
         sp_bytes_per_device: Optional[Dict[int, int]] = None,
         num_workers: int = 4,
         config_path: Optional[str] = None,
+        read_merge: bool = True,
+        max_read_bytes: Optional[int] = None,
     ):
+        if max_read_bytes is not None and (unit_size <= 0 or max_read_bytes < unit_size or
+                                           max_read_bytes % unit_size):
+            raise ValueError("max_read_bytes 必须是 unit_size 的正整数倍")
+        self._read_merge = read_merge
+        self._max_read_bytes = max_read_bytes
         cfg = load_config(config_path)
         self._lib = lib
         self._unit_size = unit_size
@@ -76,15 +83,21 @@ class VirtualMedia:
             for k, v in cfg.get("super_page_bytes_per_device", {}).items()
         }
         self._mgrs: List[DeviceSegmentManager] = []
-        for d in devices:
-            desc = lib.alloc_on_device(capacity_per_device, UMM_TIER_SSD, d)
-            self._mgrs.append(
-                DeviceSegmentManager(
-                    lib, desc, d, sp_override.get(d, default_sp), unit_size
-                )
-            )
-
         self._strategy = self._resolve_strategy(strategy, cfg, len(devices))
+        try:
+            for d in devices:
+                capacity = capacity_per_device[d] if isinstance(capacity_per_device, dict) else capacity_per_device
+                desc = lib.alloc_on_device(capacity, UMM_TIER_SSD, d)
+                try:
+                    mgr = DeviceSegmentManager(lib, desc, d, sp_override.get(d, default_sp), unit_size)
+                except BaseException:
+                    lib.free(desc)
+                    raise
+                self._mgrs.append(mgr)
+        except BaseException:
+            for mgr in self._mgrs:
+                lib.free(mgr.desc)
+            raise
         self._engine = ConcurrentIOEngine(lib, num_workers=num_workers)
         self._write_lock = threading.Lock()   # write 单写者串行化
         self._closed = False
@@ -176,11 +189,15 @@ class VirtualMedia:
     def extent_base(self, device: int) -> int:
         """该盘 extent 在存储侧的基址（盘侧地址 = extent_base + offset）。
 
-        当前返回 0 占位：chunk 级盘侧基址需从 ChunkDescriptor.base_gpa
-        解出并转换到后端盘侧地址。umm_alloc_on_device 已恢复，但本函数的
-        地址导出仍待实现（docs/07 §5.3 规则 4）；CPU read_batch 不依赖此函数。
+        若适配层提供 resolve_ssd_extent_base，则使用其设备地址解析器。
+        原生 SSD pool 回放适配层返回窗口起点加 extent 的设备内偏移。
+        未提供解析器的旧 UMMLib 路径仍返回 0 占位，不能据此用于直通；
+        CPU read_batch 使用 descriptor 读写，不依赖此函数。
         """
         self._check_device(device)
+        resolver = getattr(self._lib, 'resolve_ssd_extent_base', None)
+        if resolver is not None:
+            return resolver(self._mgrs[device].desc, self._devices[device])
         return 0
 
     def is_buffered(self, device: int, offset: int) -> bool:
@@ -244,7 +261,10 @@ class VirtualMedia:
         """把按 offset 排序的 (pos, offset) 列表中相邻单元合并为连续读段。"""
         runs: List[List[Tuple[int, int]]] = []
         for pos, off in items:
-            if runs and off == runs[-1][-1][1] + self._unit_size:
+            if (self._read_merge and runs and
+                off == runs[-1][-1][1] + self._unit_size and
+                (self._max_read_bytes is None or
+                 off + self._unit_size - runs[-1][0][1] <= self._max_read_bytes)):
                 runs[-1].append((pos, off))
             else:
                 runs.append([(pos, off)])

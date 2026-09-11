@@ -41,6 +41,7 @@ struct SsdBackend {
     uint64_t    free_pages;     /* number of free pages */
     uint64_t   *bitmap;         /* allocation bitmap */
     uint64_t    bitmap_words;   /* number of uint64_t in bitmap */
+    SsdDirect *direct;         /* explicit O_DIRECT backend */
     int         is_libnvm;      /* 1 = libnvm userspace NVMe backend */
     SsdLibnvmBackend *libnvm;   /* libnvm handle (is_libnvm only) */
     int         is_nds;         /* 1 = NDS NPU 直驱后端 */
@@ -119,6 +120,14 @@ SsdBackend* ssd_backend_create(const char *device_path, uint64_t capacity)
     sb->fd          = -1;
     sb->mmap_base   = MAP_FAILED;
     pthread_mutex_init(&sb->lock, NULL);
+
+    if (strncmp(device_path, "direct:", 7) == 0) {
+        if (ssd_direct_open(device_path + 7, capacity, &sb->direct) != UMM_OK)
+            goto fail;
+        sb->capacity = capacity;
+        sb->total_pages = sb->free_pages = capacity / SSD_PAGE_SIZE;
+        goto init_bitmap;
+    }
 
     /* ---- libnvm 路径："libnvm:<ctrl>@<ns>"，用户态 NVMe 库驱动 ---- */
     if (strncmp(device_path, "libnvm:", 7) == 0) {
@@ -306,6 +315,7 @@ fail:
         munmap(sb->mmap_base, (size_t)sb->capacity);
     if (sb->fd >= 0)
         close(sb->fd);
+    ssd_direct_close(sb->direct);
     free(sb->bitmap);
     free(sb->device_path);
     free(sb);
@@ -343,6 +353,7 @@ void ssd_backend_destroy(SsdBackend *sb)
     pthread_mutex_unlock(&sb->lock);
     pthread_mutex_destroy(&sb->lock);
 
+    ssd_direct_close(sb->direct);
     free(sb->bitmap);
     free(sb->device_path);
     free(sb);
@@ -455,6 +466,7 @@ void* ssd_backend_get_ptr(SsdBackend *sb, uint64_t offset)
 
 int ssd_backend_sync(SsdBackend *sb, uint64_t offset, uint64_t size)
 {
+    if (sb && sb->direct) return ssd_direct_sync(sb->direct);
     if (!sb || sb->mmap_base == MAP_FAILED)
         return UMM_E_INVALID_ARG;
 
@@ -524,8 +536,10 @@ int ssd_backend_pread(SsdBackend *sb, uint64_t offset, uint64_t len, void *buf)
 {
     if (!sb || (!buf && len > 0))
         return UMM_E_INVALID_ARG;
-    if (offset + len > sb->capacity)
+    if (offset > sb->capacity || len > sb->capacity - offset)
         return UMM_E_INVALID_ARG;  /* 越界 */
+
+    if (sb->direct) return ssd_direct_read(sb->direct, offset, len, buf);
 
     if (sb->is_nds_meta) {
         umm_log_error(
@@ -566,8 +580,10 @@ int ssd_backend_pwrite(SsdBackend *sb, uint64_t offset, uint64_t len,
 {
     if (!sb || (!buf && len > 0))
         return UMM_E_INVALID_ARG;
-    if (offset + len > sb->capacity)
+    if (offset > sb->capacity || len > sb->capacity - offset)
         return UMM_E_INVALID_ARG;  /* 越界 */
+
+    if (sb->direct) return ssd_direct_write(sb->direct, offset, len, buf);
 
     if (sb->is_nds_meta) {
         umm_log_error(
@@ -1404,4 +1420,12 @@ int ssd_pool_batch_write(SsdPool *pool, const UmmNdsIOVec *iovs,
                          size_t n_iov)
 {
     return ssd_pool_batch_io(pool, iovs, n_iov, 1);
+}
+
+int ssd_pool_direct_stats(SsdPool *pool, uint32_t device_idx,
+                          SsdDirectStats *out, int reset)
+{
+    if (!pool || device_idx >= pool->num_devices || !out) return UMM_E_INVALID_ARG;
+    SsdDirect *b = pool->devices[device_idx].backend->direct;
+    return b ? ssd_direct_stats(b, out, reset) : UMM_E_UNSUPPORTED;
 }

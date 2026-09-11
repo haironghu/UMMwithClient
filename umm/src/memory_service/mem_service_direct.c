@@ -317,7 +317,8 @@ static int memsvc_register_storage(void *ctx, const StorageResource *res)
     char     ssd_resolved[288] = {0};
     uint64_t eff_capacity = res->capacity;
     if (res->tier == UMM_TIER_SSD && res->device_path[0] != '\0') {
-        if (strncmp(res->device_path, "libnvm:", 7) == 0 ||
+        if (strncmp(res->device_path, "direct:", 7) == 0 ||
+            strncmp(res->device_path, "libnvm:", 7) == 0 ||
             strncmp(res->device_path, "nds:", 4) == 0 ||
             /* nds-meta 纯分配后端（umms 簿记形态），同样原样透传 */
             strncmp(res->device_path, "nds-meta:", 9) == 0) {

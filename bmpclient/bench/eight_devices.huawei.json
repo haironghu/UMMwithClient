@@ -1,0 +1,42 @@
+[
+  {
+    "device": "/dev/nvme80n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme81n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme82n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme83n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme84n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme85n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme86n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  },
+  {
+    "device": "/dev/nvme87n1a",
+    "window_offset": 0,
+    "window_bytes": 15362386386944
+  }
+]

@@ -37,6 +37,7 @@ TRANSPORT_SRC := \
     transport_ssd.c \
     transport_remote.c \
     ssd_pool.c \
+    ssd_backend_direct.c \
     ssd_backend_libnvm.c \
     ssd_backend_nds.c \
     tier_router.c
@@ -158,6 +159,7 @@ UMMS_OBJ := \
     $(MEMORY_OBJ) \
     $(METADATA_OBJ) \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_direct.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/transport_ssd.o
@@ -248,6 +250,7 @@ TEST_TRANSPORT_OBJ := \
     $(BUILD_DIR)/transport_local.o \
     $(BUILD_DIR)/mem_service_direct.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_direct.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/transport_ssd.o \
@@ -270,6 +273,7 @@ TEST_INTEGRATION_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/transport_remote.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_direct.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/tier_router.o \
@@ -314,6 +318,7 @@ TEST_TIER_OBJ := \
     $(BUILD_DIR)/transport_ssd.o \
     $(BUILD_DIR)/transport_remote.o \
     $(BUILD_DIR)/ssd_pool.o \
+    $(BUILD_DIR)/ssd_backend_direct.o \
     $(BUILD_DIR)/ssd_backend_libnvm.o \
     $(BUILD_DIR)/ssd_backend_nds.o \
     $(BUILD_DIR)/tier_router.o \
@@ -354,6 +359,14 @@ $(BIN_DIR)/test_remote_phase1: $(TEST_DIR)/test_remote_phase1.c $(TEST_REMOTE_PH
 
 $(BIN_DIR)/test_alloc_on_device: $(TEST_DIR)/test_alloc_on_device.c $(BUILD_DIR)/libumm.a | dirs
 	$(CC) $(CFLAGS) $< $(BUILD_DIR)/libumm.a -o $@ $(LDFLAGS) -Wl,--wrap=meta_service_direct_create
+
+$(BIN_DIR)/test_ssd_direct: $(TEST_DIR)/test_ssd_direct.c $(BUILD_DIR)/libumm.a | dirs
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/libumm.a -o $@ $(LDFLAGS)
+
+# Requires a filesystem supporting O_DIRECT (not tmpfs).
+.PHONY: test-direct
+test-direct: $(BIN_DIR)/test_ssd_direct
+	$(BIN_DIR)/test_ssd_direct
 
 TEST_SSD_DIST_OBJ := $(TEST_TIER_OBJ)
 
