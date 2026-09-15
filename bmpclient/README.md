@@ -6,6 +6,7 @@
 > 无加速卡单盘测试：[直接 I/O 后端与 trace 回放指南](docs/09_单盘直接IO与trace回放.md)
 > · [真实排布路径、在线回放与实施计划](docs/10_真实排布路径回放与实施计划.md)
 > · [八盘哈希分盘与窗口配置](docs/11_八盘哈希回放.md)
+> · [盘内逻辑排布与读并发实验](docs/12_盘内逻辑排布与读并发.md)
 
 `bmpclient` 是 UMM 的 Python 客户端库，通过 `ctypes` 加载 `libumm.so`，将 UMM 的 C API 封装为 Pythonic 接口，提供从大块 Chunk 申请到细粒度 `Block` 分配、再到跨 SSD 设备定长存储的内存管理能力。
 

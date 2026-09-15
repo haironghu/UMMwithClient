@@ -16,6 +16,49 @@ from bmpclient.virtual_media import VirtualMedia
 
 
 class TestMultiDevice(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
+    def test_layout_concurrency_fixed_large_writes_no_merge(self):
+        with tempfile.TemporaryDirectory(prefix='umm-layout-sweep-') as directory:
+            root = Path(directory)
+            trace, config = self.prepare(root)
+            args = parser().parse_args(['--trace', str(trace), '--devices-config', str(config),
+                '--output', str(root / 'out.json'), '--experiment', 'layout-concurrency',
+                '--segments', '16K', '--worker-sweep', '1', '4', '--repeats', '1'])
+            result = run(args)
+            self.assertFalse(result['merge'])
+            self.assertEqual(result['segments'], [16384])
+            self.assertEqual(len(result['trials']), 4)
+            self.assertEqual(len(result['comparisons']), 4)
+            hashes = {}
+            for t in result['trials']:
+                self.assertEqual(t['segment_bytes'], 16384)
+                self.assertEqual(t['io']['read_calls'], sum(b['topk'] for b in t['batches']))
+                self.assertEqual(t['io']['write_bytes'], t['io']['write_calls'] * 16384)
+                if t['layout'] in hashes:
+                    self.assertEqual(hashes[t['layout']], t['mapping_sha256'])
+                hashes[t['layout']] = t['mapping_sha256']
+
+    def test_layout_concurrency_validation_and_dry_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace, config = self.prepare(root, 'device')
+            entries = json.loads(config.read_text())
+            for entry in entries:
+                entry['window_bytes'] = 4 * 1048576
+            config.write_text(json.dumps(entries))
+            argv = ['--trace', str(trace), '--devices-config', str(config),
+                    '--output', str(root / 'out.json'), '--experiment', 'layout-concurrency', '--dry-run']
+            with contextlib.redirect_stdout(io.StringIO()), patch('bmpclient.bench.layout_replay.DirectPool') as pool:
+                result = run(parser().parse_args(argv))
+                self.assertEqual(result['worker_sweep'], [1, 4, 8, 16])
+                self.assertFalse(result['merge'])
+                self.assertEqual(result['segments'], [1048576])
+                for bad in (['--segments', '4K'], ['--segments', '64K', '1M'],
+                            ['--worker-sweep', '0'], ['--mode', 'online']):
+                    with self.assertRaises(ValueError):
+                        run(parser().parse_args(argv + bad))
+            pool.assert_not_called()
+
     def test_partial_extent_allocation_failure_reclaims_previous_devices(self):
         lib = FakeUMMLib(num_ssd_devices=8)
         allocate = lib.alloc_on_device

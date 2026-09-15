@@ -5,6 +5,7 @@ SSD pool. It does not implement RPC, metadata service or the NPU data plane.
 """
 import argparse
 import ctypes
+import copy
 import hashlib
 import json
 import os
@@ -165,22 +166,33 @@ def trial(client, trace, args, segment, shuffled, capacities):
             seed = hashlib.sha256(f'{args.seed}:{req}:{layer}:{start}:{end}'.encode()).digest()
             random.Random(seed).shuffle(tokens)
         begin = time.perf_counter_ns()
+        progress_at = time.monotonic()
+        print(f"  prepare request={req} layer={layer} rows={end-start}", flush=True)
         # Same one-token KVBlockRef interface in both layouts. Changing insertion
         # order changes real slot-table offsets, not just I/O request order.
-        for token in tokens:
+        for completed, token in enumerate(tokens, 1):
             data = pattern(trace.bases[key] + token, args.seed)
             store.offload([KVBlockRef(dense_layer, token, token, 1, data)])
+            if completed % 1024 == 0 and time.monotonic() - progress_at >= 5:
+                elapsed = (time.perf_counter_ns() - begin) / 1e9
+                rate = completed / elapsed
+                print(f"    appended={completed}/{len(tokens)} slots "
+                      f"rate={rate * PAGE / (1 << 20):.2f} MiB/s "
+                      f"eta={(len(tokens)-completed)/rate:.0f}s (includes buffered rows)", flush=True)
+                progress_at = time.monotonic()
         append_ns += time.perf_counter_ns() - begin
         for token in range(start, end):
             offset, _ = store.slot_table.locate(dense_layer, token)
             device = store.media.locate((dense_layer, token))
             mapping.update(json.dumps([req, layer, token, device, offset], separators=(',', ':')).encode())
+        print(f"  prepared request={req} layer={layer} rows={end-start}", flush=True)
         loaded[key] = end
         written_rows += end - start
 
     def flush(req):
         nonlocal sync_ns
         begin = time.perf_counter_ns()
+        print(f"  flush/sync request={req}", flush=True)
         stores[req].flush()
         client.pool.sync()
         sync_ns += time.perf_counter_ns() - begin
@@ -191,6 +203,8 @@ def trial(client, trace, args, segment, shuffled, capacities):
                 append(req, layer, lengths[(req, layer)])
             for req in sorted(stores):
                 flush(req)
+        print(f'  replay batches={len(trace.records)} workers={args.workers} merge={not args.no_merge}', flush=True)
+        replay_progress = time.monotonic()
         last = {r['request_id']: i for i, r in enumerate(trace.records)}
         for i, r in enumerate(trace.records):
             req, layer = r['request_id'], r['layer_id']
@@ -229,6 +243,9 @@ def trial(client, trace, args, segment, shuffled, capacities):
             records.append(dict(record_index=i, request_id=req, layer_id=layer, step_id=r['step_id'],
                                 topk=len(indices), unique_topk=len(set(indices)), plan_us=plan_ns / 1e3,
                                 fetch_us=fetch_ns / 1e3, verify_us=(time.perf_counter_ns() - begin) / 1e3, io=stats))
+            if time.monotonic() - replay_progress >= 5:
+                print(f'    replayed={i+1}/{len(trace.records)} batches', flush=True)
+                replay_progress = time.monotonic()
             if i == last[req]:
                 begin = time.perf_counter_ns()
                 for (q, lyr), end in loaded.items():
@@ -276,6 +293,8 @@ def parser():
     p.add_argument('--dry-run', action='store_true', help='print capacity/window plan without opening the target or writing files')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mode', choices=['snapshot', 'online'], default='snapshot')
+    p.add_argument('--experiment', choices=['write-layout', 'layout-concurrency'], default='write-layout')
+    p.add_argument('--worker-sweep', type=int, nargs='+', help='layout-concurrency only; default: 1 4 8 16')
     p.add_argument('--segments', type=size_arg, nargs='+', default=[1 << 20])
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--max-topk', type=int, default=2048)
@@ -290,7 +309,20 @@ def parser():
 def run(args):
     if min(args.workers, args.max_topk, args.repeats) < 1 or not 0 <= args.seed < 1 << 64:
         raise ValueError('invalid workers, max-topk, repeats or seed')
-    segments = sorted(set([PAGE] + args.segments))
+    layout_experiment = args.experiment == 'layout-concurrency'
+    if layout_experiment:
+        if args.mode != 'snapshot' or len(args.segments) != 1 or args.segments[0] <= PAGE:
+            raise ValueError('layout-concurrency requires snapshot and exactly one preparation segment > 4096')
+        args = copy.copy(args)
+        args.no_merge = True
+        worker_values = sorted(set(args.worker_sweep if args.worker_sweep is not None else [1, 4, 8, 16]))
+        if not worker_values or min(worker_values) < 1:
+            raise ValueError('worker-sweep must contain positive integers')
+    else:
+        if args.worker_sweep is not None:
+            raise ValueError('--worker-sweep requires --experiment layout-concurrency')
+        worker_values = [args.workers]
+    segments = sorted(set(args.segments if layout_experiment else [PAGE] + args.segments))
     if any(s < PAGE or s & (s - 1) for s in segments):
         raise ValueError('VirtualMedia segments must be powers of two >= 4096')
     if args.max_read_bytes < PAGE or args.max_read_bytes % PAGE:
@@ -343,7 +375,7 @@ def run(args):
         raise FileExistsError('result path must be new')
     capacity = sum(required)
     target, base, window = windows[0]['target'], windows[0]['window_offset'], windows[0]['window_bytes']
-    result = dict(schema_version=2, status='running', mode=args.mode, path='SparseKVStore/VirtualMedia/native SSD pool',
+    result = dict(experiment=args.experiment, worker_sweep=worker_values, schema_version=2, status='running', mode=args.mode, path='SparseKVStore/VirtualMedia/native SSD pool',
                   trace_sha256=trace.digest, trace_path=str(args.trace.resolve()),
                   file=str(target) if args.file else None, target=str(target) if len(windows) == 1 else None,
                   target_kind='block_device' if block_mode else 'regular_file',
@@ -355,7 +387,7 @@ def run(args):
                   possible_write_range=windows[0]['possible_write_range'] if len(windows) == 1 else None,
                   capacity_bytes=capacity, request_capacities=capacities, machine=platform.machine(),
                   kernel=platform.release(), python=platform.python_version(), seed=args.seed,
-                  workers=args.workers, max_read_bytes=args.max_read_bytes, merge=not args.no_merge,
+                  workers=None if layout_experiment else args.workers, max_read_bytes=args.max_read_bytes, merge=not args.no_merge,
                   verified=not args.no_verify, segments=segments, repeats=args.repeats,
                   slot_bytes=PAGE, kv_bytes=KV_BYTES, trials=[], comparisons=[],
                   notes=['shuffled is a synthetic insertion-order baseline, not measured production layout',
@@ -364,6 +396,8 @@ def run(args):
                          'first fetch includes lazy worker creation; no warmup or cache eviction',
                          'online flushes before each fetch; padding and synchronization costs are reported',
                          'firmware caches, FTL, physical die mapping and model TPOT are not controlled'])
+    if layout_experiment:
+        result['notes'].append('each trial prepares a fresh snapshot with the same large write segment; preparation is excluded from fetch time; workers is the total host thread count, not per-device queue depth')
     if args.dry_run:
         result['status'] = 'planned'
         result['notes'].append('target existence/type/size/exclusivity and O_DIRECT support have NOT been checked')
@@ -406,31 +440,40 @@ def run(args):
                         os.environ['UMM_ALLOW_BLOCK_DEVICE'] = previous_allow
             client = PoolClient(pool)
             result['library_sha256'] = hashlib.sha256(Path(pool.library_path).read_bytes()).hexdigest()
-            cases = [(s, shuffled) for s in segments for shuffled in (False, True)]
+            cases = [(s, shuffled, workers) for s in segments for workers in worker_values for shuffled in (False, True)]
             for repeat in range(args.repeats):
-                for segment, shuffled in (cases if repeat % 2 == 0 else list(reversed(cases))):
-                    print(f'repeat={repeat} segment={segment} layout={"shuffled" if shuffled else "ordered"}', flush=True)
-                    item = trial(client, trace, args, segment, shuffled, capacities)
+                for segment, shuffled, workers in (cases if repeat % 2 == 0 else list(reversed(cases))):
+                    print(f'repeat={repeat} workers={workers} segment={segment} layout={"shuffled" if shuffled else "ordered"}', flush=True)
+                    trial_args = copy.copy(args)
+                    trial_args.workers = workers
+                    item = trial(client, trace, trial_args, segment, shuffled, capacities)
+                    item['workers'] = workers
                     item['repeat'] = repeat
                     result['trials'].append(item)
                     output.seek(0)
                     json.dump(result, output, indent=2)
                     output.truncate()
                     output.flush()
-            # Factorial comparisons: isolate ordering at fixed write size, and
-            # aggregation at fixed ordering. Also report combined vs shuffled 4K.
-            def compare(base_layout, base_seg, layout, seg):
-                a = [t['active_fetch_seconds'] for t in result['trials'] if t['layout'] == base_layout and t['segment_bytes'] == base_seg]
-                b = [t['active_fetch_seconds'] for t in result['trials'] if t['layout'] == layout and t['segment_bytes'] == seg]
+            def compare(base_layout, base_seg, base_workers, layout, seg, workers):
+                a = [t['active_fetch_seconds'] for t in result['trials'] if
+                     (t['layout'], t['segment_bytes'], t['workers']) == (base_layout, base_seg, base_workers)]
+                b = [t['active_fetch_seconds'] for t in result['trials'] if
+                     (t['layout'], t['segment_bytes'], t['workers']) == (layout, seg, workers)]
                 return dict(baseline=[base_layout, base_seg], candidate=[layout, seg],
+                            baseline_workers=base_workers, candidate_workers=workers,
                             median_fetch_speedup=statistics.median(a) / statistics.median(b),
                             paired_speedups=[x / y for x, y in zip(a, b)])
             for seg in segments:
-                result['comparisons'].append(compare('shuffled', seg, 'ordered', seg))
-                if seg != PAGE:
-                    for layout in ('ordered', 'shuffled'):
-                        result['comparisons'].append(compare(layout, PAGE, layout, seg))
-                    result['comparisons'].append(compare('shuffled', PAGE, 'ordered', seg))
+                for workers in worker_values:
+                    result['comparisons'].append(compare('shuffled', seg, workers, 'ordered', seg, workers))
+                    if layout_experiment:
+                        if workers != worker_values[0]:
+                            for layout in ('ordered', 'shuffled'):
+                                result['comparisons'].append(compare(layout, seg, worker_values[0], layout, seg, workers))
+                    elif seg != PAGE:
+                        for layout in ('ordered', 'shuffled'):
+                            result['comparisons'].append(compare(layout, PAGE, workers, layout, seg, workers))
+                        result['comparisons'].append(compare('shuffled', PAGE, workers, 'ordered', seg, workers))
             result['status'] = 'complete'
         except BaseException as exc:
             result['status'] = 'failed'
