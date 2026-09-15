@@ -25,6 +25,42 @@ from bmpclient.virtual_media import VirtualMedia
 from bmpclient.bench.multi_device import OriginalLayerHash, hash_capacities, load_devices
 
 
+class DataMismatchError(RuntimeError):
+    def __init__(self, details):
+        self.details = details
+        super().__init__('data mismatch: ' + json.dumps(details, sort_keys=True))
+
+
+def diagnose_mismatch(client, store, dense_layer, record, record_index, token,
+                      actual, expected, segment, shuffled, workers):
+    """Capture evidence before cleanup; retry one native read, never rewrite data."""
+    device = store.media.locate((dense_layer, token))
+    offset, _ = store.slot_table.locate(dense_layer, token)
+    physical = store.media.extent_base(device) + offset
+    virtual = client.pool.reservations[device][0] + physical - client.window_bases[device]
+
+    def describe(data):
+        return dict(sha256=hashlib.sha256(data).hexdigest(), head_hex=bytes(data[:32]).hex(),
+                    all_zero=not any(data))
+
+    details = dict(request_id=record['request_id'], layer_id=record['layer_id'],
+                   step_id=record['step_id'], record_index=record_index, token=token,
+                   layout='shuffled' if shuffled else 'ordered', workers=workers,
+                   segment_bytes=segment, device_idx=device, extent_offset=offset,
+                   device_byte_offset=physical, pool_byte_offset=virtual,
+                   first_mismatch_byte=next(i for i, (a, b) in enumerate(zip(actual, expected)) if a != b),
+                   expected=describe(expected), actual=describe(actual))
+    retry = bytearray(PAGE)
+    owner = (ctypes.c_char * PAGE).from_buffer(retry)
+    try:
+        client.pool.read(virtual, PAGE, ctypes.addressof(owner))
+        details['native_retry'] = dict(describe(retry), matches_expected=retry == expected,
+                                       matches_first=retry == actual)
+    except Exception as exc:
+        details['native_retry'] = dict(error=str(exc))
+    return details
+
+
 class PoolClient:
     """Benchmark-only device bridge; all extents use the native bitmap."""
     def __init__(self, pool):
@@ -238,8 +274,11 @@ def trial(client, trace, args, segment, shuffled, capacities):
             begin = time.perf_counter_ns()
             if not args.no_verify:
                 for token, data in zip(indices, outs):
-                    if data != pattern(trace.bases[(req, layer)] + token, args.seed):
-                        raise RuntimeError(f'data mismatch: {req}, {layer}, {token}')
+                    expected = pattern(trace.bases[(req, layer)] + token, args.seed)
+                    if data != expected:
+                        raise DataMismatchError(diagnose_mismatch(
+                            client, store, dense_layer, r, i, token, data, expected,
+                            segment, shuffled, args.workers))
             records.append(dict(record_index=i, request_id=req, layer_id=layer, step_id=r['step_id'],
                                 topk=len(indices), unique_topk=len(set(indices)), plan_us=plan_ns / 1e3,
                                 fetch_us=fetch_ns / 1e3, verify_us=(time.perf_counter_ns() - begin) / 1e3, io=stats))
@@ -443,6 +482,8 @@ def run(args):
             cases = [(s, shuffled, workers) for s in segments for workers in worker_values for shuffled in (False, True)]
             for repeat in range(args.repeats):
                 for segment, shuffled, workers in (cases if repeat % 2 == 0 else list(reversed(cases))):
+                    result['active_trial'] = dict(repeat=repeat, segment_bytes=segment,
+                                                  layout='shuffled' if shuffled else 'ordered', workers=workers)
                     print(f'repeat={repeat} workers={workers} segment={segment} layout={"shuffled" if shuffled else "ordered"}', flush=True)
                     trial_args = copy.copy(args)
                     trial_args.workers = workers
@@ -475,9 +516,14 @@ def run(args):
                             result['comparisons'].append(compare(layout, PAGE, workers, layout, seg, workers))
                         result['comparisons'].append(compare('shuffled', PAGE, workers, 'ordered', seg, workers))
             result['status'] = 'complete'
+            result.pop('active_trial', None)
         except BaseException as exc:
             result['status'] = 'failed'
             result['error'] = str(exc)
+            if isinstance(exc, DataMismatchError):
+                result['failure'] = exc.details
+                device = exc.details['device_idx']
+                result['failure']['device_path'] = str(windows[device]['target'])
             raise
         finally:
             if pool:

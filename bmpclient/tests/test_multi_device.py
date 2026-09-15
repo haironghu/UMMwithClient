@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -7,7 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bmpclient.bench.layout_replay import parser, run, geometry
+from bmpclient.bench.layout_replay import parser, run, geometry, DataMismatchError
+from bmpclient.bench.single_ssd import DirectPool
+from bmpclient.sparse_kv import SparseKVStore
 from bmpclient.bench.multi_device import OriginalLayerHash, hash_capacities, load_devices
 from bmpclient.bench.single_ssd import load_trace
 from bmpclient.virtual_media_strategy import PositionHashStrategy
@@ -16,6 +19,41 @@ from bmpclient.virtual_media import VirtualMedia
 
 
 class TestMultiDevice(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
+    def test_mismatch_records_address_and_independent_native_retry(self):
+        original_fetch, original_read = SparseKVStore.fetch, DirectPool.read
+
+        def corrupt_fetch(store, layer, tokens, outs):
+            original_fetch(store, layer, tokens, outs)
+            outs[0][0] ^= 1
+
+        def corrupt_native(pool, off, size, ptr):
+            original_read(pool, off, size, ptr)
+            ctypes.c_ubyte.from_address(ptr).value ^= 1
+
+        for native in (False, True):
+            with self.subTest(native=native), tempfile.TemporaryDirectory(prefix='umm-mismatch-') as directory:
+                root = Path(directory)
+                trace, config = self.prepare(root)
+                output = root / 'out.json'
+                args = parser().parse_args(['--trace', str(trace), '--devices-config', str(config),
+                    '--output', str(output), '--experiment', 'layout-concurrency',
+                    '--segments', '16K', '--worker-sweep', '1', '--repeats', '1'])
+                patcher = patch.object(DirectPool, 'read', corrupt_native) if native else patch.object(SparseKVStore, 'fetch', corrupt_fetch)
+                with patcher, self.assertRaises(DataMismatchError):
+                    run(args)
+                result = json.loads(output.read_text())
+                failure = result['failure']
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['active_trial']['workers'], 1)
+                self.assertEqual(failure['first_mismatch_byte'], 0)
+                self.assertEqual(failure['native_retry']['matches_expected'], not native)
+                self.assertEqual(failure['native_retry']['matches_first'], native)
+                device = result['devices'][failure['device_idx']]
+                self.assertEqual(failure['device_path'], device['target'])
+                self.assertGreaterEqual(failure['device_byte_offset'], device['window_offset'])
+                self.assertLess(failure['device_byte_offset'], device['possible_write_range'][1])
+
     @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
     def test_layout_concurrency_fixed_large_writes_no_merge(self):
         with tempfile.TemporaryDirectory(prefix='umm-layout-sweep-') as directory:
