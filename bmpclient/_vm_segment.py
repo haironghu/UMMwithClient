@@ -4,7 +4,7 @@ bmpclient/_vm_segment.py — VirtualMedia 内部模块：盘内段（super page�
 分配器与聚合写缓冲。不作为公开接口使用。
 
 段只是**写侧**分配与回收的管理单位，不参与读路径寻址：
-segment_id = offset >> log2(sp_bytes)。读路径一律用 extent 内绝对偏移。
+segment_id = offset // sp_bytes。读路径一律用 extent 内绝对偏移。
 
 设计文档：bmpclient/docs/07_VirtualMedia合并设计_稀疏KV专用介质.md §3。
 """
@@ -21,9 +21,9 @@ class SegmentFullError(RuntimeError):
 
 
 def check_segment_geometry(sp_bytes: int, unit_size: int) -> None:
-    """校验段大小约束：2 的幂、4KB 整数倍、能装整数个单元。"""
-    if sp_bytes <= 0 or (sp_bytes & (sp_bytes - 1)) != 0:
-        raise ValueError(f"sp_bytes 必须是 2 的幂: {sp_bytes}")
+    """校验段大小约束：正数、4KB 整数倍、能装整数个单元。"""
+    if sp_bytes <= 0:
+        raise ValueError(f"sp_bytes 必须为正数: {sp_bytes}")
     if sp_bytes % 4096 != 0:
         raise ValueError(f"sp_bytes 必须是 4KB 整数倍: {sp_bytes}")
     if unit_size <= 0 or unit_size % 4096 != 0:
@@ -41,7 +41,7 @@ class DeviceSegmentManager:
     :param lib: UMMLib（或 FakeUMMLib）
     :param desc: 本盘 extent 的 ChunkDescriptor（alloc_on_device 分配）
     :param device_idx: 设备索引（仅日志/报错用）
-    :param sp_bytes: 段大小（2 的幂、4KB 整数倍、unit_size 整数倍）
+    :param sp_bytes: 段大小（正数、4KB 整数倍、unit_size 整数倍）
     :param unit_size: 排布单元定长（4KB 对齐）
     """
 
@@ -63,7 +63,6 @@ class DeviceSegmentManager:
         self._device_idx = device_idx
         self._sp_bytes = sp_bytes
         self._unit_size = unit_size
-        self._shift = sp_bytes.bit_length() - 1
         self._slots_per_seg = sp_bytes // unit_size
         self._n_seg = desc.user_size // sp_bytes
 
@@ -99,7 +98,7 @@ class DeviceSegmentManager:
 
     def segment_of(self, offset: int) -> int:
         """由 extent 内偏移推出所属段号。"""
-        return offset >> self._shift
+        return offset // self._sp_bytes
 
     # ---- 写路径 ----
 
@@ -122,7 +121,7 @@ class DeviceSegmentManager:
                 self._flush_locked()
                 self._start_segment()
             seg = self._buf_seg
-            offset = (seg << self._shift) + self._buf_fill * self._unit_size
+            offset = seg * self._sp_bytes + self._buf_fill * self._unit_size
             start = self._buf_fill * self._unit_size
             self._buf[start:start + self._unit_size] = data
             self._buf_fill += 1
@@ -147,7 +146,7 @@ class DeviceSegmentManager:
     def _flush_locked(self) -> None:
         """当前段作为一次连续大 IO 写入 extent 对应偏移区间（锁内调用）。"""
         seg = self._buf_seg
-        self._lib.write_from(self._desc, seg << self._shift, self._buf)
+        self._lib.write_from(self._desc, seg * self._sp_bytes, self._buf)
         self._buf = None
         self._buf_seg = -1
         self._buf_fill = 0
@@ -170,7 +169,7 @@ class DeviceSegmentManager:
         with self._lock:
             if self._buf is None or self.segment_of(offset) != self._buf_seg:
                 return None
-            local = offset - (self._buf_seg << self._shift)
+            local = offset - self._buf_seg * self._sp_bytes
             return bytes(self._buf[local:local + size])
 
     # ---- 回收 ----

@@ -81,7 +81,7 @@ class TestLayoutReplay(unittest.TestCase):
             trace = self.write_trace(root)
             output, target = root / 'out.json', root / 'data.raw'
             args = parser().parse_args(['--trace', str(trace), '--file', str(target), '--output', str(output),
-                                        '--segments', '26640384'])
+                                        '--segments', '26640385'])
             with self.assertRaises(ValueError):
                 run(args)
             self.assertFalse(target.exists())

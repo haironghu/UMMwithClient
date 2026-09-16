@@ -20,6 +20,61 @@ from bmpclient.virtual_media import VirtualMedia
 
 class TestMultiDevice(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
+    def test_exact_superpage_boundary_readback_and_write_latency(self):
+        with tempfile.TemporaryDirectory(prefix='umm-superpage-') as directory:
+            root = Path(directory)
+            trace = root / 'trace.jsonl'
+            trace.write_text(json.dumps(dict(request_id='r', step_id=0, layer_id=26,
+                context_length=6505, topk_token_indices=[0, 6503, 6504, 0])) + '\n')
+            args = parser().parse_args(['--trace', str(trace), '--file', str(root / 'data'),
+                '--output', str(root / 'out.json'), '--experiment', 'layout-concurrency',
+                '--segments', '26640384', '--worker-sweep', '1', '--repeats', '1'])
+            result = run(args)
+            self.assertEqual(result['status'], 'complete')
+            for t in result['trials']:
+                self.assertEqual(t['segment_bytes'], 26640384)
+                self.assertEqual(t['write_call_count'], 2)
+                self.assertEqual(t['io']['write_bytes'], 2 * 26640384)
+                self.assertGreater(t['write_call_us']['p50'], 0)
+                self.assertGreater(t['write_call_total_ms'], 0)
+
+    @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
+    def test_write_watch_detects_missing_write_and_later_overwrite(self):
+        original_write, original_sync = DirectPool.write, DirectPool.sync
+
+        def drop_write(pool, off, size, ptr):
+            if off != 0:
+                original_write(pool, off, size, ptr)
+
+        def overwrite_after_sync(pool):
+            original_sync(pool)
+            zero = bytearray(4096)
+            owner = (ctypes.c_char * 4096).from_buffer(zero)
+            original_write(pool, 0, 4096, ctypes.addressof(owner))
+
+        for mode in ('healthy', 'dropped', 'overwritten'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='umm-watch-') as directory:
+                root = Path(directory)
+                trace, config = self.prepare(root)
+                output = root / 'out.json'
+                args = parser().parse_args(['--trace', str(trace), '--devices-config', str(config),
+                    '--output', str(output), '--experiment', 'layout-concurrency',
+                    '--segments', '16K', '--worker-sweep', '1', '--repeats', '1',
+                    '--watch-device-offset', '0', '4096'])
+                if mode == 'healthy':
+                    result = run(args)
+                    self.assertTrue(all(e['status'] == 'matched' for e in result['write_watch']))
+                else:
+                    method, replacement = ('write', drop_write) if mode == 'dropped' else ('sync', overwrite_after_sync)
+                    with patch.object(DirectPool, method, replacement), self.assertRaises(DataMismatchError):
+                        run(args)
+                    result = json.loads(output.read_text())
+                    failure = result['failure']
+                    self.assertTrue(failure['actual_all_zero'])
+                    self.assertFalse(failure['expected_all_zero'])
+                    self.assertEqual(failure['stage'], 'immediately_after_write' if mode == 'dropped' else 'after_snapshot_sync')
+
+    @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
     def test_mismatch_records_address_and_independent_native_retry(self):
         original_fetch, original_read = SparseKVStore.fetch, DirectPool.read
 

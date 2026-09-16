@@ -63,8 +63,13 @@ def diagnose_mismatch(client, store, dense_layer, record, record_index, token,
 
 class PoolClient:
     """Benchmark-only device bridge; all extents use the native bitmap."""
-    def __init__(self, pool):
+    def __init__(self, pool, watch=None):
         self.pool = pool
+        self.watch = watch
+        self.watch_expected = None
+        self.watch_events = []
+        self.watch_context = {}
+        self.write_call_us = []
         fn = pool.lib.ssd_pool_free
         fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
         fn.restype = ctypes.c_int
@@ -75,6 +80,28 @@ class PoolClient:
         self.live = {}
         self.next_id = 1
         self.window_bases = [pool.stats(device_idx=d)['window_base'] for d in range(pool.device_count)]
+
+    def check_watch(self, stage):
+        if self.watch is None:
+            return
+        device, physical = self.watch
+        event = dict(self.watch_context, stage=stage, device_idx=device, device_byte_offset=physical)
+        if self.watch_expected is None:
+            event['status'] = 'not_written'
+        else:
+            virtual = self.pool.reservations[device][0] + physical - self.window_bases[device]
+            data = bytearray(PAGE)
+            owner = (ctypes.c_char * PAGE).from_buffer(data)
+            self.pool.read(virtual, PAGE, ctypes.addressof(owner))
+            expected = self.watch_expected
+            event.update(status='matched' if data == expected else 'mismatch',
+                         expected_sha256=hashlib.sha256(expected).hexdigest(),
+                         actual_sha256=hashlib.sha256(data).hexdigest(),
+                         expected_all_zero=not any(expected), actual_all_zero=not any(data))
+        self.watch_events.append(event)
+        print('  write-watch: ' + json.dumps(event, sort_keys=True), flush=True)
+        if event['status'] == 'mismatch':
+            raise DataMismatchError(event)
 
     def get_topology(self):
         return SimpleNamespace(num_resources=self.pool.device_count, resources=[
@@ -110,7 +137,19 @@ class PoolClient:
         # Real VM supplies writable bytearrays. Native backend handles alignment;
         # its bounce_bytes are included in the report, never hidden.
         owner = (ctypes.c_char * view.nbytes).from_buffer(view)
-        (self.pool.write if write else self.pool.read)(off + offset, view.nbytes, ctypes.addressof(owner))
+        if write:
+            begin = time.perf_counter_ns()
+            self.pool.write(off + offset, view.nbytes, ctypes.addressof(owner))
+            self.write_call_us.append((time.perf_counter_ns() - begin) / 1e3)
+        else:
+            self.pool.read(off + offset, view.nbytes, ctypes.addressof(owner))
+        if write and self.watch is not None:
+            device, physical = self.watch
+            virtual = self.pool.reservations[device][0] + physical - self.window_bases[device]
+            local = virtual - (off + offset)
+            if 0 <= local and local + PAGE <= view.nbytes:
+                self.watch_expected = bytes(view[local:local + PAGE])
+                self.check_watch('immediately_after_write')
         return view.nbytes
 
     def read_into(self, desc, offset, buf):
@@ -160,6 +199,7 @@ def delta(after, before):
 
 
 def trial(client, trace, args, segment, shuffled, capacities):
+    client.write_call_us = []
     lengths, _ = geometry(trace, segment, args.mode)
     layers = {}
     for request, layer in lengths:
@@ -239,6 +279,7 @@ def trial(client, trace, args, segment, shuffled, capacities):
                 append(req, layer, lengths[(req, layer)])
             for req in sorted(stores):
                 flush(req)
+            client.check_watch('after_snapshot_sync')
         print(f'  replay batches={len(trace.records)} workers={args.workers} merge={not args.no_merge}', flush=True)
         replay_progress = time.monotonic()
         last = {r['request_id']: i for i, r in enumerate(trace.records)}
@@ -309,6 +350,8 @@ def trial(client, trace, args, segment, shuffled, capacities):
                     mapping_sha256=mapping.hexdigest(), batches=records, io=io,
                     written_rows=written_rows, write_amplification_vs_slots=io['write_bytes'] / (written_rows * PAGE),
                     read_amplification_vs_unique_kv=read_bytes / useful,
+                    write_call_us=percentiles(client.write_call_us) if client.write_call_us else {},
+                    write_call_count=len(client.write_call_us), write_call_total_ms=sum(client.write_call_us) / 1e3,
                     append_ms=append_ns / 1e6, flush_sync_ms=sync_ns / 1e6, release_ms=release_ns / 1e6,
                     wall_ms=(time.perf_counter_ns() - initial) / 1e6,
                     active_fetch_seconds=seconds, fetch_us=percentiles([r['fetch_us'] for r in records]),
@@ -342,6 +385,8 @@ def parser():
     p.add_argument('--seed', type=int, default=2026)
     p.add_argument('--no-merge', action='store_true')
     p.add_argument('--no-verify', action='store_true')
+    p.add_argument('--watch-device-offset', nargs=2, type=int, metavar=('DEVICE_IDX', 'BYTE_OFFSET'),
+                   help='diagnostic snapshot only: read back one physical 4096-byte page after writes and snapshot sync')
     return p
 
 
@@ -362,8 +407,8 @@ def run(args):
             raise ValueError('--worker-sweep requires --experiment layout-concurrency')
         worker_values = [args.workers]
     segments = sorted(set(args.segments if layout_experiment else [PAGE] + args.segments))
-    if any(s < PAGE or s & (s - 1) for s in segments):
-        raise ValueError('VirtualMedia segments must be powers of two >= 4096')
+    if any(s < PAGE or s % PAGE for s in segments):
+        raise ValueError('VirtualMedia segments must be multiples of 4096')
     if args.max_read_bytes < PAGE or args.max_read_bytes % PAGE:
         raise ValueError('max-read-bytes must be a multiple of 4096')
     trace = load_trace(args.trace, args.max_topk)
@@ -387,6 +432,13 @@ def run(args):
         windows = [dict(device_idx=0, target=(args.file or args.device).resolve(),
                         kind='device' if args.device else 'file', window_offset=base, window_bytes=window)]
     block_mode = windows[0]['kind'] == 'device'
+    if args.watch_device_offset is not None:
+        d, watched = args.watch_device_offset
+        if args.mode != 'snapshot' or not 0 <= d < len(windows):
+            raise ValueError('watch-device-offset requires snapshot and a valid device index')
+        w = windows[d]
+        if watched % PAGE or watched < w['window_offset'] or watched + PAGE > w['window_offset'] + w['window_bytes']:
+            raise ValueError('watched page must be aligned and inside the configured window')
     if block_mode and not args.dry_run and not args.allow_device_write:
         raise ValueError('device writes require --allow-device-write')
     if not block_mode and args.allow_device_write:
@@ -437,6 +489,9 @@ def run(args):
                          'firmware caches, FTL, physical die mapping and model TPOT are not controlled'])
     if layout_experiment:
         result['notes'].append('each trial prepares a fresh snapshot with the same large write segment; preparation is excluded from fetch time; workers is the total host thread count, not per-device queue depth')
+    result['watch_device_offset'] = args.watch_device_offset
+    if args.watch_device_offset is not None:
+        result['notes'].append('diagnostic run: watch reads affect preparation I/O statistics and cache state; do not use for performance comparisons')
     if args.dry_run:
         result['status'] = 'planned'
         result['notes'].append('target existence/type/size/exclusivity and O_DIRECT support have NOT been checked')
@@ -477,13 +532,16 @@ def run(args):
                         os.environ.pop('UMM_ALLOW_BLOCK_DEVICE', None)
                     else:
                         os.environ['UMM_ALLOW_BLOCK_DEVICE'] = previous_allow
-            client = PoolClient(pool)
+            client = PoolClient(pool, args.watch_device_offset)
+            result['write_watch'] = client.watch_events
             result['library_sha256'] = hashlib.sha256(Path(pool.library_path).read_bytes()).hexdigest()
             cases = [(s, shuffled, workers) for s in segments for workers in worker_values for shuffled in (False, True)]
             for repeat in range(args.repeats):
                 for segment, shuffled, workers in (cases if repeat % 2 == 0 else list(reversed(cases))):
                     result['active_trial'] = dict(repeat=repeat, segment_bytes=segment,
                                                   layout='shuffled' if shuffled else 'ordered', workers=workers)
+                    client.watch_expected = None
+                    client.watch_context = result['active_trial'].copy()
                     print(f'repeat={repeat} workers={workers} segment={segment} layout={"shuffled" if shuffled else "ordered"}', flush=True)
                     trial_args = copy.copy(args)
                     trial_args.workers = workers
