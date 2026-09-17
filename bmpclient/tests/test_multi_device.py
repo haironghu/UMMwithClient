@@ -11,7 +11,7 @@ from unittest.mock import patch
 from bmpclient.bench.layout_replay import parser, run, geometry, DataMismatchError
 from bmpclient.bench.single_ssd import DirectPool
 from bmpclient.sparse_kv import SparseKVStore
-from bmpclient.bench.multi_device import OriginalLayerHash, hash_capacities, load_devices
+from bmpclient.bench.multi_device import OriginalLayerHash, hash_capacities, load_devices, LayerPlacement, layer_capacities
 from bmpclient.bench.single_ssd import load_trace
 from bmpclient.virtual_media_strategy import PositionHashStrategy
 from bmpclient.testing import FakeUMMLib
@@ -19,6 +19,46 @@ from bmpclient.virtual_media import VirtualMedia
 
 
 class TestMultiDevice(unittest.TestCase):
+    def test_layer_placement_boundaries_and_capacity(self):
+        for mode in ('range', 'stripe'):
+            for length in (1, 7, 8, 9, 31, 32, 33, 65):
+                with self.subTest(mode=mode, length=length):
+                    lengths = {('a', 19): length, ('a', 31): length}
+                    strategy = LayerPlacement(8, [19, 31], 'a', lengths, mode, 4)
+                    caps, rows = layer_capacities(12288, lengths, 8, mode, 4)
+                    counts = [0] * 8
+                    assignments = [strategy.locate((0, t)) for t in range(length)]
+                    for d in assignments:
+                        counts[d] += 1
+                    self.assertEqual(rows['a'], [n * 2 for n in counts])
+                    self.assertEqual(assignments, [strategy.locate((1, t)) for t in range(length)])
+                    if mode == 'range':
+                        self.assertEqual(assignments, sorted(assignments))
+                        self.assertLessEqual(max(counts) - min(counts), 1)
+                    else:
+                        self.assertEqual(assignments, [(t // 4) % 8 for t in range(length)])
+                    self.assertTrue(all(n % 12288 == 0 for n in caps['a']))
+
+    @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
+    def test_layer_placement_native_replay(self):
+        for mode in ('range', 'stripe'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='umm-placement-') as directory:
+                root = Path(directory)
+                trace, config = self.prepare(root)
+                argv = ['--trace', str(trace), '--devices-config', str(config),
+                    '--output', str(root / 'out.json'), '--experiment', 'layout-concurrency',
+                    '--segments', '12K', '--worker-sweep', '1', '4', '--repeats', '1',
+                    '--placement', mode, '--stripe-bytes', '16K']
+                result = run(parser().parse_args(argv))
+                self.assertEqual(result['status'], 'complete')
+                self.assertEqual(len(result['trials']), 4)
+                self.assertIsNone(result['hash_strategy'])
+                for trial in result['trials']:
+                    active = [d['device_idx'] for d in trial['io']['devices'] if d['read_calls']]
+                    self.assertEqual(active, list(range(8)))
+                    self.assertEqual(trial['placement'], mode)
+                    self.assertEqual(trial['io']['read_calls'], sum(b['topk'] for b in trial['batches']))
+
     @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
     def test_exact_superpage_boundary_readback_and_write_latency(self):
         with tempfile.TemporaryDirectory(prefix='umm-superpage-') as directory:

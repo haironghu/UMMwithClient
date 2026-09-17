@@ -22,7 +22,8 @@ from bmpclient.sparse_kv import SparseKVStore, KVBlockRef
 from bmpclient.sparse_kv.store import FLAG_DISK
 from bmpclient.umm_client import ChunkDescriptor, UMM_TIER_SSD
 from bmpclient.virtual_media import VirtualMedia
-from bmpclient.bench.multi_device import OriginalLayerHash, hash_capacities, load_devices
+from bmpclient.bench.multi_device import (OriginalLayerHash, hash_capacities, load_devices,
+                                        LayerPlacement, layer_capacities)
 
 
 class DataMismatchError(RuntimeError):
@@ -218,7 +219,9 @@ def trial(client, trace, args, segment, shuffled, capacities):
     def store_for(req):
         if req not in stores:
             vm = VirtualMedia(client, unit_size=PAGE, capacity_per_device=(dict(enumerate(capacities[req])) if isinstance(capacities[req], list) else capacities[req]),
-                              strategy=OriginalLayerHash(client.pool.device_count, sorted(layers[req])),
+                              strategy=(LayerPlacement(client.pool.device_count, sorted(layers[req]), req, lengths, args.placement, args.stripe_bytes // PAGE)
+                                        if args.placement != 'hash' else
+                                        OriginalLayerHash(client.pool.device_count, sorted(layers[req]))),
                               sp_bytes=segment, sp_bytes_per_device={}, num_workers=args.workers,
                               read_merge=not args.no_merge, max_read_bytes=args.max_read_bytes)
             try:
@@ -375,6 +378,10 @@ def parser():
     p.add_argument('--dry-run', action='store_true', help='print capacity/window plan without opening the target or writing files')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mode', choices=['snapshot', 'online'], default='snapshot')
+    p.add_argument('--placement', choices=['hash', 'range', 'stripe'], default='hash')
+    p.add_argument('--stripe-bytes', type=size_arg, default=1 << 20,
+                   help='stripe placement only: logical slot bytes per stripe, independent of write segment; default 1 MiB')
+    p.add_argument('--layouts', nargs='+', choices=['ordered', 'shuffled'], default=['ordered', 'shuffled'])
     p.add_argument('--experiment', choices=['write-layout', 'layout-concurrency'], default='write-layout')
     p.add_argument('--worker-sweep', type=int, nargs='+', help='layout-concurrency only; default: 1 4 8 16')
     p.add_argument('--segments', type=size_arg, nargs='+', default=[1 << 20])
@@ -391,6 +398,10 @@ def parser():
 
 
 def run(args):
+    if args.placement != 'hash' and (args.mode != 'snapshot' or not args.devices_config):
+        raise ValueError('range/stripe placement requires snapshot and devices-config')
+    if args.stripe_bytes < PAGE or args.stripe_bytes % PAGE:
+        raise ValueError('stripe-bytes must be a positive multiple of 4096')
     if min(args.workers, args.max_topk, args.repeats) < 1 or not 0 <= args.seed < 1 << 64:
         raise ValueError('invalid workers, max-topk, repeats or seed')
     layout_experiment = args.experiment == 'layout-concurrency'
@@ -418,7 +429,11 @@ def run(args):
         if args.window_offset is not None or args.window_bytes is not None:
             raise ValueError('window options belong in devices-config')
         windows = load_devices(args.devices_config)
-        capacities, per_device_rows = hash_capacities(trace, max(segments), args.mode, 8, lengths)
+        if args.placement != 'hash':
+            capacities, per_device_rows = layer_capacities(max(segments), lengths, 8,
+                                                          args.placement, args.stripe_bytes // PAGE)
+        else:
+            capacities, per_device_rows = hash_capacities(trace, max(segments), args.mode, 8, lengths)
         required = [sum(caps[d] for caps in capacities.values()) for d in range(8)]
     else:
         required = [sum(capacities.values())]
@@ -490,6 +505,12 @@ def run(args):
     if layout_experiment:
         result['notes'].append('each trial prepares a fresh snapshot with the same large write segment; preparation is excluded from fetch time; workers is the total host thread count, not per-device queue depth')
     result['watch_device_offset'] = args.watch_device_offset
+    result['placement'] = args.placement
+    result['layouts'] = sorted(set(args.layouts))
+    result['stripe_bytes'] = args.stripe_bytes if args.placement == 'stripe' else None
+    if args.placement != 'hash':
+        result['hash_strategy'] = None
+        result['notes'].append('placement restarts at device 0 for each request/layer; range uses balanced contiguous token intervals from snapshot max context; stripe uses token // stripe_rows modulo device count; stripe size and write segment size are independent')
     if args.watch_device_offset is not None:
         result['notes'].append('diagnostic run: watch reads affect preparation I/O statistics and cache state; do not use for performance comparisons')
     if args.dry_run:
@@ -535,7 +556,8 @@ def run(args):
             client = PoolClient(pool, args.watch_device_offset)
             result['write_watch'] = client.watch_events
             result['library_sha256'] = hashlib.sha256(Path(pool.library_path).read_bytes()).hexdigest()
-            cases = [(s, shuffled, workers) for s in segments for workers in worker_values for shuffled in (False, True)]
+            cases = [(s, shuffled, workers) for s in segments for workers in worker_values for shuffled in (False, True)
+                     if ('shuffled' if shuffled else 'ordered') in args.layouts]
             for repeat in range(args.repeats):
                 for segment, shuffled, workers in (cases if repeat % 2 == 0 else list(reversed(cases))):
                     result['active_trial'] = dict(repeat=repeat, segment_bytes=segment,
@@ -547,6 +569,7 @@ def run(args):
                     trial_args.workers = workers
                     item = trial(client, trace, trial_args, segment, shuffled, capacities)
                     item['workers'] = workers
+                    item['placement'] = args.placement
                     item['repeat'] = repeat
                     result['trials'].append(item)
                     output.seek(0)
@@ -564,15 +587,17 @@ def run(args):
                             paired_speedups=[x / y for x, y in zip(a, b)])
             for seg in segments:
                 for workers in worker_values:
-                    result['comparisons'].append(compare('shuffled', seg, workers, 'ordered', seg, workers))
+                    if {'ordered', 'shuffled'}.issubset(args.layouts):
+                        result['comparisons'].append(compare('shuffled', seg, workers, 'ordered', seg, workers))
                     if layout_experiment:
                         if workers != worker_values[0]:
-                            for layout in ('ordered', 'shuffled'):
+                            for layout in sorted(set(args.layouts)):
                                 result['comparisons'].append(compare(layout, seg, worker_values[0], layout, seg, workers))
                     elif seg != PAGE:
-                        for layout in ('ordered', 'shuffled'):
+                        for layout in sorted(set(args.layouts)):
                             result['comparisons'].append(compare(layout, PAGE, workers, layout, seg, workers))
-                        result['comparisons'].append(compare('shuffled', PAGE, workers, 'ordered', seg, workers))
+                        if {'ordered', 'shuffled'}.issubset(args.layouts):
+                            result['comparisons'].append(compare('shuffled', PAGE, workers, 'ordered', seg, workers))
             result['status'] = 'complete'
             result.pop('active_trial', None)
         except BaseException as exc:
