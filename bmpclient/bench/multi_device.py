@@ -18,12 +18,13 @@ class OriginalLayerHash(PlacementStrategy):
 
 
 class LayerPlacement(PlacementStrategy):
-    """Per-layer balanced contiguous ranges or fixed-size round-robin stripes."""
+    """Snapshot placement by contiguous ranges, token stripes or whole layers."""
     def __init__(self, count, original_layers, request, lengths, placement, stripe_rows):
         super().__init__(count, {})
-        if placement not in ('range', 'stripe') or stripe_rows < 1:
+        if placement not in ('range', 'stripe', 'layer') or stripe_rows < 1:
             raise ValueError('invalid layer placement')
         self.lengths = [lengths[(request, layer)] for layer in original_layers]
+        self.original_layers = list(original_layers)
         self.placement = placement
         self.stripe_rows = stripe_rows
 
@@ -32,6 +33,8 @@ class LayerPlacement(PlacementStrategy):
         length = self.lengths[layer]
         if not 0 <= token < length:
             raise ValueError('token outside snapshot layer')
+        if self.placement == 'layer':
+            return self.original_layers[layer] % self.num_devices
         if self.placement == 'stripe':
             return (token // self.stripe_rows) % self.num_devices
         width, extra = divmod(length, self.num_devices)
@@ -42,7 +45,10 @@ class LayerPlacement(PlacementStrategy):
 def layer_capacities(segment, lengths, count, placement, stripe_rows):
     rows = {req: [0] * count for req, _ in lengths}
     for (req, layer), length in sorted(lengths.items()):
-        if placement == 'range':
+        if placement == 'layer':
+            counts = [0] * count
+            counts[layer % count] = length
+        elif placement == 'range':
             width, extra = divmod(length, count)
             counts = [width + (d < extra) for d in range(count)]
         elif placement == 'stripe':

@@ -19,6 +19,16 @@ from bmpclient.virtual_media import VirtualMedia
 
 
 class TestMultiDevice(unittest.TestCase):
+    def test_whole_layer_original_ids_and_capacity(self):
+        lengths = {('a', 19): 65, ('a', 27): 33, ('a', 31): 1}
+        strategy = LayerPlacement(8, [19, 27, 31], 'a', lengths, 'layer', 256)
+        self.assertEqual(strategy.locate_batch([(0, 0), (0, 31), (0, 32), (0, 64), (1, 32), (2, 0)]),
+                         [3, 3, 3, 3, 3, 7])
+        caps, rows = layer_capacities(12288, lengths, 8, 'layer', 256)
+        self.assertEqual(rows['a'], [0, 0, 0, 98, 0, 0, 0, 1])
+        self.assertEqual(caps['a'][3], 33 * 12288)
+        self.assertEqual(caps['a'][7], 12288)
+
     def test_layer_placement_boundaries_and_capacity(self):
         for mode in ('range', 'stripe'):
             for length in (1, 7, 8, 9, 31, 32, 33, 65):
@@ -41,21 +51,26 @@ class TestMultiDevice(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('UMM_TEST_DIRECT') == '1', 'opt-in temporary file integration')
     def test_layer_placement_native_replay(self):
-        for mode in ('range', 'stripe'):
+        for mode in ('range', 'stripe', 'layer'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='umm-placement-') as directory:
                 root = Path(directory)
                 trace, config = self.prepare(root)
                 argv = ['--trace', str(trace), '--devices-config', str(config),
                     '--output', str(root / 'out.json'), '--experiment', 'layout-concurrency',
                     '--segments', '12K', '--worker-sweep', '1', '4', '--repeats', '1',
-                    '--placement', mode, '--stripe-bytes', '16K']
+                    '--placement', mode, '--stripe-bytes', '16K', '--vllm-block-size', '32']
                 result = run(parser().parse_args(argv))
                 self.assertEqual(result['status'], 'complete')
                 self.assertEqual(len(result['trials']), 4)
                 self.assertIsNone(result['hash_strategy'])
+                self.assertEqual(result['vllm_block_size'], 32)
                 for trial in result['trials']:
                     active = [d['device_idx'] for d in trial['io']['devices'] if d['read_calls']]
-                    self.assertEqual(active, list(range(8)))
+                    self.assertEqual(active, [2, 3, 7] if mode == 'layer' else list(range(8)))
+                    if mode == 'layer':
+                        for batch in trial['batches']:
+                            active_batch = [d['device_idx'] for d in batch['io']['devices'] if d['read_calls']]
+                            self.assertEqual(active_batch, [batch['layer_id'] % 8])
                     self.assertEqual(trial['placement'], mode)
                     self.assertEqual(trial['io']['read_calls'], sum(b['topk'] for b in trial['batches']))
 

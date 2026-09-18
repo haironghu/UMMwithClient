@@ -378,7 +378,8 @@ def parser():
     p.add_argument('--dry-run', action='store_true', help='print capacity/window plan without opening the target or writing files')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mode', choices=['snapshot', 'online'], default='snapshot')
-    p.add_argument('--placement', choices=['hash', 'range', 'stripe'], default='hash')
+    p.add_argument('--placement', choices=['hash', 'range', 'stripe', 'layer'], default='hash')
+    p.add_argument('--vllm-block-size', type=int, help='tokens per vLLM block, recorded as metadata; does not change slot or write segment geometry')
     p.add_argument('--stripe-bytes', type=size_arg, default=1 << 20,
                    help='stripe placement only: logical slot bytes per stripe, independent of write segment; default 1 MiB')
     p.add_argument('--layouts', nargs='+', choices=['ordered', 'shuffled'], default=['ordered', 'shuffled'])
@@ -398,8 +399,10 @@ def parser():
 
 
 def run(args):
+    if args.vllm_block_size is not None and args.vllm_block_size < 1:
+        raise ValueError('vllm-block-size must be positive')
     if args.placement != 'hash' and (args.mode != 'snapshot' or not args.devices_config):
-        raise ValueError('range/stripe placement requires snapshot and devices-config')
+        raise ValueError('range/stripe/layer placement requires snapshot and devices-config')
     if args.stripe_bytes < PAGE or args.stripe_bytes % PAGE:
         raise ValueError('stripe-bytes must be a positive multiple of 4096')
     if min(args.workers, args.max_topk, args.repeats) < 1 or not 0 <= args.seed < 1 << 64:
@@ -506,11 +509,12 @@ def run(args):
         result['notes'].append('each trial prepares a fresh snapshot with the same large write segment; preparation is excluded from fetch time; workers is the total host thread count, not per-device queue depth')
     result['watch_device_offset'] = args.watch_device_offset
     result['placement'] = args.placement
+    result['vllm_block_size'] = args.vllm_block_size
     result['layouts'] = sorted(set(args.layouts))
     result['stripe_bytes'] = args.stripe_bytes if args.placement == 'stripe' else None
     if args.placement != 'hash':
         result['hash_strategy'] = None
-        result['notes'].append('placement restarts at device 0 for each request/layer; range uses balanced contiguous token intervals from snapshot max context; stripe uses token // stripe_rows modulo device count; stripe size and write segment size are independent')
+        result['notes'].append('range balances contiguous token intervals per snapshot layer; stripe uses token // stripe_rows modulo device count, restarting each layer; layer uses original layer_id modulo device count; placement and write segment size are independent')
     if args.watch_device_offset is not None:
         result['notes'].append('diagnostic run: watch reads affect preparation I/O statistics and cache state; do not use for performance comparisons')
     if args.dry_run:
