@@ -264,7 +264,7 @@ def trial(client, trace, args, segment, shuffled, capacities):
     def store_for(req):
         if req not in stores:
             vm = VirtualMedia(client, unit_size=PAGE, capacity_per_device=(dict(enumerate(capacities[req])) if isinstance(capacities[req], list) else capacities[req]),
-                              strategy=(LayerPlacement(client.pool.device_count, sorted(layers[req]), req, lengths, args.placement, args.stripe_bytes // PAGE)
+                              strategy=(LayerPlacement(client.pool.device_count, sorted(layers[req]), req, lengths)
                                         if args.placement != 'hash' else
                                         OriginalLayerHash(client.pool.device_count, sorted(layers[req]))),
                               sp_bytes=segment, sp_bytes_per_device={}, num_workers=args.workers,
@@ -419,10 +419,8 @@ def parser():
     p.add_argument('--dry-run', action='store_true', help='print capacity/window plan without opening the target or writing files')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mode', choices=['snapshot', 'online'], default='snapshot')
-    p.add_argument('--placement', choices=['hash', 'range', 'stripe', 'layer'], default='hash')
+    p.add_argument('--placement', choices=['hash', 'layer'], default='hash')
     p.add_argument('--vllm-block-size', type=int, help='tokens per vLLM block, recorded as metadata; does not change slot or write segment geometry')
-    p.add_argument('--stripe-bytes', type=size_arg, default=1 << 20,
-                   help='stripe placement only: logical slot bytes per stripe, independent of write segment; default 1 MiB')
     p.add_argument('--layouts', nargs='+', choices=['ordered', 'shuffled'], default=['ordered', 'shuffled'])
     p.add_argument('--experiment', choices=['write-layout', 'layout-concurrency'], default='write-layout')
     p.add_argument('--worker-sweep', type=int, nargs='+', help='layout-concurrency only; default: 1 4 8 16')
@@ -444,10 +442,8 @@ def parser():
 def run(args):
     if args.vllm_block_size is not None and args.vllm_block_size < 1:
         raise ValueError('vllm-block-size must be positive')
-    if args.placement != 'hash' and (args.mode != 'snapshot' or not args.devices_config):
-        raise ValueError('range/stripe/layer placement requires snapshot and devices-config')
-    if args.stripe_bytes < PAGE or args.stripe_bytes % PAGE:
-        raise ValueError('stripe-bytes must be a positive multiple of 4096')
+    if args.placement == 'layer' and (args.mode != 'snapshot' or not args.devices_config):
+        raise ValueError('layer placement requires snapshot and devices-config')
     if min(args.workers, args.max_topk, args.repeats) < 1 or not 0 <= args.seed < 1 << 64:
         raise ValueError('invalid workers, max-topk, repeats or seed')
     layout_experiment = args.experiment == 'layout-concurrency'
@@ -478,9 +474,8 @@ def run(args):
         if args.window_offset is not None or args.window_bytes is not None:
             raise ValueError('window options belong in devices-config')
         windows = load_devices(args.devices_config)
-        if args.placement != 'hash':
-            capacities, per_device_rows = layer_capacities(max(segments), lengths, 8,
-                                                          args.placement, args.stripe_bytes // PAGE)
+        if args.placement == 'layer':
+            capacities, per_device_rows = layer_capacities(max(segments), lengths, 8)
         else:
             capacities, per_device_rows = hash_capacities(trace, max(segments), args.mode, 8, lengths)
         required = [sum(caps[d] for caps in capacities.values()) for d in range(8)]
@@ -565,10 +560,9 @@ def run(args):
     result['placement'] = args.placement
     result['vllm_block_size'] = args.vllm_block_size
     result['layouts'] = sorted(set(args.layouts))
-    result['stripe_bytes'] = args.stripe_bytes if args.placement == 'stripe' else None
-    if args.placement != 'hash':
+    if args.placement == 'layer':
         result['hash_strategy'] = None
-        result['notes'].append('range balances contiguous token intervals per snapshot layer; stripe uses token // stripe_rows modulo device count, restarting each layer; layer uses original layer_id modulo device count; placement and write segment size are independent')
+        result['notes'].append('layer places every KV row of an original model layer on original layer_id modulo device count; placement and write segment size are independent')
     if args.watch_device_offset is not None:
         result['notes'].append('diagnostic run: watch reads affect preparation I/O statistics and cache state; do not use for performance comparisons')
     if args.dry_run:
