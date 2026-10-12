@@ -46,7 +46,7 @@ class Trace:
     digest: str
 
 
-def load_trace(path, max_topk):
+def load_trace(path, max_topk, allow_empty=False):
     records, lengths = [], {}
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -64,8 +64,9 @@ def load_trace(path, max_topk):
                 integer(r["layer_id"], "layer_id")
                 ctx = integer(r["context_length"], "context_length", 1)
                 indices = r["topk_token_indices"]
-                if not isinstance(indices, list) or not 1 <= len(indices) <= max_topk:
-                    raise ValueError(f"topk must have 1..{max_topk} entries")
+                minimum = 0 if allow_empty else 1
+                if not isinstance(indices, list) or not minimum <= len(indices) <= max_topk:
+                    raise ValueError(f"topk must have {minimum}..{max_topk} entries")
                 for token in indices:
                     if integer(token, "token index") >= ctx:
                         raise ValueError("token index must be < context_length")

@@ -199,6 +199,51 @@ def delta(after, before):
     return result
 
 
+def validate_miss_trace(trace):
+    settings = set()
+    for r in trace.records:
+        if type(r.get('warmup')) is not bool:
+            raise ValueError('miss trace requires a boolean warmup field')
+        for key in ('selected', 'cache_hits', 'fresh_hits', 'misses', 'replacements', 'cache_capacity'):
+            if type(r.get(key)) is not int or r[key] < 0:
+                raise ValueError(f'invalid miss trace field: {key}')
+        if (r['misses'] != len(r['topk_token_indices']) or
+            len(set(r['topk_token_indices'])) != r['misses'] or
+            r['selected'] != r['cache_hits'] + r['fresh_hits'] + r['misses'] or
+            r['selected'] > 2048 or r['cache_capacity'] < 2048):
+            raise ValueError('inconsistent miss trace counts')
+        if r.get('cache_strategy') not in ('baseline', 'same_state_replacement', 'independent_replacement'):
+            raise ValueError('unknown cache strategy')
+        settings.add((r['cache_capacity'], r['cache_strategy']))
+    if len(settings) != 1 or not any(not r['warmup'] for r in trace.records):
+        raise ValueError('one cache scenario and at least one measured batch required')
+    capacity, strategy = settings.pop()
+    return dict(capacity_rows_per_layer=capacity, strategy=strategy)
+
+
+def summarize_read_batches(records):
+    measured = [r for r in records if not r.get('warmup', False)]
+    active = [r for r in measured if r['unique_topk']]
+    seconds = sum(r['fetch_us'] for r in measured) / 1e6
+    read_bytes = sum(r['io']['read_bytes'] for r in measured)
+    useful = sum(r['unique_topk'] * KV_BYTES for r in measured)
+    steps = {}
+    for r in measured:
+        key = (r['request_id'], r['step_id'])
+        steps[key] = steps.get(key, 0.0) + r['fetch_us']
+    return dict(measured_batches=len(measured), zero_miss_batches=len(measured) - len(active),
+                measured_miss_rows=sum(r['unique_topk'] for r in measured),
+                measured_read_bytes=read_bytes, measured_useful_kv_bytes=useful,
+                read_amplification_vs_unique_kv=read_bytes / useful if useful else None,
+                active_fetch_seconds=seconds,
+                fetch_us=percentiles([r['fetch_us'] for r in measured]) if measured else {},
+                nonempty_fetch_us=percentiles([r['fetch_us'] for r in active]) if active else {},
+                decode_step_read_us=percentiles(list(steps.values())) if steps else {},
+                plan_us=percentiles([r['plan_us'] for r in measured]) if measured else {},
+                effective_unique_kv_MiB_s=useful / (1 << 20) / seconds if seconds else None,
+                submitted_read_MiB_s=read_bytes / (1 << 20) / seconds if seconds else None)
+
+
 def trial(client, trace, args, segment, shuffled, capacities):
     client.write_call_us = []
     lengths, _ = geometry(trace, segment, args.mode)
@@ -299,9 +344,9 @@ def trial(client, trace, args, segment, shuffled, capacities):
             outs = [memoryview(bytearray(PAGE)) for _ in indices]
             before = native_stats(client.pool)
             begin = time.perf_counter_ns()
-            plan = store.plan(dense_layer, indices)
-            plan_ns = time.perf_counter_ns() - begin
-            entries = plan.entries()
+            plan = store.plan(dense_layer, indices) if indices else None
+            plan_ns = time.perf_counter_ns() - begin if indices else 0
+            entries = plan.entries() if plan is not None else []
             if any(entry[1] != FLAG_DISK for entry in entries):
                 raise RuntimeError('expected disk-only descriptors after flush')
             for token, entry in zip(indices, entries):
@@ -310,8 +355,9 @@ def trial(client, trace, args, segment, shuffled, capacities):
                 if entry[0] != device or entry[2] != store.media.extent_base(device) + off:
                     raise RuntimeError('plan address mismatch')
             begin = time.perf_counter_ns()
-            store.fetch(dense_layer, indices, outs)
-            fetch_ns = time.perf_counter_ns() - begin
+            if indices:
+                store.fetch(dense_layer, indices, outs)
+            fetch_ns = time.perf_counter_ns() - begin if indices else 0
             stats = delta(native_stats(client.pool), before)
             if stats['read_bytes'] < len(set(indices)) * PAGE or stats['write_bytes']:
                 raise RuntimeError('unexpected disk-only fetch statistics')
@@ -324,6 +370,7 @@ def trial(client, trace, args, segment, shuffled, capacities):
                             client, store, dense_layer, r, i, token, data, expected,
                             segment, shuffled, args.workers))
             records.append(dict(record_index=i, request_id=req, layer_id=layer, step_id=r['step_id'],
+                                warmup=r.get('warmup', False) if args.miss_trace else False,
                                 topk=len(indices), unique_topk=len(set(indices)), plan_us=plan_ns / 1e3,
                                 fetch_us=fetch_ns / 1e3, verify_us=(time.perf_counter_ns() - begin) / 1e3, io=stats))
             if time.monotonic() - replay_progress >= 5:
@@ -346,20 +393,14 @@ def trial(client, trace, args, segment, shuffled, capacities):
         io = delta(native_stats(client.pool), start_stats)
         if client.live:
             raise RuntimeError('native extents leaked')
-        seconds = sum(r['fetch_us'] for r in records) / 1e6
-        read_bytes = sum(r['io']['read_bytes'] for r in records)
-        useful = sum(r['unique_topk'] * KV_BYTES for r in records)
         return dict(segment_bytes=segment, layout='shuffled' if shuffled else 'ordered',
                     mapping_sha256=mapping.hexdigest(), batches=records, io=io,
                     written_rows=written_rows, write_amplification_vs_slots=io['write_bytes'] / (written_rows * PAGE),
-                    read_amplification_vs_unique_kv=read_bytes / useful,
                     write_call_us=percentiles(client.write_call_us) if client.write_call_us else {},
                     write_call_count=len(client.write_call_us), write_call_total_ms=sum(client.write_call_us) / 1e3,
                     append_ms=append_ns / 1e6, flush_sync_ms=sync_ns / 1e6, release_ms=release_ns / 1e6,
                     wall_ms=(time.perf_counter_ns() - initial) / 1e6,
-                    active_fetch_seconds=seconds, fetch_us=percentiles([r['fetch_us'] for r in records]),
-                    plan_us=percentiles([r['plan_us'] for r in records]),
-                    effective_unique_kv_MiB_s=useful / (1 << 20) / seconds)
+                    **summarize_read_batches(records))
     finally:
         for store in stores.values():
             store.close()
@@ -388,6 +429,8 @@ def parser():
     p.add_argument('--segments', type=size_arg, nargs='+', default=[1 << 20])
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--max-topk', type=int, default=2048)
+    p.add_argument('--miss-trace', action='store_true',
+                   help='read only exported cache misses; preserve empty batches; exclude marked warmup from read metrics')
     p.add_argument('--max-read-bytes', type=size_arg, default=1 << 20)
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--seed', type=int, default=2026)
@@ -425,7 +468,10 @@ def run(args):
         raise ValueError('VirtualMedia segments must be multiples of 4096')
     if args.max_read_bytes < PAGE or args.max_read_bytes % PAGE:
         raise ValueError('max-read-bytes must be a multiple of 4096')
-    trace = load_trace(args.trace, args.max_topk)
+    trace = load_trace(args.trace, args.max_topk, allow_empty=args.miss_trace)
+    miss_scenario = validate_miss_trace(trace) if args.miss_trace else None
+    if args.miss_trace and args.mode != 'snapshot':
+        raise ValueError('miss-trace benchmark currently requires snapshot mode')
     lengths, capacities = geometry(trace, max(segments), args.mode)
     per_device_rows = None
     if args.devices_config:
@@ -508,6 +554,14 @@ def run(args):
     if layout_experiment:
         result['notes'].append('each trial prepares a fresh snapshot with the same large write segment; preparation is excluded from fetch time; workers is the total host thread count, not per-device queue depth')
     result['watch_device_offset'] = args.watch_device_offset
+    result['miss_scenario'] = miss_scenario
+    if args.miss_trace:
+        result['notes'].extend([
+            'HBM residency is simulated offline; this benchmark transfers SSD to host DRAM, not GPU HBM',
+            'warmup batches execute actual misses but are excluded from read latency/bandwidth metrics; io totals still include them',
+            'zero-miss batches issue no read and have zero fetch_us; decode_step_read_us sums sequential layer fetch times',
+            'same_state_replacement excludes I/O needed to maintain the counterfactual baseline cache',
+            'all cases prepare full identical context snapshots, not only miss rows; synthetic data, not captured KV values'])
     result['placement'] = args.placement
     result['vllm_block_size'] = args.vllm_block_size
     result['layouts'] = sorted(set(args.layouts))
@@ -587,8 +641,8 @@ def run(args):
                      (t['layout'], t['segment_bytes'], t['workers']) == (layout, seg, workers)]
                 return dict(baseline=[base_layout, base_seg], candidate=[layout, seg],
                             baseline_workers=base_workers, candidate_workers=workers,
-                            median_fetch_speedup=statistics.median(a) / statistics.median(b),
-                            paired_speedups=[x / y for x, y in zip(a, b)])
+                            median_fetch_speedup=statistics.median(a) / statistics.median(b) if statistics.median(b) else None,
+                            paired_speedups=[x / y if y else None for x, y in zip(a, b)])
             for seg in segments:
                 for workers in worker_values:
                     if {'ordered', 'shuffled'}.issubset(args.layouts):
