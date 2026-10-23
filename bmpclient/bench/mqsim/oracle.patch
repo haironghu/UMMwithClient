@@ -1,0 +1,183 @@
+diff --git a/src/host/IO_Flow_Trace_Based.cpp b/src/host/IO_Flow_Trace_Based.cpp
+index 741fbc8..6ea9981 100644
+--- a/src/host/IO_Flow_Trace_Based.cpp
++++ b/src/host/IO_Flow_Trace_Based.cpp
+@@ -1,4 +1,8 @@
+ #include "IO_Flow_Trace_Based.h"
++#include <cstdlib>
++#include <stdexcept>
++#include "../exec/SSD_Device.h"
++#include "../ssd/FTL.h"
+ #include "../utils/StringTools.h"
+ #include "ASCII_Trace_Definition.h"
+ #include "../utils/DistributionTypes.h"
+@@ -66,6 +70,7 @@ void IO_Flow_Trace_Based::NVMe_consume_io_request(Completion_Queue_Entry *io_req
+ {
+ 	IO_Flow_Base::NVMe_consume_io_request(io_request);
+ 	IO_Flow_Base::NVMe_update_and_submit_completion_queue_tail();
++    if (dsa_mode) dsa_completed();
+ }
+ 
+ void IO_Flow_Trace_Based::SATA_consume_io_request(Host_IO_Request *io_request)
+@@ -76,6 +81,17 @@ void IO_Flow_Trace_Based::SATA_consume_io_request(Host_IO_Request *io_request)
+ void IO_Flow_Trace_Based::Start_simulation()
+ {
+ 	IO_Flow_Base::Start_simulation();
++    if (std::getenv("DSA_ORACLE_QD")) {
++        dsa_mode = true;
++        dsa_window = std::stoul(std::getenv("DSA_ORACLE_QD"));
++        if (dsa_window == 0 || total_replay_no != 1 || percentage_to_be_simulated != 100 ||
++            SSD_device_type != HostInterface_Types::NVME ||
++            !std::getenv("DSA_ORACLE_BATCHES") || !std::getenv("DSA_ORACLE_MAPPING"))
++            throw std::runtime_error("DSA replay requires NVMe, positive QD, 100%, one replay and output paths");
++        dsa_batches.open(std::getenv("DSA_ORACLE_BATCHES"));
++        if (!dsa_batches) throw std::runtime_error("Cannot open DSA batch log");
++        dsa_batches << "batch,begin_ns,end_ns,elapsed_ns,requests\n";
++    }
+ 	std::string trace_line;
+ 	char *pEnd;
+ 
+@@ -131,6 +147,7 @@ void IO_Flow_Trace_Based::Validate_simulation_config()
+ 
+ void IO_Flow_Trace_Based::Execute_simulator_event(MQSimEngine::Sim_Event *)
+ {
++    if (dsa_mode) { dsa_pump(); return; }
+ 	Host_IO_Request *request = Generate_next_request();
+ 	if (request != NULL)
+ 	{
+@@ -334,4 +351,83 @@ void IO_Flow_Trace_Based::Get_statistics(Utils::Workload_Statistics &stats, LPA_
+ 	stats.Initial_occupancy_ratio = initial_occupancy_ratio;
+ 	stats.Replay_no = total_replay_no;
+ }
++
++void IO_Flow_Trace_Based::dsa_dump_mapping()
++{
++    auto* device = dynamic_cast<SSD_Device*>(Simulator->GetObject("SSDDevice"));
++    if (!device) throw std::runtime_error("SSD device missing");
++    auto* ftl = dynamic_cast<SSD_Components::FTL*>(device->Firmware);
++    auto* amu = ftl->Address_Mapping_Unit;
++    if (!amu->Is_ideal_mapping_table()) throw std::runtime_error("DSA requires ideal mapping table");
++    const uint64_t sectors = device->Get_no_of_LHAs_in_an_NVM_write_unit();
++    const uint64_t pages = (dsa_max_sector + sectors - 1) / sectors;
++    if (pages > amu->Get_logical_pages_count(0)) throw std::runtime_error("Snapshot exceeds logical capacity");
++    std::ofstream out(std::getenv("DSA_ORACLE_MAPPING"));
++    if (!out) throw std::runtime_error("Cannot open PPA output");
++    out << "lpa,ppa,channel,chip,die,plane,block,page\n";
++    for (LPA_type lpa=0; lpa<pages; ++lpa) {
++        PPA_type ppa; page_status_type state;
++        amu->Get_data_mapping_info_for_gc(0, lpa, ppa, state);
++        if (state == 0 || ppa == NO_PPA) throw std::runtime_error("Unwritten snapshot page in PPA query");
++        auto a = amu->Convert_ppa_to_address(ppa);
++        out << lpa << ',' << ppa << ',' << a.ChannelID << ',' << a.ChipID << ',' << a.DieID << ',' << a.PlaneID << ',' << a.BlockID << ',' << a.PageID << '\n';
++    }
++    out.flush();
++    if (!out) throw std::runtime_error("PPA output failed");
++}
++
++void IO_Flow_Trace_Based::dsa_finish_batch()
++{
++    dsa_batches << dsa_batch << ',' << dsa_begin << ',' << Simulator->Time() << ','
++                << Simulator->Time()-dsa_begin << ',' << dsa_count << '\n';
++    dsa_batches.flush();
++    if (dsa_batch == 0) dsa_dump_mapping();
++    dsa_count = 0;
++    if (!dsa_eof) {
++        uint64_t next = std::stoull(current_trace_line[ASCIITraceDeviceColumn]);
++        if (next <= dsa_batch) throw std::runtime_error("DSA batch IDs must increase");
++        dsa_batch = next;
++        Simulator->Register_sim_event(Simulator->Time()+1, this);
++    }
++}
++
++void IO_Flow_Trace_Based::dsa_completed()
++{
++    if (dsa_inflight == 0) throw std::runtime_error("Unexpected completion");
++    --dsa_inflight;
++    // Defer until completion callback unwinds; never submit recursively in PHY signals.
++    if (dsa_inflight == 0 && (dsa_eof || std::stoull(current_trace_line[1]) != dsa_batch))
++        dsa_finish_batch();
++    else
++        Simulator->Register_sim_event(Simulator->Time()+1, this);
++}
++
++void IO_Flow_Trace_Based::dsa_pump()
++{
++    if (dsa_count == 0) dsa_begin = Simulator->Time();
++    while (!dsa_eof && dsa_inflight < dsa_window && std::stoull(current_trace_line[1]) == dsa_batch) {
++        bool write = current_trace_line[4] == "0";
++        if ((dsa_batch == 0) != write) throw std::runtime_error("Batch 0 writes only; later batches reads only");
++        auto* request = Generate_next_request();
++        if (!request) throw std::runtime_error("Truncated DSA trace");
++        const uint64_t end = request->Start_LBA + request->LBA_count;
++        // Reject MQSim's default address wrapping; no silent change to our layout.
++        if (request->Start_LBA != std::stoull(current_trace_line[2]) || end-1 > end_lsa_on_device)
++            throw std::runtime_error("DSA address wrapped or exceeds capacity");
++        if (write) dsa_max_sector = std::max(dsa_max_sector, end);
++        ++dsa_inflight; ++dsa_count;
++        Submit_io_request(request);
++        std::string line;
++        if (std::getline(trace_file, line)) {
++            current_trace_line.clear();
++            Utils::Helper_Functions::Remove_cr(line);
++            Utils::Helper_Functions::Tokenize(line, ASCIILineDelimiter, current_trace_line);
++            if (current_trace_line.size() != 5) throw std::runtime_error("Malformed DSA trace");
++        } else {
++            dsa_eof = true;
++            if (STAT_generated_request_count != total_requests_to_be_generated) throw std::runtime_error("DSA trace count mismatch");
++        }
++    }
++}
++
+ } // namespace Host_Components
+\ No newline at end of file
+diff --git a/src/host/IO_Flow_Trace_Based.h b/src/host/IO_Flow_Trace_Based.h
+index edf98ce..b23ccbc 100644
+--- a/src/host/IO_Flow_Trace_Based.h
++++ b/src/host/IO_Flow_Trace_Based.h
+@@ -28,6 +28,16 @@ public:
+ 						page_status_type (*Find_NVM_subunit_access_bitmap)(LHA_type lha));
+ 
+ private:
++    // Opt-in DSA replay: column 1 is a batch ID, batch 0 is snapshot writes.
++    bool dsa_mode = false, dsa_eof = false;
++    unsigned int dsa_window = 0, dsa_inflight = 0, dsa_count = 0;
++    uint64_t dsa_batch = 0, dsa_max_sector = 0;
++    sim_time_type dsa_begin = 0;
++    std::ofstream dsa_batches;
++    void dsa_pump();
++    void dsa_completed();
++    void dsa_finish_batch();
++    void dsa_dump_mapping();
+ 	Trace_Time_Unit time_unit;
+ 	unsigned int percentage_to_be_simulated;
+ 	std::string trace_file_path;
+diff --git a/src/ssd/NVM_PHY_ONFI.cpp b/src/ssd/NVM_PHY_ONFI.cpp
+index a225dbe..2d08bb9 100644
+--- a/src/ssd/NVM_PHY_ONFI.cpp
++++ b/src/ssd/NVM_PHY_ONFI.cpp
+@@ -1,4 +1,7 @@
+ #include "NVM_PHY_ONFI.h"
++#include <cstdlib>
++#include <fstream>
++#include <stdexcept>
+ 
+ namespace SSD_Components {
+ 	void NVM_PHY_ONFI::ConnectToTransactionServicedSignal(TransactionServicedHandlerType function)
+@@ -15,6 +18,17 @@ namespace SSD_Components {
+ 	*/
+ 	void NVM_PHY_ONFI::broadcastTransactionServicedSignal(NVM_Transaction_Flash* transaction)
+ 	{
++        if (std::getenv("DSA_ORACLE_NAND")) {
++            static std::ofstream log(std::getenv("DSA_ORACLE_NAND"));
++            static bool header = false;
++            if (!log) throw std::runtime_error("Cannot open NAND transaction log");
++            if (!header) { log << "end_ns,issue_ns,type,source,lpa,ppa,channel,chip,die,plane,block,page,bytes,execution_ns,transfer_ns\n"; header=true; }
++            auto& a = transaction->Address;
++            log << Simulator->Time() << ',' << transaction->Issue_time << ',' << int(transaction->Type) << ',' << int(transaction->Source)
++                << ',' << transaction->LPA << ',' << transaction->PPA << ',' << a.ChannelID << ',' << a.ChipID << ',' << a.DieID
++                << ',' << a.PlaneID << ',' << a.BlockID << ',' << a.PageID << ',' << transaction->Data_and_metadata_size_in_byte
++                << ',' << transaction->STAT_execution_time << ',' << transaction->STAT_transfer_time << '\n';
++        }
+ 		for (std::vector<TransactionServicedHandlerType>::iterator it = connectedTransactionServicedHandlers.begin();
+ 			it != connectedTransactionServicedHandlers.end(); it++) {
+ 			(*it)(transaction);

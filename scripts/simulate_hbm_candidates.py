@@ -66,7 +66,7 @@ def flatten(value):
     return [value]
 
 
-def load_record(path, seq_len):
+def load_record(path, seq_len, *, include_scores=False):
     if path.suffix == ".pt":
         try:
             import torch
@@ -93,7 +93,8 @@ def load_record(path, seq_len):
         raise ValueError(f"{path}: invalid top-2400 candidates/scores")
     # Deterministic score tie-break; native fused top-k may use a different one.
     ranked = [t for t, s in sorted(zip(ids, scores), key=lambda pair: (-pair[1], pair[0]))]
-    return str(raw["layer"]), native, ranked
+    result = (str(raw["layer"]), native, ranked)
+    return (*result, dict(zip(ids, scores))) if include_scores else result
 
 
 def discover(directory):

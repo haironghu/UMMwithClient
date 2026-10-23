@@ -1,3 +1,6 @@
 AGENTS.md
 *.pyc
 __pycache__/
+
+# Downloaded simulator sources and build products
+.deps/

@@ -1,0 +1,2 @@
+# Unified patches preserve upstream context indentation and blank context lines.
+bmpclient/bench/mqsim/*.patch -whitespace
