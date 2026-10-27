@@ -8,6 +8,21 @@ from pathlib import Path
 import hashlib
 import json
 import os
+
+# Explicit per-process workaround for a TLS-intercepting network. This is our
+# launcher option, not a ModelScope SDK environment variable. Default: verify.
+if os.environ.get('GLM_DOWNLOAD_INSECURE_SSL', '0') == '1':
+    import requests
+    original_request = requests.sessions.Session.request
+
+    def insecure_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return original_request(self, method, url, **kwargs)
+
+    requests.sessions.Session.request = insecure_request
+    print('[WARNING] TLS certificate verification is DISABLED for this download '
+          'process; server identity and protection against interception are lost.', flush=True)
+
 from modelscope import snapshot_download
 
 repo=os.environ['MODEL_ID']
@@ -33,6 +48,7 @@ shards={name for d in indices for name in d['weight_map'].values()}
 missing=[name for name in shards if not (actual/name).is_file() or (actual/name).stat().st_size==0]
 if missing:raise RuntimeError(f'Missing/empty weight shards: {missing[:10]}')
 record=dict(model_id=repo,requested_revision=revision or 'SDK default (mutable)',local_path=str(actual),
+            tls_certificate_verification=os.environ.get('GLM_DOWNLOAD_INSECURE_SSL', '0') != '1',
             config_sha256=hashlib.sha256((actual/'config.json').read_bytes()).hexdigest(),
             weight_shards=len(shards),weight_shard_bytes=sum((actual/name).stat().st_size for name in shards),
             note='File existence/size checks only; SDK handles downloads. Record a fixed upstream revision for exact reproduction.')
