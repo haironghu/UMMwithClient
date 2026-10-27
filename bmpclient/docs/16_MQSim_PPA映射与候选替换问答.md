@@ -96,7 +96,7 @@ LPA → PPA → channel / chip / die / plane / block / page
 
 ## 问题二：候选替换策略是怎么做的？
 
-**回答：从原生 Top-2048 出发，用 Top-2400 中的额外候选替换部分 KV，让读取请求在盘内资源上更均衡。最终选中总数不变。**
+**回答：各组使用相同的 baseline LRU 缓存状态，从原生 Top-2048 的 Miss 项中做替换，只允许加入 Top-2400 额外候选中同样 Miss 的项，让实际 SSD 读取更均衡。最终选中总数和每步 Miss 数均不变。**
 
 ### 1. 查询每个候选的模拟 PPA
 
@@ -104,7 +104,7 @@ LPA → PPA → channel / chip / die / plane / block / page
 
 ### 2. 统计原生选择的资源负载
 
-统计选中项在每个 channel、chip、die、plane 上对应的读取请求数。资源按完整路径区分，例如：
+先按每层 baseline LRU 筛选实际需要读盘的 Miss，再统计它们在每个 channel、chip、die、plane 上对应的读取请求数。资源按完整路径区分，例如：
 
 ```text
 channel 键 = (channel)
@@ -115,16 +115,18 @@ plane 键   = (channel, chip, die, plane)
 
 不同 die 下相同编号的 plane 不会混在一起统计。
 
-首轮实验不模拟历史 HBM 缓存，所有历史选中项都需要读盘。当前 token 的 KV 直接可用，不计入盘侧负载。
+默认使用每层 4096/8192 行的冷启动 BatchLRU，前 100 步更新和读取但排除出测量。每一步各组使用相同的 baseline 缓存，原生命中项及当前 token 的 KV 直接可用，不计入盘侧负载。
+
+缓存始终由原生 Top-2048 更新，替换后的选择不影响下一步缓存。原型早期的无 HBM 对照仍可通过 `--capacities 0` 显式运行，不是当前正式实验口径。
 
 ### 3. 尝试一对一替换
 
-每次从原生集合移除一个允许替换的项，再加入一个原生集合之外的参考候选。例如，暂只看 plane 负载：
+每次从原生集合移除一个允许替换的 Miss，再加入一个原生集合之外、有参考分数且同样不在 buffer 中的候选。例如，暂只看 plane 负载：
 
 ```text
-原生选择：A、B、C、D
+原生选择中的 Miss：A、B、C、D
 所在位置：plane 0、0、0、1
-额外候选：E 位于 plane 2
+额外候选：E 位于 plane 2，且也不在 baseline buffer 中
 
 尝试 C → E
 请求分布：3、1、0 → 2、1、1
@@ -165,10 +167,11 @@ plane 键   = (channel, chip, die, plane)
 
 ### 6. 保护规则和参考分数
 
+- 原生集合中命中 baseline buffer 的所有项始终保护。
 - 当前 token 始终保护，保持它是否被原生选中的状态。
 - 缺失参考分数的原生项始终保护。
 - `--protect-top N` 额外保护参考排名前 N 的原生项。
-- 新加入的项必须是有参考分数的额外候选。
+- 新加入的项必须是有参考分数的额外候选，且在当步 baseline buffer 中同样 Miss；已驻留的额外候选也不能加入。
 - 当前未设置严格的总分数损失上限；通过替换预算和保护项控制偏移，并单独记录参考分数损失。
 
 参考分数损失是被移除项与加入项的参考分数之差的累加，不能代替模型质量评估。
@@ -185,7 +188,9 @@ plane 键   = (channel, chip, die, plane)
 | ppa_aware | 按上述静态指标进行贪心替换 |
 | random_matched | 每层、每步随机替换与 ppa_aware 实际相同数量的项，遵守相同保护规则 |
 
-随机组匹配实际替换数量，不匹配参考分数损失。各组从同一 snapshot 写入序列开始，并检查映射、主机读取量和 NAND 读事务数量一致。
+随机组匹配实际替换数量，不匹配参考分数损失，同样只允许 Miss 换 Miss。各组从同一 snapshot 写入序列开始，并逐步核对 baseline 缓存状态（含 LRU 顺序）、原生命中项和原生 Miss 集合的哈希；映射、每步主机读取量和 NAND 读事务数量保持一致。零 Miss 层不发读请求，但保留在逐层结果中，时延为 0。
+
+因此同一容量下，各组 `cache_hit_rate` 和 `available_hit_rate` 相同，比较的是相同读量的物理位置变化。共享 baseline 是反事实对照，维持未被替换策略选中的原生项的额外缓存填充成本不计入结果。
 
 当前同页的多个 4 KiB 请求保留为独立读请求，不做主机合并、不启用数据缓存；指标按请求计数，而不是按不同物理页计数。不同物理页数单独记录。
 
@@ -193,5 +198,5 @@ plane 键   = (channel, chip, die, plane)
 
 ### 对应代码
 
-- [候选替换与回放](../../scripts/mqsim_ppa_oracle.py)：`resources()` 构造资源路径，`pressure()` 统计负载，`objective()` 计算平方和，`select()` 执行贪心替换，`main()` 生成对照并运行 MQSim。
+- [候选替换与回放](../../scripts/mqsim_ppa_oracle.py)：`resources()` 构造资源路径，`pressure()` 统计负载，`objective()` 计算平方和，`select()` 执行 Miss 换 Miss 的贪心替换，`baseline_states()` 按原生选择生成公共 LRU 轨迹，`selections_with_baseline()` 应用筛选并审计不变量，`main()` 生成对照并运行 MQSim。
 - [完整候选导出](../../scripts/export_ppa_candidates.py)：保留原生集合、参考候选与分数、当前 token 及 snapshot 字节偏移。

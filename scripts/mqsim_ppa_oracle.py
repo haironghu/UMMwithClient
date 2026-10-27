@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """PPA-aware fixed-trajectory replay through patched official MQSim NVMe/FTL/NAND.
 
-Single synthetic SSD; sequential full snapshot writes, then layer barriers.
-No historical HBM cache, no NAND data cache, ideal mapping. Report simulator
+Single synthetic SSD; full snapshot writes, then layer barriers. All policies
+share the native baseline's per-layer batch-LRU trajectory. Only cache misses
+can be replaced, and only by extra candidates that also miss. Report simulator
 latency separately from Python selection cost. Not a model quality/TPOT test.
 """
 import argparse
@@ -21,6 +22,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from setup_mqsim_oracle import PATCH, REVISION, ROOT
+from simulate_hbm_candidates import BatchLRU
 
 PAGE = 16384
 SLOT = 4096
@@ -85,16 +87,18 @@ def objective(loads):
     return sum(v*v for v in loads.values())
 
 
-def select(native, candidate_rows, mapping, current, budget, protect_top=0):
+def select(native, candidate_rows, mapping, current, budget, protect_top=0, cached=()):
+    """Preserve all native hits; allow only scored Miss -> extra Miss swaps."""
     selected = set(native)
+    resident = set(cached) | {current}
     scored = sorted((r for r in candidate_rows if r['score'] is not None),
                     key=lambda r: (-r['score'], r['token']))
     rank = {r['token']:i for i,r in enumerate(scored)}
     score = {r['token']:r['score'] for r in scored}
     info = {r['token']:mapping[r['offset_bytes']//PAGE] for r in candidate_rows}
-    available = {r['token'] for r in scored} - selected - {current}
-    removable = {t for t in native if t != current and t in rank and rank[t] >= protect_top}
-    loads = pressure(selected-{current}, info)
+    available = {r['token'] for r in scored} - selected - resident
+    removable = {t for t in native if t not in resident and t in rank and rank[t] >= protect_top}
+    loads = pressure(selected-resident, info)
     initial = objective(loads)
     exchanges=[]
     # Group identical resources: removing the worst-score native and adding the
@@ -130,6 +134,25 @@ def select(native, candidate_rows, mapping, current, budget, protect_top=0):
         loads.update(change)
         exchanges.append((old,new))
     return selected, exchanges, initial, objective(loads)
+
+
+def baseline_states(directory, capacity):
+    """Yield immutable pre-step state; advance ONLY with native Top-2048.
+
+    Rebuilding this trajectory for each case is deterministic. The digest
+    includes LRU order, not just membership; cross-case checks enforce equality.
+    capacity=0 is an explicit no-HBM control, retained for old smoke experiments.
+    """
+    caches = {}
+    for row in records(directory):
+        if row['layer_id'] not in caches:
+            caches[row['layer_id']] = BatchLRU(capacity)
+        cache = caches[row['layer_id']]
+        state = tuple(cache.rows)
+        digest = hashlib.sha256(array('Q', state).tobytes()).hexdigest()
+        if capacity:
+            cache.commit(row['native'])
+        yield row, frozenset(state), digest
 
 
 def percentile(values, p):
@@ -233,12 +256,13 @@ def validate_export(directory):
         previous=key; count+=1
         g=geometry[r['layer_id']]
         native=r['native']; candidates=r['candidates']; ids={x['token'] for x in candidates}
-        if len(set(native))!=min(2048,r['context_length']) or not set(native)<=ids or len(ids)!=len(candidates):
+        if (len(native)!=min(2048,r['context_length']) or len(set(native))!=len(native)
+                or not set(native)<=ids or len(ids)!=len(candidates)):
             raise ValueError('Invalid native or candidate set')
         scored=[x for x in candidates if x['score'] is not None]
         if len(scored)!=min(2400,r['context_length']) or any(not math.isfinite(x['score']) for x in scored):
             raise ValueError('Invalid reference scores')
-        if r['current_token']!=r['context_length']-1 or r['context_length']>g['context_length'] or not set(native)-{r['current_token']}:
+        if r['context_length']<1 or r['current_token']!=r['context_length']-1 or r['context_length']>g['context_length']:
             raise ValueError('Invalid context geometry')
         for x in candidates:
             if not 0<=x['token']<r['context_length'] or x['device']!=0 or x['offset_bytes']!=g['base_bytes']+x['token']*SLOT:
@@ -247,143 +271,196 @@ def validate_export(directory):
     return m
 
 
+def selections_with_baseline(directory, mapping, capacity, strategy, budget, protect_top, seed, warmup_steps):
+    """Plan one case against the unchanged native-cache trajectory."""
+    for index, (row, cached, cache_digest) in enumerate(baseline_states(directory, capacity), 1):
+        native = set(row['native']); current = row['current_token']
+        resident = cached | {current}
+        native_misses = native - resident
+        start = time.perf_counter()
+        selected, swaps, before, _ = select(native, row['candidates'], mapping, current,
+                                            budget, protect_top, cached=cached)
+        if strategy == 'baseline':
+            selected = native; swaps = []
+        elif strategy == 'random_matched':
+            ranked = sorted((x for x in row['candidates'] if x['score'] is not None),
+                            key=lambda x: (-x['score'], x['token']))
+            protected = {x['token'] for x in ranked[:protect_top]} | resident
+            scored = {x['token'] for x in ranked}
+            eligible = sorted((native & scored) - protected)
+            extra = sorted(scored - native - resident)
+            rng_seed = int.from_bytes(hashlib.sha256(f'{seed}:{index}:{budget}'.encode()).digest()[:8], 'little')
+            rng = random.Random(rng_seed); n = len(swaps)
+            old = rng.sample(eligible, n); new = rng.sample(extra, n)
+            selected = (native - set(old)) | set(new); swaps = list(zip(old, new))
+        decision_ms = (time.perf_counter() - start) * 1000
+        info = {x['token']:mapping[x['offset_bytes']//PAGE] for x in row['candidates']}
+        addresses = {x['token']:x['offset_bytes'] for x in row['candidates']}
+        scores = {x['token']:x['score'] for x in row['candidates']}
+        emitted = sorted(selected - resident)
+        native_hits = native & cached
+        fresh_hits = int(current in native and current not in cached)
+        if (len(selected) != len(native) or (selected & resident) != (native & resident)
+                or len(emitted) != len(native_misses)
+                or any(old not in native_misses or new in resident or new in native for old, new in swaps)):
+            raise ValueError('Miss-only replacement changed native hits/current-token availability/read volume')
+        contract = hashlib.sha256(json.dumps([row['step_id'], row['layer_id'], cache_digest,
+                      sorted(native), sorted(native_misses), len(native_hits), fresh_hits],
+                      separators=(',', ':')).encode()).hexdigest()
+        loads = pressure(emitted, info)
+        m = dict(batch=index, step=row['step_id'], layer=row['layer_id'],
+                 capacity_rows_per_layer=capacity, selected=len(selected), cache_hits=len(native_hits),
+                 fresh_hits=fresh_hits, misses=len(emitted), requests=len(emitted),
+                 cache_state_sha256=cache_digest, baseline_contract_sha256=contract,
+                 warmup=row['step_id'] < warmup_steps, replacements=len(swaps),
+                 score_loss=sum(scores[old]-scores[new] for old, new in swaps),
+                 decision_ms=decision_ms, objective_before=before, objective_after=objective(loads),
+                 unique_physical_pages=len({info[t]['ppa'] for t in emitted}),
+                 peak_channel=max((v for k,v in loads.items() if len(k)==1), default=0),
+                 peak_die=max((v for k,v in loads.items() if len(k)==3), default=0),
+                 peak_plane=max((v for k,v in loads.items() if len(k)==4), default=0))
+        audit = dict(**m, selected_indices=sorted(selected), miss_indices=emitted,
+                     native_miss_indices=sorted(native_misses), swaps=swaps)
+        yield m, audit, [addresses[token] for token in emitted]
+
+
 def main(args):
-    source=args.mqsim.resolve();inputs=args.candidates.resolve();out=args.out_dir.resolve()
-    if args.qd<1 or args.qd>65534 or any(b<0 or b>352 for b in args.budgets) or args.protect_top<0 or args.warmup_steps<0:
-        raise ValueError('Invalid QD, budget, protection or warmup')
+    source=args.mqsim.resolve(); inputs=args.candidates.resolve(); out=args.out_dir.resolve()
+    capacities=sorted(set(args.capacities))
+    if (args.qd<1 or args.qd>65534 or any(b<0 or b>352 for b in args.budgets)
+            or args.protect_top<0 or args.warmup_steps<0
+            or any(c != 0 and c<2048 for c in capacities)):
+        raise ValueError('Invalid QD/budget/protection/warmup/capacity (use 0 or >=2048 rows)')
+    manifest=validate_export(inputs)
     if not any(r['step_id']>=args.warmup_steps for r in records(inputs)):
-        raise ValueError('Warmup excludes all records')
+        raise ValueError('Warmup excludes all records; use --warmup-steps 0 for short smoke runs')
     build=json.loads((source/'dsa-oracle-build.json').read_text())
     if (build['upstream_revision']!=REVISION or build['patch_sha256']!=sha(PATCH) or build['binary_sha256']!=sha(source/'MQSim')):
         raise ValueError('MQSim build mismatch; rerun setup_mqsim_oracle.py')
-    manifest=validate_export(inputs)
     out.mkdir(parents=True,exist_ok=False)
     report=dict(status='running',upstream=build,source_manifest=manifest,
                 qd=args.qd,budgets=sorted(set(args.budgets)),protect_top=args.protect_top,
+                capacities=capacities,cache_policy='shared_native_baseline_batch_lru',
+                cache_initialization='cold',cache_update='native_top2048_only',
+                replacement_policy='miss_to_extra_miss_only',
                 warmup_steps=args.warmup_steps,seed=args.seed,
                 limitations=['Reference SSD geometry unless explicit config; not hardware-calibrated',
                              'Exact simulated PPA only; no PPA prediction error',
-                             'Single SSD, fixed full snapshot, no historical HBM cache',
-                             'NVMe-to-NAND simulated latency; no Python selection time or model compute included',
+                             'Single SSD, fixed full snapshot; cold per-layer baseline HBM LRU',
+                             'Counterfactual shared baseline cache; I/O to maintain unselected baseline rows is excluded',
+                             'NVMe-to-NAND simulated latency; no Python selection/LRU/mapping-query time or model compute included',
                              '4 KiB requests remain separate, including same-page requests; no host coalescing',
-                             'NAND transaction bytes are payload bytes, not internal sensed bytes; page sense bytes are an estimate',
+                             'NAND transaction bytes are payload bytes; page sense bytes are an estimate',
                              'Random control matches actual replacement count, not score loss',
                              'Static sum-of-squares resource proxy, greedy shortlist; not global optimal',
                              'No model quality or end-to-end TPOT evaluation'],results=[])
-    report_path=out/'summary.json';report_path.write_text(json.dumps(report,indent=2))
+    report_path=out/'summary.json'; report_path.write_text(json.dumps(report,indent=2))
     config=out/'ssd.xml'
     configure(source,config,manifest['snapshot_bytes'],args.ssd_config)
     report['ssd_config_sha256']=sha(config)
-    # Dump real simulator mappings AFTER all writes complete. Each case replays
-    # exactly these writes in a fresh process and checks mapping equality.
-    prep=out/'prepare';prep.mkdir()
+    # Every case replays the same full writes, and queries PPA only after completion.
+    prep=out/'prepare'; prep.mkdir()
     with (prep/'input.trace').open('w') as f:
         write_snapshot(f,manifest['snapshot_bytes'],manifest['segment_bytes'])
     prep_batches,mapping_path,prep_reads=run_sim(source,config,prep,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
     if len(prep_batches)!=1 or any(read_nand(prep_reads)): raise ValueError('Unexpected prepare activity')
     mapping=load_mapping(mapping_path)
-    if len(mapping)!=manifest['snapshot_bytes']//PAGE:
-        raise ValueError('Incomplete PPA mapping')
-    mapsha=sha(mapping_path);report['mapping_sha256']=mapsha
-    jobs=[('baseline',0)]
-    for budget in sorted(set(args.budgets)):
-        if budget: jobs.extend([('ppa_aware',budget),('random_matched',budget)])
-    for strategy,budget in jobs:
-        case=out/f'{strategy}-b{budget}';case.mkdir()
-        metadata=[]
-        with (case/'input.trace').open('w') as trace, (case/'selections.jsonl').open('w') as selections:
-            write_snapshot(trace,manifest['snapshot_bytes'],manifest['segment_bytes'])
-            for index,row in enumerate(records(inputs),1):
-                native=set(row['native']);current=row['current_token']
-                start=time.perf_counter()
-                selected,swaps,before,after=select(native,row['candidates'],mapping,current,budget,args.protect_top)
-                if strategy=='baseline': selected=native;swaps=[]
-                elif strategy=='random_matched':
-                    ranked=sorted((x for x in row['candidates'] if x['score'] is not None),key=lambda x:(-x['score'],x['token']))
-                    protected={x['token'] for x in ranked[:args.protect_top]}|{current}
-                    scored={x['token'] for x in ranked}
-                    eligible=sorted(native & scored - protected)
-                    extra=sorted(scored-native-{current})
-                    seed=int.from_bytes(hashlib.sha256(f'{args.seed}:{index}:{budget}'.encode()).digest()[:8],'little')
-                    rng=random.Random(seed);n=len(swaps)
-                    old=rng.sample(eligible,n);new=rng.sample(extra,n)
-                    selected=(native-set(old))|set(new);swaps=list(zip(old,new))
-                decision_ms=(time.perf_counter()-start)*1000
-                if len(selected)!=len(native) or (current in selected)!=(current in native):
-                    raise ValueError('Selection changes total count or current-token availability')
-                info={x['token']:mapping[x['offset_bytes']//PAGE] for x in row['candidates']}
-                addresses={x['token']:x['offset_bytes'] for x in row['candidates']}
-                scores={x['token']:x['score'] for x in row['candidates']}
-                loads=pressure(selected-{current},info)
-                emitted=sorted(selected-{current}) # identical token-ID submission order rule
-                score_loss=sum(scores[old]-scores[new] for old,new in swaps)
-                for token in emitted: trace.write(f'0 {index} {addresses[token]//512} 8 1\n')
-                m=dict(batch=index,step=row['step_id'],layer=row['layer_id'],requests=len(emitted),
-                       warmup=row['step_id']<args.warmup_steps,replacements=len(swaps),score_loss=score_loss,
-                       decision_ms=decision_ms,objective_before=before,objective_after=objective(loads),
-                       unique_physical_pages=len({info[t]['ppa'] for t in emitted}),
-                       peak_channel=max((v for k,v in loads.items() if len(k)==1),default=0),
-                       peak_die=max((v for k,v in loads.items() if len(k)==3),default=0),
-                       peak_plane=max((v for k,v in loads.items() if len(k)==4),default=0))
-                metadata.append(m)
-                selections.write(json.dumps(dict(**m,selected=sorted(selected),swaps=swaps))+'\n')
-        batches,actual_map_path,nand=run_sim(source,config,case,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
-        if sha(actual_map_path)!=mapsha or len(batches)!=len(metadata)+1:
-            raise ValueError('Mapping or batch completion changed across cases')
-        if sum(x['requests'] for x in batches)!=sum(x['requests'] for x in metadata)+prep_batches[0]['requests']:
-            raise ValueError('Request completion mismatch')
-        by_batch={m['batch']:m for m in metadata}
-        for b in batches[1:]:
-            m=by_batch[b['batch']]
-            if b['requests']!=m['requests']:raise ValueError('Layer request mismatch')
-            m.update(begin_ns=b['begin_ns'],end_ns=b['end_ns'],elapsed_ns=b['elapsed_ns'],nand_read_transactions=0,nand_read_payload_bytes=0,
-                     residence_ns=0,execution_ns=0,transfer_ns=0)
-        # Completion times belong to disjoint, closed layer intervals.
-        batch_index=0
-        for tr in read_nand(nand):
-            while batch_index<len(metadata) and tr['end_ns']>metadata[batch_index]['end_ns']:
-                batch_index+=1
-            if batch_index>=len(metadata) or tr['issue_ns']<metadata[batch_index]['begin_ns']:
-                raise ValueError('NAND transaction crosses a layer barrier')
-            m=metadata[batch_index]
-            expected=mapping[tr['lpa']]
-            if any(tr[k]!=expected[k] for k in ('ppa','channel','chip','die','plane','block','page')):
-                raise ValueError('NAND read position differs from prepared PPA')
-            m['nand_read_transactions']+=1;m['nand_read_payload_bytes']+=tr['bytes']
-            m['residence_ns']+=tr['end_ns']-tr['issue_ns']
-            m['execution_ns']+=tr['execution_ns'];m['transfer_ns']+=tr['transfer_ns']
-        if any(m['nand_read_transactions']!=m['requests'] or m['nand_read_payload_bytes']!=m['requests']*SLOT for m in metadata):
-            raise ValueError('NAND read traffic differs from the no-cache/no-coalescing model')
-        with (case/'layers.csv').open('w') as f:
-            writer=csv.DictWriter(f,fieldnames=list(metadata[0]));writer.writeheader();writer.writerows(metadata)
-        measured=[m for m in metadata if not m['warmup']]
-        steps=Counter()
-        for m in measured: steps[m['step']]+=m['elapsed_ns']/1000
-        total=sum(m['elapsed_ns'] for m in measured)/1e9
-        result=dict(strategy=strategy,budget=budget,measured_batches=len(measured),requests=sum(m['requests'] for m in measured),
-                    submitted_read_bytes=sum(m['requests']*SLOT for m in measured),
-                    nand_read_transactions=sum(m['nand_read_transactions'] for m in measured),
-                    nand_read_payload_bytes=sum(m['nand_read_payload_bytes'] for m in measured),
-                    nand_page_sense_bytes_estimate=sum(m['nand_read_transactions']*PAGE for m in measured),read_seconds=total,
-                    mean_nand_residence_us=sum(m['residence_ns'] for m in measured)/sum(m['nand_read_transactions'] for m in measured)/1000,
-                    mean_nand_residual_us=sum(m['residence_ns']-m['execution_ns']-m['transfer_ns'] for m in measured)/sum(m['nand_read_transactions'] for m in measured)/1000,
-                    layer_p95_us=percentile([m['elapsed_ns']/1000 for m in measured],.95),
-                    step_p50_us=percentile(list(steps.values()),.5),step_p95_us=percentile(list(steps.values()),.95),
-                    replacements=sum(m['replacements'] for m in measured),score_loss=sum(m['score_loss'] for m in measured),
-                    mean_decision_ms=statistics.mean(m['decision_ms'] for m in measured),
-                    submitted_MiB_s=sum(m['requests']*SLOT for m in measured)/(1<<20)/total)
-        base=report['results'][0] if report['results'] else result
-        if result['requests']!=base['requests'] or result['nand_read_payload_bytes']!=base['nand_read_payload_bytes']:
-            raise ValueError('Unequal read volume; cannot claim a conflict-only comparison')
-        result['speedup']=base['read_seconds']/total
-        report['results'].append(result)
-        report_path.write_text(json.dumps(report,indent=2)+'\n')
-        with (out/'comparison.csv').open('w') as f:
-            writer=csv.DictWriter(f,fieldnames=list(result));writer.writeheader();writer.writerows(report['results'])
-        print(f'Finished {strategy} budget={budget}: {total:.6f}s, speedup={result["speedup"]:.3f}',flush=True)
-    report['status']='complete';report_path.write_text(json.dumps(report,indent=2)+'\n')
+    if len(mapping)!=manifest['snapshot_bytes']//PAGE: raise ValueError('Incomplete PPA mapping')
+    mapsha=sha(mapping_path); report['mapping_sha256']=mapsha
+    for capacity in capacities:
+        jobs=[('baseline',0)]
+        for budget in sorted(set(args.budgets)):
+            if budget: jobs.extend([('ppa_aware',budget),('random_matched',budget)])
+        contracts=None; base_result=None
+        for strategy,budget in jobs:
+            case=out/f'c{capacity}-{strategy}-b{budget}'; case.mkdir()
+            metadata=[]; current_contracts=[]
+            with (case/'input.trace').open('w') as trace, (case/'selections.jsonl').open('w') as selections:
+                write_snapshot(trace,manifest['snapshot_bytes'],manifest['segment_bytes'])
+                for m,audit,offsets in selections_with_baseline(inputs,mapping,capacity,strategy,budget,
+                                                              args.protect_top,args.seed,args.warmup_steps):
+                    current_contracts.append(m['baseline_contract_sha256'])
+                    if contracts is not None and (m['batch']>len(contracts) or current_contracts[-1]!=contracts[m['batch']-1]):
+                        raise ValueError('Per-step baseline cache/native hits/miss set differs between cases')
+                    # Zero-Miss layers stay in metadata but issue no simulated I/O.
+                    # Strictly increasing batch IDs may have gaps; native patch supports this.
+                    for offset in offsets: trace.write(f'0 {m["batch"]} {offset//512} 8 1\n')
+                    metadata.append(m); selections.write(json.dumps(audit)+'\n')
+            if contracts is None: contracts=current_contracts
+            elif current_contracts!=contracts: raise ValueError('Case lost baseline records')
+            batches,actual_map_path,nand=run_sim(source,config,case,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
+            active={b['batch']:b for b in batches[1:]}
+            expected={m['batch'] for m in metadata if m['requests']}
+            if sha(actual_map_path)!=mapsha or set(active)!=expected or len(active)!=len(batches)-1:
+                raise ValueError('Mapping or nonempty batch completion changed across cases')
+            if sum(x['requests'] for x in batches)!=sum(x['requests'] for x in metadata)+prep_batches[0]['requests']:
+                raise ValueError('Request completion mismatch')
+            cursor=batches[0]['end_ns']
+            for m in metadata:
+                if m['requests']:
+                    b=active[m['batch']]
+                    if b['requests']!=m['requests'] or b['begin_ns']<=cursor:
+                        raise ValueError('Layer request/barrier mismatch')
+                    cursor=b['end_ns']
+                else:
+                    b=dict(begin_ns=cursor,end_ns=cursor,elapsed_ns=0)
+                m.update(begin_ns=b['begin_ns'],end_ns=b['end_ns'],elapsed_ns=b['elapsed_ns'],
+                         nand_read_transactions=0,nand_read_payload_bytes=0,residence_ns=0,execution_ns=0,transfer_ns=0)
+            # Attribute actual NAND transactions only to nonempty layer intervals.
+            active_meta=[m for m in metadata if m['requests']]
+            batch_index=0
+            for tr in read_nand(nand):
+                while batch_index<len(active_meta) and tr['end_ns']>active_meta[batch_index]['end_ns']:
+                    batch_index+=1
+                if batch_index>=len(active_meta) or tr['issue_ns']<active_meta[batch_index]['begin_ns']:
+                    raise ValueError('NAND transaction crosses a layer barrier')
+                m=active_meta[batch_index]; expected_ppa=mapping[tr['lpa']]
+                if any(tr[k]!=expected_ppa[k] for k in ('ppa','channel','chip','die','plane','block','page')):
+                    raise ValueError('NAND read position differs from prepared PPA')
+                m['nand_read_transactions']+=1; m['nand_read_payload_bytes']+=tr['bytes']
+                m['residence_ns']+=tr['end_ns']-tr['issue_ns']
+                m['execution_ns']+=tr['execution_ns']; m['transfer_ns']+=tr['transfer_ns']
+            if any(m['nand_read_transactions']!=m['requests'] or m['nand_read_payload_bytes']!=m['requests']*SLOT for m in metadata):
+                raise ValueError('NAND read traffic differs from cache-filtered no-coalescing model')
+            with (case/'layers.csv').open('w') as f:
+                writer=csv.DictWriter(f,fieldnames=list(metadata[0])); writer.writeheader(); writer.writerows(metadata)
+            measured=[m for m in metadata if not m['warmup']]
+            steps=Counter()
+            for m in measured: steps[m['step']]+=m['elapsed_ns']/1000
+            total=sum(m['elapsed_ns'] for m in measured)/1e9
+            reads=sum(m['requests'] for m in measured)
+            selected=sum(m['selected'] for m in measured)
+            hits=sum(m['cache_hits'] for m in measured); fresh=sum(m['fresh_hits'] for m in measured)
+            result=dict(capacity_rows_per_layer=capacity,strategy=strategy,budget=budget,
+                        baseline_cache_trace_sha256=hashlib.sha256(''.join(current_contracts).encode()).hexdigest(),
+                        measured_batches=len(measured),zero_miss_batches=sum(m['requests']==0 for m in measured),
+                        selected=selected,cache_hits=hits,fresh_hits=fresh,misses=reads,
+                        cache_hit_rate=hits/selected if selected else None,
+                        available_hit_rate=(hits+fresh)/selected if selected else None,
+                        requests=reads,submitted_read_bytes=reads*SLOT,
+                        nand_read_transactions=sum(m['nand_read_transactions'] for m in measured),
+                        nand_read_payload_bytes=sum(m['nand_read_payload_bytes'] for m in measured),
+                        nand_page_sense_bytes_estimate=reads*PAGE,read_seconds=total,
+                        mean_nand_residence_us=sum(m['residence_ns'] for m in measured)/reads/1000 if reads else None,
+                        mean_nand_residual_us=sum(m['residence_ns']-m['execution_ns']-m['transfer_ns'] for m in measured)/reads/1000 if reads else None,
+                        layer_p95_us=percentile([m['elapsed_ns']/1000 for m in measured],.95),
+                        step_p50_us=percentile(list(steps.values()),.5),step_p95_us=percentile(list(steps.values()),.95),
+                        replacements=sum(m['replacements'] for m in measured),score_loss=sum(m['score_loss'] for m in measured),
+                        mean_decision_ms=statistics.mean(m['decision_ms'] for m in measured),
+                        submitted_MiB_s=reads*SLOT/(1<<20)/total if total else None)
+            if base_result is None: base_result=result
+            if any(result[k]!=base_result[k] for k in ('selected','cache_hits','fresh_hits','requests','nand_read_payload_bytes')):
+                raise ValueError('Unequal cache hit/read volume; cannot claim a conflict-only comparison')
+            result['speedup']=base_result['read_seconds']/total if total else None
+            result['read_time_reduction']=1-total/base_result['read_seconds'] if base_result['read_seconds'] else None
+            report['results'].append(result)
+            report_path.write_text(json.dumps(report,indent=2)+'\n')
+            with (out/'comparison.csv').open('w') as f:
+                writer=csv.DictWriter(f,fieldnames=list(result)); writer.writeheader(); writer.writerows(report['results'])
+            speed=f'{result["speedup"]:.3f}' if result['speedup'] is not None else 'N/A (no reads)'
+            print(f'Finished c{capacity} {strategy} budget={budget}: {total:.6f}s, speedup={speed}',flush=True)
+    report['status']='complete'; report_path.write_text(json.dumps(report,indent=2)+'\n')
     return report
-
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
@@ -394,7 +471,10 @@ def parser():
     p.add_argument('--qd',type=int,default=16,help='Outstanding NVMe requests; not CPU read threads')
     p.add_argument('--budgets',type=int,nargs='+',default=[0,32,64,128])
     p.add_argument('--protect-top',type=int,default=0)
-    p.add_argument('--warmup-steps',type=int,default=0)
+    p.add_argument('--capacities',type=int,nargs='+',default=[4096,8192],
+                   help='Native baseline LRU rows per layer; 0 is an explicit no-HBM control')
+    p.add_argument('--warmup-steps',type=int,default=100,
+                   help='Replay first N steps to warm the cold baseline LRU, excluding them from metrics')
     p.add_argument('--seed',type=int,default=2026)
     return p
 

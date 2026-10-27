@@ -2,7 +2,8 @@
 """Export complete scored DSA candidates for the single-SSD MQSim oracle.
 
 One request, ordered token slots, numeric layer order, one final padded tail.
-No hardware access. All historical KV must be read; no HBM state is simulated.
+No hardware access. Export full candidates and addresses; the replay computes
+baseline HBM residency and filters actual SSD misses, rather than this exporter.
 """
 import argparse
 import hashlib
@@ -37,10 +38,10 @@ def export(args):
     if args.layers is not None and set(args.layers) != {l for l, _ in chosen}:
         raise ValueError('Requested layer missing')
     args.out_dir.mkdir(parents=True, exist_ok=False)
-    manifest = dict(schema_version=1, status='running', source=str(args.sample_dir.resolve()),
+    manifest = dict(schema_version=2, status='running', source=str(args.sample_dir.resolve()),
                     sample_id=args.sample_dir.name, device_count=1, slot_bytes=args.slot_bytes,
                     segment_bytes=args.segment_bytes, layout='ordered_single_ssd',
-                    hbm_cache=False, current_token='directly_available_and_protected', layers=[])
+                    hbm_cache_policy='computed_by_replay', current_token='directly_available_and_protected', layers=[])
     mp = args.out_dir / 'manifest.json'
     mp.write_text(json.dumps(manifest, indent=2))
     offset = 0
