@@ -60,7 +60,7 @@ python3 -u scripts/mqsim_ppa_oracle.py \
 
 可用 `--ssd-config /path/to/ssd.xml` 提供其他几何和时延参数；本阶段仍强制理想页映射、关闭预处理和磨损均衡、使用 OUT_OF_ORDER，必须为 NVMe 和 16 KiB page。快照大于 60% 物理容量时拒绝运行。非均匀的 271 个有效 die、六 plane 的具体命令并行约束尚未适配或验证；不要直接宣称当前 preset 模拟了那块硬盘。
 
-已根据 AGENTS.md 提供 `bmpclient/bench/mqsim/ssd_agents_34ch_8die_6plane.xml`：34 channel、用户已确认每 channel 1 chip × 8 die、6 plane/die、16 KiB page，并接受按 272 个 die 模拟。block/page 组织及读时序仍未校准；具体占位值和使用命令见[配置说明](../bench/mqsim/ssd_agents_34ch_8die_6plane.README.md)。使用时显式传入 `--ssd-config`，不会改变运行器默认参考配置。
+已提供 `bmpclient/bench/mqsim/ssd_agents_34ch_8die_6plane.xml`：34 channel、每 channel 8 die、6 plane/die、16 KiB page，并接受按 272 个 die 模拟。用户最新硬件术语为 `channel → die → chip → plane`，与 MQSim 的 chip/die 层级命名不同，当前仅保持并行资源数量；读写 Block 的 6408 Page 不直接作为物理擦除块参数。物理 block/page 组织及读时序仍未校准；具体占位值和使用命令见[配置说明](../bench/mqsim/ssd_agents_34ch_8die_6plane.README.md)。使用时显式传入 `--ssd-config`，不会改变运行器默认参考配置。
 
 ## 4. 三组选择方法
 
