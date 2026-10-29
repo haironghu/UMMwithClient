@@ -73,6 +73,15 @@ cache_state_sha256 / layer_rank / stride_tokens`。缓存语义为 shared-baseli
 （BatchLRU 只用原生 Top-2048 推进）；`budget=0` 时集合不变、返回原张量，
 输出与原生运行逐位一致——这是插桩惰性对照（R0）。
 
+**TP 语义（重要）**：DSA 的注意力集合是全头共享的，因此替换必须在**所有
+TP rank 上得到完全相同的集合**。复制式 indexer 保证了各 rank 输入位一致，
+`select()` 是确定性纯函数，所以 hook 在 override 模式下让每个 rank 都执行
+同一套计算（包括 FP32 参考重算——这会显著拖慢生成，属实验预期）；落盘
+I/O 仍只在 `DSA_DUMP_RANK`。每层每步还通过 all_reduce 比对各 rank 选中集
+的稳定摘要，不一致立即抛错拒绝继续（`DSA_OVERRIDE_VERIFY_RANKS=0` 可关，
+不建议）。`DSA_OVERRIDE_MAPPING` 指向的文件必须对所有 rank 进程可读
+（同一容器/共享挂载即可）。
+
 | 变量 | 缺省 | 说明 |
 |---|---|---|
 | `DSA_OVERRIDE_ENABLE` | 未设 | `=1` 启用（隐含要求 DSA_DUMP_ENABLE） |
@@ -82,6 +91,7 @@ cache_state_sha256 / layer_rank / stride_tokens`。缓存语义为 shared-baseli
 | `DSA_OVERRIDE_BUDGET` | 128 | 每步每层最多替换数（0–352） |
 | `DSA_OVERRIDE_PROTECT_TOP` | 0 | 参考排名前 N 保护 |
 | `DSA_OVERRIDE_LAYER_RANKS` | 无 | 层号→rank 的 JSON；缺省 rank=数字层号（78 层连续时正确） |
+| `DSA_OVERRIDE_VERIFY_RANKS` | 1 | 每步 all_reduce 校验各 rank 选中集一致，不一致即抛错 |
 
 完整闭环流程（质量与带宽同轨迹会合）：
 

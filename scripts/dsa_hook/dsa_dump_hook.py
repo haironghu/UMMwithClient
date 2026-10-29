@@ -43,6 +43,7 @@ unpadded. The dump rank synchronizes twice per layer-step; expect slower
 generation while collecting.
 """
 import atexit
+from array import array
 import hashlib
 import json
 import math
@@ -114,6 +115,9 @@ def _override_config():
             _override['cfg'] = False
             return None
         try:
+            if not _config()['enable']:
+                raise ValueError('DSA_OVERRIDE_ENABLE=1 requires DSA_DUMP_ENABLE=1 '
+                                 '(the dump is the second-generation trace)')
             ranks = (json.loads(Path(env['DSA_OVERRIDE_LAYER_RANKS']).read_text())
                      if env.get('DSA_OVERRIDE_LAYER_RANKS') else None)
             cfg = dict(capacity=int(env.get('DSA_OVERRIDE_CAPACITY', '4096')),
@@ -122,6 +126,7 @@ def _override_config():
                        stride=int(env.get('DSA_OVERRIDE_STRIDE_TOKENS', '0')),
                        mapping_path=env.get('DSA_OVERRIDE_MAPPING', '').strip(),
                        cache=env.get('DSA_OVERRIDE_CACHE', 'shared'),
+                       verify_ranks=env.get('DSA_OVERRIDE_VERIFY_RANKS', '1') == '1',
                        rank_map=ranks)
             if (cfg['capacity'] < 2048 or not 0 <= cfg['budget'] <= 352
                     or cfg['protect_top'] < 0 or cfg['stride'] <= 0
@@ -148,7 +153,9 @@ def _override_mapping(cfg):
 
 
 def _apply_override(impl, layer_name, seq, native, cand_ids, cand_scores):
-    """Run the shared select() online; returns (selected, swaps, lru_digest, rank)."""
+    """Run the shared select() online on THIS rank; deterministic inputs make
+    the result identical on every rank. Returns (selected, swaps, lru_digest,
+    layer_rank, override_cfg) or None when the step falls back to native."""
     cfg = _override_config()
     if cfg is None:
         return None
@@ -188,7 +195,11 @@ def _apply_override(impl, layer_name, seq, native, cand_ids, cand_scores):
 def stash_indexer_inputs(impl, q_li, weights):
     """Called from indexer_select_post_process right after RoPE, pre-quant."""
     cfg = _config()
-    if not cfg['enable'] or impl.tp_rank != cfg['rank']:
+    if not cfg['enable']:
+        return
+    # Override runs on every TP rank (selections must be identical), so the
+    # stash is kept rank-wide whenever override mode is active.
+    if impl.tp_rank != cfg['rank'] and _override_config() is None:
         return
     if impl.use_sparse_c8_indexer:
         _warn_once('c8', 'sparse-c8 indexer path is not dumpable '
@@ -218,15 +229,48 @@ def _gather_indexer_keys(kv_cache, block_table, seq, head_dim):
     return rows.to(torch.float32)
 
 
+def _verify_rank_consistency(reference_tensor, sorted_ids):
+    """Fail loudly if any TP rank computed a different override.
+
+    DSA selects ONE token set per sequence shared by all heads, and with plain
+    TP every rank runs attention over its own copy of that set: a silent
+    disagreement between ranks corrupts the model. The replicated indexer
+    gives every rank identical inputs, so identical selections are expected;
+    a digest mismatch raises instead of returning inconsistent tensors.
+    """
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        _warn_once('ovr-dist', 'torch.distributed unavailable; cross-rank check skipped')
+        return
+    if not dist.is_initialized():
+        return
+    digest = int.from_bytes(hashlib.sha256(
+        array('q', sorted_ids).tobytes()).digest()[:8], 'little') & 0x7FFFFFFFFFFFFFFF
+    low = torch.tensor([digest], dtype=torch.int64, device=reference_tensor.device)
+    high = low.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX)
+    if int(low[0]) != int(high[0]):
+        raise RuntimeError(f'[IndexerTrace] TP ranks computed different overrides '
+                           f'(digest {int(low[0])} vs {int(high[0])}); refusing to mix '
+                           'inconsistent attention sets')
+
+
 def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
                actual_seq_lengths_query, actual_seq_lengths_key):
     """Called from AscendSFAImpl.forward right after the fused top-k.
 
     Returns the index tensor to hand to npu_sparse_flash_attention: the
     original one, or the PPA-aware replacement when override mode is active.
+    Dump-only mode runs entirely on the dump rank; override mode runs the
+    same deterministic computation on EVERY rank (identical replicated
+    inputs -> identical selections) and only the dump I/O stays rank-gated.
     """
     cfg = _config()
-    if not cfg['enable'] or impl.tp_rank != cfg['rank']:
+    ocfg = _override_config()
+    dump_rank = cfg['enable'] and impl.tp_rank == cfg['rank']
+    if ocfg is None and not dump_rank:
         return topk_indices
     _bump('forward_calls')
     state = getattr(attn_metadata.attn_state, 'name', str(attn_metadata.attn_state))
@@ -302,45 +346,49 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
         _bump('skip_nonfinite')
         return topk_indices
     override = (_apply_override(impl, layer_name, seq, native, cand_ids, cand_scores)
-                if _override_config() is not None else None)
+                if ocfg is not None else None)
     result_indices = topk_indices
-    if override is not None and _override_config() is not None:
+    if override is not None:
         # budget=0 or a perfectly balanced step keeps the native set: then the
         # tensor is returned unchanged and the output stays bit-identical.
         selected, swaps, digest, rank, ocfg = override
         if selected != set(native):
             result_indices = torch.tensor(sorted(selected), dtype=topk_indices.dtype,
                                           device=topk_indices.device).view(topk_indices.shape)
+        if ocfg['verify_ranks']:
+            _verify_rank_consistency(topk_indices, sorted(selected))
+    if not dump_rank:
+        return result_indices
     record = dict(seq_lens_key=[seq], seq_lens_query=[1],
                   indices=sorted(native), candidate_indices=cand_ids,
                   candidate_scores=cand_scores, has_reference_candidates=True,
                   layer=str(layer_name))
-    if _override_config() is not None:
+    if ocfg is not None:
         if override is not None:
             record.update(selected=sorted(selected), swaps=[[o, n] for o, n in swaps],
                           overridden=True, cache_mode='shared',
                           cache_capacity=ocfg['capacity'], cache_state_sha256=digest,
                           layer_rank=rank, stride_tokens=ocfg['stride'])
         else:
-            # Override active but this step fell back to native; the offline
-            # applied replay must refuse such traces rather than guess.
+            # Override active but this step fell back to native (identically on
+            # every rank); the offline applied replay must refuse such traces.
             record.update(overridden=False)
     out_dir = Path(cfg['dump_dir'])
     if not _state['ready']:
         if not cfg['dump_dir']:
             _warn_once('dir', 'DSA_DUMP_ENABLE=1 but DSA_DUMP_DIR is empty; skipping')
             _bump('skip_no_dir')
-            return topk_indices
+            return result_indices
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f'[IndexerTrace] hook ready: dir={out_dir} rank={cfg["rank"]} '
               f'ref_topk={cfg["ref_topk"]} min_seq={cfg["min_seq"]}', flush=True)
         _state['ready'] = True
-        if _override_config() is not None:
+        if ocfg is not None:
             (out_dir / '_override_config.json').write_text(json.dumps(dict(
-                mapping_sha256=_override['mapping_sha'], capacity=_override['cfg']['capacity'],
-                budget=_override['cfg']['budget'], protect_top=_override['cfg']['protect_top'],
-                stride_tokens=_override['cfg']['stride'], cache_mode='shared',
-                rank_map=_override['cfg']['rank_map'], rank_source='record.layer_rank',
+                mapping_sha256=_override['mapping_sha'], capacity=ocfg['capacity'],
+                budget=ocfg['budget'], protect_top=ocfg['protect_top'],
+                stride_tokens=ocfg['stride'], cache_mode='shared',
+                rank_map=ocfg['rank_map'], rank_source='record.layer_rank',
             ), indent=2) + '\n')
     path = out_dir / f'{layer_name}_s{seq}.pt'
     tmp = path.with_name(path.name + '.tmp')
@@ -351,7 +399,7 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
                                  candidates=keep, native_in_candidates=overlap,
                                  overridden=bool(override), swaps=len(override[1]) if override else 0,
                                  seconds=round(time.time() - started, 4)))
-    if _override_config() is not None:
+    if ocfg is not None:
         _bump('override_applied' if override else 'override_fallback')
     _bump('dumps')
     _bump(f'dumps:{layer_name}')
