@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from export_ppa_candidates import export, parser as export_parser
 from make_ppa_oracle_fixture import make_fixture
@@ -175,6 +176,64 @@ class OracleTests(unittest.TestCase):
                 with (root/f'results/c{capacity}-ppa_aware-b8/layers.csv').open() as f:
                     measured=list(csv.DictReader(f))
                 self.assertTrue(any(int(r['requests'])==0 and int(r['elapsed_ns'])==0 for r in measured))
+
+    @unittest.skipUnless(os.environ.get('MQSIM_SOURCE'),'requires patched MQSim build')
+    def test_resume_interrupted_run_reuses_completed_cases_and_limits_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);make_fixture(root/'sample',steps=1,layers=(2,))
+            export(export_parser().parse_args([str(root/'sample'),'--out-dir',str(root/'export'),'--segment-bytes','262144']))
+            argv=['--candidates',str(root/'export'),'--mqsim',os.environ['MQSIM_SOURCE'],
+                  '--out-dir',str(root/'results'),'--budgets','8','16',
+                  '--capacities','4096','8192','--warmup-steps','0']
+            calls=[]
+            def interrupt(source, config, directory, *args):
+                calls.append(directory.name)
+                if directory.name=='c4096-random_matched-b8':
+                    raise RuntimeError('simulated interruption')
+                return run_sim(source,config,directory,*args)
+            with patch('mqsim_ppa_oracle.run_sim',side_effect=interrupt):
+                with self.assertRaisesRegex(RuntimeError,'simulated interruption'):
+                    main(parser().parse_args(argv))
+            out=root/'results'
+            old=json.loads((out/'summary.json').read_text())
+            self.assertEqual(len(old['results']),2)
+            paths=[out/'prepare/ppa.csv',out/'c4096-baseline-b0/layers.csv',out/'c4096-ppa_aware-b8/layers.csv']
+            resumed=argv[:argv.index('--capacities')]+['--capacities','4096','--warmup-steps','0','--resume']
+            with self.assertRaisesRegex(ValueError,'parameter mismatch: qd'):
+                main(parser().parse_args(resumed+['--qd','32']))
+            # A changed SSD configuration must fail before modifying the checkpoint.
+            changed=root/'changed.xml'
+            changed.write_text((out/'ssd.xml').read_text().replace('<Page_Read_Latency_LSB>75000',
+                                                                     '<Page_Read_Latency_LSB>76000'))
+            with self.assertRaisesRegex(ValueError,'SSD config mismatch'):
+                main(parser().parse_args(resumed+['--ssd-config',str(changed)]))
+            layers=out/'c4096-baseline-b0/layers.csv';original=layers.read_text()
+            # Modify a per-layer contract rather than relying only on the top-level checkpoint.
+            lines=original.splitlines();header=lines[0].split(',');values=lines[1].split(',')
+            values[header.index('baseline_contract_sha256')]='broken'
+            layers.write_text(lines[0]+'\n'+','.join(values)+'\n')
+            with self.assertRaisesRegex(ValueError,'summary/layers mismatch'):
+                main(parser().parse_args(resumed))
+            layers.write_text(original)
+            mtimes=[p.stat().st_mtime_ns for p in paths]
+            calls.clear()
+            def track(source,config,directory,*args):
+                calls.append(directory.name)
+                return run_sim(source,config,directory,*args)
+            with patch('mqsim_ppa_oracle.run_sim',side_effect=track):
+                result=main(parser().parse_args(resumed))
+            self.assertEqual(calls,['c4096-random_matched-b8','c4096-ppa_aware-b16','c4096-random_matched-b16'])
+            self.assertEqual(result['status'],'complete')
+            self.assertEqual(result['capacities'],[4096])
+            self.assertEqual(result['results'][:2],old['results'])
+            self.assertEqual(len(result['results']),5)
+            self.assertEqual(mtimes,[p.stat().st_mtime_ns for p in paths])
+            self.assertEqual(len(list(out.glob('c4096-random_matched-b8.interrupted-*'))),1)
+            self.assertFalse(list(out.glob('c8192-*')))
+            self.assertEqual(len({r['baseline_cache_trace_sha256'] for r in result['results']}),1)
+            with (out/'comparison.csv').open() as f:self.assertEqual(len(list(csv.DictReader(f))),5)
+            with patch('mqsim_ppa_oracle.run_sim',side_effect=AssertionError('must skip all completed cases')):
+                self.assertEqual(main(parser().parse_args(resumed))['results'],result['results'])
 
     @unittest.skipUnless(os.environ.get('MQSIM_SOURCE'),'requires patched MQSim build')
     def test_all_zero_miss_batches_no_nan_or_division_by_zero(self):

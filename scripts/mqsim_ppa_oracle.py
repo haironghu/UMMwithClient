@@ -18,6 +18,7 @@ from pathlib import Path
 import random
 import statistics
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -324,6 +325,50 @@ def selections_with_baseline(directory, mapping, capacity, strategy, budget, pro
         yield m, audit, [addresses[token] for token in emitted]
 
 
+def completed_contracts(case, result, manifest, warmup, mapsha):
+    """Validate saved case metadata before skipping an expensive completed run."""
+    if sha(case/'ppa.csv') != mapsha:
+        raise ValueError(f'Resume mapping mismatch: {case}')
+    if not (case/'selections.jsonl').is_file():
+        raise ValueError(f'Resume selections missing: {case}')
+    with (case/'layers.csv').open() as f:
+        rows=list(csv.DictReader(f))
+    if len(rows)!=manifest['records']:
+        raise ValueError(f'Resume layer count mismatch: {case}')
+    contracts=[]; measured=[]
+    for index,row in enumerate(rows,1):
+        is_warm=int(row['step'])<warmup
+        if (int(row['batch'])!=index or int(row['capacity_rows_per_layer'])!=result['capacity_rows_per_layer']
+                or row['warmup']!=str(is_warm)):
+            raise ValueError(f'Resume layer metadata mismatch: {case}')
+        contracts.append(row['baseline_contract_sha256'])
+        if not is_warm: measured.append(row)
+    expected=dict(measured_batches=len(measured),
+                  zero_miss_batches=sum(int(r['requests'])==0 for r in measured))
+    for key in ('selected','cache_hits','fresh_hits','misses','requests','replacements',
+                'nand_read_transactions','nand_read_payload_bytes'):
+        expected[key]=sum(int(r[key]) for r in measured)
+    expected['baseline_cache_trace_sha256']=hashlib.sha256(''.join(contracts).encode()).hexdigest()
+    if (any(result[k]!=v for k,v in expected.items()) or
+            not math.isclose(result['read_seconds'],sum(int(r['elapsed_ns']) for r in measured)/1e9,
+                             rel_tol=1e-12,abs_tol=1e-12)):
+        raise ValueError(f'Resume summary/layers mismatch: {case}')
+    return contracts
+
+
+def save_report(out, report):
+    """Atomically replace checkpoints so an interrupted write preserves the old file."""
+    path=out/'summary.json'
+    pending=out/'summary.json.tmp'
+    pending.write_text(json.dumps(report,indent=2)+'\n'); pending.replace(path)
+    if report['results']:
+        pending=out/'comparison.csv.tmp'
+        with pending.open('w') as f:
+            writer=csv.DictWriter(f,fieldnames=list(report['results'][0]))
+            writer.writeheader(); writer.writerows(report['results'])
+        pending.replace(out/'comparison.csv')
+
+
 def main(args):
     source=args.mqsim.resolve(); inputs=args.candidates.resolve(); out=args.out_dir.resolve()
     capacities=sorted(set(args.capacities))
@@ -331,13 +376,33 @@ def main(args):
             or args.protect_top<0 or args.warmup_steps<0
             or any(c != 0 and c<2048 for c in capacities)):
         raise ValueError('Invalid QD/budget/protection/warmup/capacity (use 0 or >=2048 rows)')
+    print(f'Validating candidates: {inputs}',flush=True)
     manifest=validate_export(inputs)
+    print(f'Validated {manifest["records"]} layer/step records',flush=True)
     if not any(r['step_id']>=args.warmup_steps for r in records(inputs)):
         raise ValueError('Warmup excludes all records; use --warmup-steps 0 for short smoke runs')
     build=json.loads((source/'dsa-oracle-build.json').read_text())
     if (build['upstream_revision']!=REVISION or build['patch_sha256']!=sha(PATCH) or build['binary_sha256']!=sha(source/'MQSim')):
         raise ValueError('MQSim build mismatch; rerun setup_mqsim_oracle.py')
-    out.mkdir(parents=True,exist_ok=False)
+    previous=None
+    if args.resume:
+        previous=json.loads((out/'summary.json').read_text())
+        expected=dict(source_manifest=manifest,upstream=build,qd=args.qd,
+                      protect_top=args.protect_top,warmup_steps=args.warmup_steps,seed=args.seed,
+                      cache_policy='shared_native_baseline_batch_lru',cache_update='native_top2048_only',
+                      replacement_policy='miss_to_extra_miss_only')
+        for key,value in expected.items():
+            if previous.get(key)!=value:
+                raise ValueError(f'Resume parameter mismatch: {key}; use original parameters')
+        with tempfile.TemporaryDirectory(prefix='mqsim-resume-config-') as temp:
+            check=Path(temp)/'ssd.xml'
+            configure(source,check,manifest['snapshot_bytes'],args.ssd_config)
+            if sha(check)!=previous.get('ssd_config_sha256') or sha(out/'ssd.xml')!=sha(check):
+                raise ValueError('Resume SSD config mismatch; use original configuration')
+        if sha(out/'prepare/ppa.csv')!=previous.get('mapping_sha256'):
+            raise ValueError('Resume prepare mapping missing or changed')
+    else:
+        out.mkdir(parents=True,exist_ok=False)
     report=dict(status='running',upstream=build,source_manifest=manifest,
                 qd=args.qd,budgets=sorted(set(args.budgets)),protect_top=args.protect_top,
                 capacities=capacities,cache_policy='shared_native_baseline_batch_lru',
@@ -354,26 +419,66 @@ def main(args):
                              'Random control matches actual replacement count, not score loss',
                              'Static sum-of-squares resource proxy, greedy shortlist; not global optimal',
                              'No model quality or end-to-end TPOT evaluation'],results=[])
-    report_path=out/'summary.json'; report_path.write_text(json.dumps(report,indent=2))
     config=out/'ssd.xml'
-    configure(source,config,manifest['snapshot_bytes'],args.ssd_config)
+    if previous is None: configure(source,config,manifest['snapshot_bytes'],args.ssd_config)
     report['ssd_config_sha256']=sha(config)
     # Every case replays the same full writes, and queries PPA only after completion.
-    prep=out/'prepare'; prep.mkdir()
-    with (prep/'input.trace').open('w') as f:
-        write_snapshot(f,manifest['snapshot_bytes'],manifest['segment_bytes'])
-    prep_batches,mapping_path,prep_reads=run_sim(source,config,prep,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
-    if len(prep_batches)!=1 or any(read_nand(prep_reads)): raise ValueError('Unexpected prepare activity')
+    prep=out/'prepare'
+    if previous is None:
+        save_report(out,report)
+        prep.mkdir()
+        with (prep/'input.trace').open('w') as f:
+            write_snapshot(f,manifest['snapshot_bytes'],manifest['segment_bytes'])
+        prep_batches,mapping_path,prep_reads=run_sim(source,config,prep,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
+        if len(prep_batches)!=1 or any(read_nand(prep_reads)): raise ValueError('Unexpected prepare activity')
+    else:
+        print('Resume: reuse prepared PPA mapping',flush=True)
+        mapping_path=prep/'ppa.csv'
+        with (prep/'batches.csv').open() as f:
+            prep_batches=[{k:int(v) for k,v in r.items()} for r in csv.DictReader(f)]
+        if (len(prep_batches)!=1 or prep_batches[0]['batch']!=0
+                or prep_batches[0]['requests']!=manifest['snapshot_bytes']//manifest['segment_bytes']):
+            raise ValueError('Resume prepare completion mismatch')
     mapping=load_mapping(mapping_path)
     if len(mapping)!=manifest['snapshot_bytes']//PAGE: raise ValueError('Incomplete PPA mapping')
     mapsha=sha(mapping_path); report['mapping_sha256']=mapsha
+    completed={}; saved_contracts={}
+    if previous is not None:
+        for result in previous['results']:
+            key=(result['capacity_rows_per_layer'],result['strategy'],result['budget'])
+            if key in completed: raise ValueError('Duplicate completed resume case')
+            if key[0] not in capacities or (key[2] and key[2] not in args.budgets): continue
+            case=out/f'c{key[0]}-{key[1]}-b{key[2]}'
+            saved_contracts[key]=completed_contracts(case,result,manifest,args.warmup_steps,mapsha)
+            completed[key]=result
+        # Preserve the original summary before changing the requested scope.
+        (out/f'summary.before-resume-{time.time_ns()}.json').write_text(json.dumps(previous,indent=2)+'\n')
+        report['results']=list(completed.values())
+    save_report(out,report)
     for capacity in capacities:
         jobs=[('baseline',0)]
         for budget in sorted(set(args.budgets)):
             if budget: jobs.extend([('ppa_aware',budget),('random_matched',budget)])
         contracts=None; base_result=None
         for strategy,budget in jobs:
-            case=out/f'c{capacity}-{strategy}-b{budget}'; case.mkdir()
+            key=(capacity,strategy,budget)
+            case=out/f'c{capacity}-{strategy}-b{budget}'
+            if key in completed:
+                result=completed[key]; current_contracts=saved_contracts[key]
+                if contracts is None: contracts=current_contracts
+                if contracts!=current_contracts:
+                    raise ValueError('Resumed cases have different baseline cache states')
+                if base_result is None: base_result=result
+                if any(result[k]!=base_result[k] for k in ('selected','cache_hits','fresh_hits','requests','nand_read_payload_bytes')):
+                    raise ValueError('Resumed cases have unequal cache hit/read volume')
+                print(f'Skip completed c{capacity} {strategy} budget={budget}',flush=True)
+                continue
+            if case.exists():
+                archived=case.with_name(case.name+f'.interrupted-{time.time_ns()}')
+                case.rename(archived)
+                print(f'Preserved unfinished case: {archived.name}',flush=True)
+            case.mkdir()
+            print(f'Planning c{capacity} {strategy} budget={budget}',flush=True)
             metadata=[]; current_contracts=[]
             with (case/'input.trace').open('w') as trace, (case/'selections.jsonl').open('w') as selections:
                 write_snapshot(trace,manifest['snapshot_bytes'],manifest['segment_bytes'])
@@ -386,6 +491,8 @@ def main(args):
                     # Strictly increasing batch IDs may have gaps; native patch supports this.
                     for offset in offsets: trace.write(f'0 {m["batch"]} {offset//512} 8 1\n')
                     metadata.append(m); selections.write(json.dumps(audit)+'\n')
+                    if m['batch']%1000==0:
+                        print(f'Planned {case.name}: {m["batch"]}/{manifest["records"]} layer/step records',flush=True)
             if contracts is None: contracts=current_contracts
             elif current_contracts!=contracts: raise ValueError('Case lost baseline records')
             batches,actual_map_path,nand=run_sim(source,config,case,args.qd,manifest['snapshot_bytes'],manifest['segment_bytes'])
@@ -454,12 +561,10 @@ def main(args):
             result['speedup']=base_result['read_seconds']/total if total else None
             result['read_time_reduction']=1-total/base_result['read_seconds'] if base_result['read_seconds'] else None
             report['results'].append(result)
-            report_path.write_text(json.dumps(report,indent=2)+'\n')
-            with (out/'comparison.csv').open('w') as f:
-                writer=csv.DictWriter(f,fieldnames=list(result)); writer.writeheader(); writer.writerows(report['results'])
+            save_report(out,report)
             speed=f'{result["speedup"]:.3f}' if result['speedup'] is not None else 'N/A (no reads)'
             print(f'Finished c{capacity} {strategy} budget={budget}: {total:.6f}s, speedup={speed}',flush=True)
-    report['status']='complete'; report_path.write_text(json.dumps(report,indent=2)+'\n')
+    report['status']='complete'; save_report(out,report)
     return report
 
 def parser():
@@ -468,6 +573,8 @@ def parser():
     p.add_argument('--mqsim',type=Path,default=ROOT/'.deps/MQSim')
     p.add_argument('--out-dir',type=Path,required=True)
     p.add_argument('--ssd-config',type=Path)
+    p.add_argument('--resume',action='store_true',
+                   help='Reuse validated completed cases in --out-dir; preserve and restart unfinished cases')
     p.add_argument('--qd',type=int,default=16,help='Outstanding NVMe requests; not CPU read threads')
     p.add_argument('--budgets',type=int,nargs='+',default=[0,32,64,128])
     p.add_argument('--protect-top',type=int,default=0)

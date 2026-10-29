@@ -62,6 +62,32 @@ python3 -u scripts/mqsim_ppa_oracle.py \
 
 已提供 `bmpclient/bench/mqsim/ssd_agents_34ch_8die_6plane.xml`：34 channel、每 channel 8 die、6 plane/die、16 KiB page，并接受按 272 个 die 模拟。用户最新硬件术语为 `channel → die → chip → plane`，与 MQSim 的 chip/die 层级命名不同，当前仅保持并行资源数量；读写 Block 的 6408 Page 不直接作为物理擦除块参数。物理 block/page 组织及读时序仍未校准；具体占位值和使用命令见[配置说明](../bench/mqsim/ssd_agents_34ch_8die_6plane.README.md)。使用时显式传入 `--ssd-config`，不会改变运行器默认参考配置。
 
+### 中断后只补跑 4096 容量
+
+保留原实验目录，更新代码后添加 `--resume`。示例中 `RUN_DIR` 必须指向已经有 `summary.json`、`prepare/` 和已完成组文件的原目录，不要新建输出目录：
+
+```bash
+RUN_DIR=/你的原实验输出目录
+
+nohup python3 -u scripts/mqsim_ppa_oracle.py \
+  --candidates "$HOME/ppa_candidates_all" \
+  --out-dir "$RUN_DIR" \
+  --ssd-config "$RUN_DIR/ssd.xml" \
+  --capacities 4096 \
+  --budgets 0 32 64 128 \
+  --qd 16 \
+  --warmup-steps 100 \
+  --resume > "${RUN_DIR}.resume.log" 2>&1 &
+```
+
+`--ssd-config` 指向原目录保存的最终配置，确保续跑使用完全相同的参数。不改候选数据、QD、warmup、seed、保护排名等条件。确认原实验进程已退出，勿同时写同一个目录。
+
+若已完成 baseline 和 PPA-32，续跑跳过这两组及 prepare，仅补随机-32、PPA-64、随机-64、PPA-128、随机-128，共 5 组；不运行 8192。最终 `comparison.csv` 有 7 条数据。若某组已在原 `summary.json` 中登记完成，也会自动跳过。
+
+兼容此前没有 `--resume` 的运行结果。复用前检查候选与构建摘要、最终 SSD 配置、prepare 映射、已完成组的映射和逐层统计，以及共享 baseline 缓存轨迹哈希；不一致时停止。未完成组只支持从该组开头重跑，旧目录重命名为 `.interrupted-时间戳` 后保留，不删除。重设容量范围前也会保留 `summary.before-resume-时间戳.json`。summary 和 comparison 以原子替换保存，防止后续中断写坏检查点。
+
+首次候选校验前后、各组准备开始及每 1000 个层/步记录会打印进度；MQSim 子进程日志仍在对应组的 `mqsim.log`。
+
 ## 4. 三组选择方法
 
 1. **baseline**：完全保留原生 Top-2048。
