@@ -55,6 +55,7 @@ import time
 import torch
 
 LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+SAMPLE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 _state = {
     'cfg': None,
@@ -64,6 +65,7 @@ _state = {
     'warned': set(),
     'manifest': None,
     'ready': False,
+    'sample': '_',
 }
 
 
@@ -93,6 +95,35 @@ def _warn_once(key, message):
     if key not in _state['warned']:
         _state['warned'].add(key)
         print(f'[IndexerTrace] {message}', flush=True)
+
+
+def _marker_sample(root):
+    """Sample id from the current_sample marker (doc 17 convention).
+
+    Datasets run many examples through one server; each example must land in
+    its own dump directory with its own cold LRU, or seq continuity and the
+    offline one-sample-per-directory contract break. Marker absent -> '_'
+    (dumps stay in the root directory, single-sample behavior).
+    """
+    try:
+        text = (root / 'current_sample').read_text().strip()
+    except OSError:
+        return '_'
+    return SAMPLE_RE.sub('_', text)[:64] if text else '_'
+
+
+def _rotate_sample(sample):
+    """Switch the active sample: fresh manifest, per-layer seq chain and LRU."""
+    if _state['manifest'] is not None:
+        _state['manifest'].close()
+        _state['manifest'] = None
+    _state['last_seq'] = {}
+    _override['lrus'] = {}
+    for key in [k for k in _state['counters'] if k.startswith('dumps:')]:
+        del _state['counters'][key]
+    _state['sample'] = sample
+    _state['ready'] = False
+    print(f'[IndexerTrace] sample -> {sample}', flush=True)
 
 
 # ---------------- online PPA-aware override (second-generation traces) ------
@@ -345,6 +376,12 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
         _warn_once('finite', f'{layer_name} s={seq}: non-finite reference scores; skipping')
         _bump('skip_nonfinite')
         return topk_indices
+    # Sample rotation must happen at the same point on EVERY rank (it resets
+    # the override LRU), so it is checked before the rank-gated dump path.
+    root = Path(cfg['dump_dir'])
+    sample = _marker_sample(root)
+    if sample != _state['sample'] and (ocfg is not None or dump_rank):
+        _rotate_sample(sample)
     override = (_apply_override(impl, layer_name, seq, native, cand_ids, cand_scores)
                 if ocfg is not None else None)
     result_indices = topk_indices
@@ -359,6 +396,7 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
             _verify_rank_consistency(topk_indices, sorted(selected))
     if not dump_rank:
         return result_indices
+    out_dir = root if sample == '_' else root / sample
     record = dict(seq_lens_key=[seq], seq_lens_query=[1],
                   indices=sorted(native), candidate_indices=cand_ids,
                   candidate_scores=cand_scores, has_reference_candidates=True,
@@ -373,7 +411,6 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
             # Override active but this step fell back to native (identically on
             # every rank); the offline applied replay must refuse such traces.
             record.update(overridden=False)
-    out_dir = Path(cfg['dump_dir'])
     if not _state['ready']:
         if not cfg['dump_dir']:
             _warn_once('dir', 'DSA_DUMP_ENABLE=1 but DSA_DUMP_DIR is empty; skipping')
@@ -428,7 +465,7 @@ def _write_summary():
     summary = dict(finished_at=time.time(), config=cfg, counters=counters,
                    per_layer_dumps={k[6:]: v for k, v in counters.items()
                                     if k.startswith('dumps:')},
-                   last_seq=_state['last_seq'],
+                   last_seq=_state['last_seq'], sample=_state['sample'],
                    override_mapping_sha256=_override['mapping_sha'])
     tmp = out_dir / '_summary.json.tmp'
     tmp.write_text(json.dumps(summary, indent=2, default=str) + '\n')

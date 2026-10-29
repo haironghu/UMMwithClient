@@ -129,12 +129,28 @@ export DSA_DUMP_DIR=$HOME/dsa_dump_dir/sample_xxx
 bash scripts/start_glm51_w4a8_trace.sh
 ```
 
+**跑数据集（多样本）**：一个服务进程要连续跑很多 example，而离线管线
+要求一个目录一个样本。沿用旧插桩的 marker 约定（doc 17 §4）：每个请求
+**发起前**把样本 id 写进 marker，请求结束后再换下一个：
+
+```bash
+printf '%s\n' 'ruler_niah_64k_0001' > "$DSA_DUMP_DIR/current_sample"
+# 发请求（串行，一次一个）；完成后：
+printf '%s\n' 'ruler_niah_64k_0002' > "$DSA_DUMP_DIR/current_sample"
+```
+
+marker 变化时 hook 自动轮转：dump 进入 `DSA_DUMP_DIR/<样本id>/` 子目录、
+逐层 seq 链与 override LRU 全部重置、manifest/_override_config.json 每
+样本一份。样本 id 会净化成文件名安全字符。**只在请求间切换 marker**，
+请求中途切换会产生断裂轨迹。之后每个子目录单独走第 6 节校验和离线
+导出（输入即该子目录）。无 marker 时行为不变（全部落根目录，单样本）。
+
 口径要求（与离线管线一致）：**单请求 decode**（`--max-num-seqs 1` 或只发
 一个请求）、greedy、`--enforce-eager`（启动脚本默认已带，保证 decode 批
 无 padding）。多请求 batch、prefill、DSA-CP、sparse-c8 路径会被跳过并
 计入 `_summary.json` 计数。dump rank 每层每步同步两次，采集时生成速度
 明显变慢属预期。看到 `[IndexerTrace] hook ready` 只代表初始化，不代表
-落盘成功——以第 5 节校验为准。
+落盘成功——以第 6 节校验为准。
 
 ## 6. 采集后校验
 
