@@ -1,0 +1,44 @@
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -35,6 +35,10 @@
+     transdata,
+     wait_for_kv_layer_from_connector,
+ )
++try:  # opt-in Top-2400 reference indexer dump; see UMMwithClient scripts/dsa_hook
++    from vllm_ascend.attention import dsa_dump_hook
++except ImportError:  # hook module not installed: sfa_v1 stays fully functional
++    dsa_dump_hook = None
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.distributed.utils import all_gather_async
+ from vllm_ascend.ops.layer_shard_linear import (
+@@ -943,6 +947,10 @@
+             q_li_pe = q_li_pe.squeeze(2)
+             q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
+ 
++        if dsa_dump_hook is not None:
++            # Post-RoPE, pre-hadamard/quant: the exact inputs the fused kernel sees.
++            dsa_dump_hook.stash_indexer_inputs(self, q_li, weights)
++
+         if self.use_sparse_c8_indexer:
+             q_li_shape_ori = q_li.shape
+             q_li = q_li @ AscendSFAImpl.q_hadamard
+@@ -1212,6 +1220,19 @@
+             actual_seq_lengths_key=actual_seq_lengths_key,
+         )
+ 
++        if dsa_dump_hook is not None:
++            # Returns the original tensor, or the PPA-aware replacement when
++            # DSA_OVERRIDE_* is active (second-generation traces).
++            topk_indices = dsa_dump_hook.maybe_dump(
++                impl=self,
++                layer_name=layer_name,
++                topk_indices=topk_indices,
++                attn_metadata=attn_metadata,
++                kv_cache=kv_cache,
++                actual_seq_lengths_query=actual_seq_lengths_query,
++                actual_seq_lengths_key=actual_seq_lengths_key,
++            )
++
+         attn_output = self._execute_sparse_flash_attention_process(
+             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+         )

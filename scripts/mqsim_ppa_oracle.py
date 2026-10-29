@@ -7,7 +7,6 @@ can be replaced, and only by extra candidates that also miss. Report simulator
 latency separately from Python selection cost. Not a model quality/TPOT test.
 """
 import argparse
-from array import array
 from collections import Counter
 import csv
 import hashlib
@@ -24,9 +23,13 @@ import xml.etree.ElementTree as ET
 
 from setup_mqsim_oracle import PATCH, REVISION, ROOT
 from simulate_hbm_candidates import BatchLRU
+from ppa_selection import (PAGE, SLOT, DenseMapping, declared_stride_offsets,
+                           load_mapping, lru_digest, objective, pressure,
+                           resources, select)
 
-PAGE = 16384
-SLOT = 4096
+__all__ = ['PAGE', 'SLOT', 'BatchLRU', 'DenseMapping', 'load_mapping',
+           'resources', 'pressure', 'objective', 'select', 'declared_stride_offsets',
+           'lru_digest', 'baseline_states', 'records', 'sha']
 
 
 def sha(path):
@@ -43,100 +46,6 @@ def records(directory):
             yield json.loads(line)
 
 
-class DenseMapping:
-    """Compact fixed-width mapping: 64 bytes/page instead of millions of dicts."""
-    columns = ('lpa','ppa','channel','chip','die','plane','block','page')
-
-    def __init__(self):
-        self.data = array('Q')
-
-    def __len__(self):
-        return len(self.data)//8
-
-    def __getitem__(self, lpa):
-        if lpa < 0 or lpa >= len(self):
-            raise KeyError(lpa)
-        return dict(zip(self.columns, self.data[lpa*8:(lpa+1)*8]))
-
-
-def load_mapping(path):
-    result = DenseMapping()
-    seen = set()
-    with path.open() as f:
-        for r in csv.DictReader(f):
-            values = [int(r[k]) for k in result.columns]
-            if values[0] != len(result) or values[1] in seen or min(values)<0:
-                raise ValueError('Non-contiguous LPA or aliased/invalid PPA mapping')
-            seen.add(values[1]); result.data.extend(values)
-    return result
-
-
-def resources(row):
-    full = (row['channel'], row['chip'], row['die'], row['plane'])
-    return tuple(full[:i] for i in range(1, 5))
-
-
-def pressure(ids, info):
-    result=Counter()
-    for token in ids:
-        result.update(resources(info[token]))
-    return result
-
-
-def objective(loads):
-    # Static concentration proxy, not a NAND timing model. MQSim measures latency.
-    return sum(v*v for v in loads.values())
-
-
-def select(native, candidate_rows, mapping, current, budget, protect_top=0, cached=()):
-    """Preserve all native hits; allow only scored Miss -> extra Miss swaps."""
-    selected = set(native)
-    resident = set(cached) | {current}
-    scored = sorted((r for r in candidate_rows if r['score'] is not None),
-                    key=lambda r: (-r['score'], r['token']))
-    rank = {r['token']:i for i,r in enumerate(scored)}
-    score = {r['token']:r['score'] for r in scored}
-    info = {r['token']:mapping[r['offset_bytes']//PAGE] for r in candidate_rows}
-    available = {r['token'] for r in scored} - selected - resident
-    removable = {t for t in native if t not in resident and t in rank and rank[t] >= protect_top}
-    loads = pressure(selected-resident, info)
-    initial = objective(loads)
-    exchanges=[]
-    # Group identical resources: removing the worst-score native and adding the
-    # best-score extra for that group preserves a deterministic quality preference.
-    for _ in range(budget):
-        remove_groups={}; add_groups={}
-        for t in removable:
-            key=resources(info[t])[-1]
-            if key not in remove_groups or (score[t],-t) < (score[remove_groups[key]],-remove_groups[key]):
-                remove_groups[key]=t
-        for t in available:
-            key=resources(info[t])[-1]
-            if key not in add_groups or (-score[t],t) < (-score[add_groups[key]],add_groups[key]):
-                add_groups[key]=t
-        removals=sorted(remove_groups.values(), key=lambda t:(-sum(2*loads[k]-1 for k in resources(info[t])),score[t],t))[:16]
-        additions=sorted(add_groups.values(), key=lambda t:(sum(2*loads[k]+1 for k in resources(info[t])),-score[t],t))[:16]
-        best=None
-        for old in removals:
-            rk=resources(info[old])
-            for new in additions:
-                ak=resources(info[new])
-                change=Counter(ak)
-                change.subtract(rk)
-                delta=sum(2*loads[k]*n+n*n for k,n in change.items())
-                key=(delta,score[old]-score[new],old,new)
-                if delta < 0 and (best is None or key < best[0]):
-                    best=(key,old,new,change)
-        if best is None:
-            break
-        _,old,new,change=best
-        selected.remove(old); selected.add(new)
-        removable.remove(old); available.remove(new)
-        loads.update(change)
-        exchanges.append((old,new))
-    return selected, exchanges, initial, objective(loads)
-
-
 def baseline_states(directory, capacity):
     """Yield immutable pre-step state; advance ONLY with native Top-2048.
 
@@ -150,7 +59,7 @@ def baseline_states(directory, capacity):
             caches[row['layer_id']] = BatchLRU(capacity)
         cache = caches[row['layer_id']]
         state = tuple(cache.rows)
-        digest = hashlib.sha256(array('Q', state).tobytes()).hexdigest()
+        digest = lru_digest(cache)
         if capacity:
             cache.commit(row['native'])
         yield row, frozenset(state), digest
@@ -263,6 +172,10 @@ def validate_export(directory):
         scored=[x for x in candidates if x['score'] is not None]
         if len(scored)!=min(2400,r['context_length']) or any(not math.isfinite(x['score']) for x in scored):
             raise ValueError('Invalid reference scores')
+        applied=r.get('applied_selected')
+        if applied is not None and (len(applied)!=len(native) or len(set(applied))!=len(applied)
+                                    or any(not 0<=t<r['context_length'] for t in applied)):
+            raise ValueError('Invalid applied selection')
         if r['context_length']<1 or r['current_token']!=r['context_length']-1 or r['context_length']>g['context_length']:
             raise ValueError('Invalid context geometry')
         for x in candidates:
@@ -278,26 +191,40 @@ def selections_with_baseline(directory, mapping, capacity, strategy, budget, pro
         native = set(row['native']); current = row['current_token']
         resident = cached | {current}
         native_misses = native - resident
-        start = time.perf_counter()
-        selected, swaps, before, _ = select(native, row['candidates'], mapping, current,
-                                            budget, protect_top, cached=cached)
-        if strategy == 'baseline':
-            selected = native; swaps = []
-        elif strategy == 'random_matched':
-            ranked = sorted((x for x in row['candidates'] if x['score'] is not None),
-                            key=lambda x: (-x['score'], x['token']))
-            protected = {x['token'] for x in ranked[:protect_top]} | resident
-            scored = {x['token'] for x in ranked}
-            eligible = sorted((native & scored) - protected)
-            extra = sorted(scored - native - resident)
-            rng_seed = int.from_bytes(hashlib.sha256(f'{seed}:{index}:{budget}'.encode()).digest()[:8], 'little')
-            rng = random.Random(rng_seed); n = len(swaps)
-            old = rng.sample(eligible, n); new = rng.sample(extra, n)
-            selected = (native - set(old)) | set(new); swaps = list(zip(old, new))
-        decision_ms = (time.perf_counter() - start) * 1000
         info = {x['token']:mapping[x['offset_bytes']//PAGE] for x in row['candidates']}
         addresses = {x['token']:x['offset_bytes'] for x in row['candidates']}
         scores = {x['token']:x['score'] for x in row['candidates']}
+        start = time.perf_counter()
+        if strategy == 'applied':
+            # Replay the selection the online hook actually applied (second-
+            # generation trace); no decision is made here. The digest check
+            # pins the online LRU trajectory to the replayed baseline.
+            if 'applied_selected' not in row:
+                raise ValueError('Applied replay requires applied selections on every record')
+            if row['applied_cache_state_sha256'] != cache_digest:
+                raise ValueError(f'Online LRU state differs from replayed baseline at '
+                                 f'step {row["step_id"]} layer {row["layer_id"]}')
+            selected = set(row['applied_selected'])
+            swaps = [tuple(pair) for pair in row['applied_swaps']]
+            before = objective(pressure(native_misses, info))
+            decision_ms = 0.0
+        else:
+            selected, swaps, before, _ = select(native, row['candidates'], mapping, current,
+                                                budget, protect_top, cached=cached)
+            if strategy == 'baseline':
+                selected = native; swaps = []
+            elif strategy == 'random_matched':
+                ranked = sorted((x for x in row['candidates'] if x['score'] is not None),
+                                key=lambda x: (-x['score'], x['token']))
+                protected = {x['token'] for x in ranked[:protect_top]} | resident
+                scored = {x['token'] for x in ranked}
+                eligible = sorted((native & scored) - protected)
+                extra = sorted(scored - native - resident)
+                rng_seed = int.from_bytes(hashlib.sha256(f'{seed}:{index}:{budget}'.encode()).digest()[:8], 'little')
+                rng = random.Random(rng_seed); n = len(swaps)
+                old = rng.sample(eligible, n); new = rng.sample(extra, n)
+                selected = (native - set(old)) | set(new); swaps = list(zip(old, new))
+            decision_ms = (time.perf_counter() - start) * 1000
         emitted = sorted(selected - resident)
         native_hits = native & cached
         fresh_hits = int(current in native and current not in cached)
@@ -379,6 +306,8 @@ def main(args):
     print(f'Validating candidates: {inputs}',flush=True)
     manifest=validate_export(inputs)
     print(f'Validated {manifest["records"]} layer/step records',flush=True)
+    if args.applied and not manifest.get('has_applied_selections'):
+        raise ValueError('--applied needs a second-generation export with applied selections')
     if not any(r['step_id']>=args.warmup_steps for r in records(inputs)):
         raise ValueError('Warmup excludes all records; use --warmup-steps 0 for short smoke runs')
     build=json.loads((source/'dsa-oracle-build.json').read_text())
@@ -408,6 +337,7 @@ def main(args):
                 capacities=capacities,cache_policy='shared_native_baseline_batch_lru',
                 cache_initialization='cold',cache_update='native_top2048_only',
                 replacement_policy='miss_to_extra_miss_only',
+                includes_applied_replay=bool(args.applied),
                 warmup_steps=args.warmup_steps,seed=args.seed,
                 limitations=['Reference SSD geometry unless explicit config; not hardware-calibrated',
                              'Exact simulated PPA only; no PPA prediction error',
@@ -419,6 +349,9 @@ def main(args):
                              'Random control matches actual replacement count, not score loss',
                              'Static sum-of-squares resource proxy, greedy shortlist; not global optimal',
                              'No model quality or end-to-end TPOT evaluation'],results=[])
+    if args.applied:
+        report['limitations'].append('Applied case replays online-hook selections from the '
+                                     'diverged trajectory; its native baseline shares that trajectory')
     config=out/'ssd.xml'
     if previous is None: configure(source,config,manifest['snapshot_bytes'],args.ssd_config)
     report['ssd_config_sha256']=sha(config)
@@ -442,6 +375,14 @@ def main(args):
     mapping=load_mapping(mapping_path)
     if len(mapping)!=manifest['snapshot_bytes']//PAGE: raise ValueError('Incomplete PPA mapping')
     mapsha=sha(mapping_path); report['mapping_sha256']=mapsha
+    online=manifest.get('online_override') or {}
+    if online.get('mapping_sha256') and online['mapping_sha256']!=mapsha:
+        raise ValueError('Prepared mapping differs from the mapping the online hook used; '
+                         'layout/stride/rank mismatch between prepare export and online run')
+    if args.prepare_only:
+        report['status']='prepared'; save_report(out,report)
+        print(f'Prepare-only complete: mapping {mapping_path} sha256={mapsha}',flush=True)
+        return report
     completed={}; saved_contracts={}
     if previous is not None:
         for result in previous['results']:
@@ -457,6 +398,7 @@ def main(args):
     save_report(out,report)
     for capacity in capacities:
         jobs=[('baseline',0)]
+        if args.applied: jobs.append(('applied',0))
         for budget in sorted(set(args.budgets)):
             if budget: jobs.extend([('ppa_aware',budget),('random_matched',budget)])
         contracts=None; base_result=None
@@ -575,6 +517,12 @@ def parser():
     p.add_argument('--ssd-config',type=Path)
     p.add_argument('--resume',action='store_true',
                    help='Reuse validated completed cases in --out-dir; preserve and restart unfinished cases')
+    p.add_argument('--applied',action='store_true',
+                   help='Also replay the selection the online override hook applied '
+                        '(second-generation traces with applied selections)')
+    p.add_argument('--prepare-only',action='store_true',
+                   help='Write the snapshot/PPA mapping then exit; used to feed the online '
+                        'override hook before the second-generation run')
     p.add_argument('--qd',type=int,default=16,help='Outstanding NVMe requests; not CPU read threads')
     p.add_argument('--budgets',type=int,nargs='+',default=[0,32,64,128])
     p.add_argument('--protect-top',type=int,default=0)

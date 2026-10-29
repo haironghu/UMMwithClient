@@ -14,30 +14,14 @@ JSON files (useful for portable fixtures). Candidate scores must be finite.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, OrderedDict, defaultdict
+from collections import Counter, defaultdict
 import csv
 import json
 import math
 from pathlib import Path
 import re
 
-
-class BatchLRU:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.rows = OrderedDict()
-
-    def commit(self, selected):
-        selected = set(selected)
-        if len(selected) > self.capacity:
-            raise ValueError("Cache cannot hold the selected attention batch")
-        # Protect all selected hits while allocating misses.
-        for token in selected:
-            self.rows.pop(token, None)
-        while len(self.rows) + len(selected) > self.capacity:
-            self.rows.popitem(last=False)
-        for token in sorted(selected):
-            self.rows[token] = None
+from ppa_selection import BatchLRU  # re-exported: existing importers use this name here
 
 
 def choose(native, ranked_candidates, available, budget, protect_top=0):
@@ -66,7 +50,7 @@ def flatten(value):
     return [value]
 
 
-def load_record(path, seq_len, *, include_scores=False):
+def load_record(path, seq_len, *, include_scores=False, include_raw=False):
     if path.suffix == ".pt":
         try:
             import torch
@@ -94,7 +78,11 @@ def load_record(path, seq_len, *, include_scores=False):
     # Deterministic score tie-break; native fused top-k may use a different one.
     ranked = [t for t, s in sorted(zip(ids, scores), key=lambda pair: (-pair[1], pair[0]))]
     result = (str(raw["layer"]), native, ranked)
-    return (*result, dict(zip(ids, scores))) if include_scores else result
+    if include_scores:
+        result = (*result, dict(zip(ids, scores)))
+    if include_raw:
+        result = (*result, raw)
+    return result
 
 
 def discover(directory):
