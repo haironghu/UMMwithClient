@@ -15,7 +15,7 @@ import convert_datasets as cd  # noqa: E402
 import make_passkey_dataset as pk  # noqa: E402
 import reconcile_swaps as rs  # noqa: E402
 import run_quality_collection as rqc  # noqa: E402
-from common import match_answer, sanitize_id  # noqa: E402
+from common import extract_option, match_answer, sanitize_id  # noqa: E402
 
 
 class CommonTests(unittest.TestCase):
@@ -30,6 +30,25 @@ class CommonTests(unittest.TestCase):
         self.assertTrue(match_answer("(A)", ["A", "(A)"], "contain"))
         self.assertFalse(match_answer("B", ["A"], "exact"))
         self.assertIsNone(match_answer("x", []))
+
+    def test_option_extraction(self):
+        self.assertEqual(extract_option("C"), "C")
+        self.assertEqual(extract_option("B."), "B")
+        self.assertEqual(extract_option("(D)"), "D")
+        self.assertEqual(extract_option("A. Because the table says so"), "A")
+        self.assertEqual(extract_option("Answer: C."), "C")
+        self.assertEqual(extract_option("The answer is (D)."), "D")
+        self.assertEqual(extract_option("我认为选 B"), "B")
+        self.assertEqual(extract_option("答案：C"), "C")
+        self.assertEqual(extract_option("The correct option is C"), "C")
+        # Mid-sentence letters and English articles must not masquerade as options.
+        self.assertIsNone(extract_option("I believe it is not a"))
+        self.assertIsNone(extract_option("a bit of everything"))
+        self.assertEqual(extract_option("C is wrong, so the answer is B"), "B")
+        self.assertTrue(match_answer("I believe it is not a", ["A"], "option") is False)
+        self.assertTrue(match_answer("Answer: A", ["A"], "option"))
+        self.assertFalse(match_answer("C is wrong, so the answer is B", ["A"], "option"))
+        self.assertFalse(match_answer("no letter at all", ["C"], "option"))
 
 
 class PasskeyTests(unittest.TestCase):

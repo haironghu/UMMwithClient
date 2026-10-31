@@ -47,7 +47,7 @@ def rows_longbench_v2(path):
         yield dict(id=sanitize_id(f"lbv2_{index:04d}"),
                    task=f"lbv2_{row.get('domain') or 'any'}",
                    prompt=prompt, reference=[answer, f"({answer})"],
-                   max_tokens=8, match="contain")
+                   max_tokens=8, match="option")
 
 
 def rows_infinitebench(path):

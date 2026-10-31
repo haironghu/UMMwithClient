@@ -58,8 +58,30 @@ def normalize_answer(text):
     return " ".join(str(text or "").split()).strip().lower()
 
 
+# Case-sensitive on purpose: a lowercase leading "a bit of ..." is an article,
+# not option A. The explicit-keyword pattern below stays case-insensitive.
+OPTION_START_RE = re.compile(r"^\W*[\(\[]?([ABCD])(?![A-Za-z])")
+OPTION_EXPLICIT_RE = re.compile(
+    r"(?:answer|option|答案|选)(?:\s+is)?\s*[:\-：]?\s*[\(\[]?\s*([ABCD])\b", re.IGNORECASE)
+
+
+def extract_option(output):
+    """The A-D letter the model committed to: an explicit "answer is X /
+    option is X / 答案：X / 选X" pattern wins (it is the conclusion), else a
+    leading uppercase letter ("C.", "(D)", "B because ..."). Mid-sentence
+    standalone letters and lowercase articles are deliberately ignored.
+    None when nothing parseable (counted wrong, the conservative choice)."""
+    text = str(output or "").strip()
+    match = OPTION_EXPLICIT_RE.search(text) or OPTION_START_RE.search(text)
+    return match.group(1).upper() if match else None
+
+
 def match_answer(output, reference, mode="contain"):
-    """None when unscoreable (no reference); True/False otherwise."""
+    """None when unscoreable (no reference); True/False otherwise.
+
+    mode "option": MCQ judgement by letter extraction; single-letter containment
+    would misfire on sentences that merely contain the letter, so it is not used.
+    """
     refs = [reference] if isinstance(reference, str) else list(reference or [])
     refs = [r for r in refs if str(r).strip()]
     if not refs:
@@ -67,6 +89,9 @@ def match_answer(output, reference, mode="contain"):
     out = normalize_answer(output)
     if mode == "exact":
         return any(normalize_answer(r) == out for r in refs)
+    if mode == "option":
+        gold = str(refs[0]).strip().strip("()[]").upper()
+        return gold in "ABCD" and extract_option(out) == gold
     return any(normalize_answer(r) in out for r in refs)
 
 
