@@ -33,6 +33,15 @@ python3 scripts/quality/convert_datasets.py --format longbench-v2 \
 注意：转换器的 prompt 包装是自定的——本实验只做 **A/B 同 prompt 对比**，
 分数与各基准官方榜单不可比。
 
+小规模先跑（如 20 条冒烟）：**先过滤后抽样**，避免抽到超长样本后实际
+运行不足 20 条：
+
+```bash
+# 服务在线时转换（自动过滤超长），再按 task 分层抽 20 条（各 domain 都有代表）
+python3 scripts/quality/sample_dataset.py --input lbv2.jsonl --out lbv2_s20.jsonl \
+    --count 20                    # 默认 task-round-robin；--strategy random 换随机
+```
+
 ## 2. 采集（跑两遍，同数据集）
 
 服务端独占、单请求串行、greedy（runner 固定 temperature=0）。每例自动写

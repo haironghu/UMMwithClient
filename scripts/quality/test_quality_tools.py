@@ -15,6 +15,7 @@ import convert_datasets as cd  # noqa: E402
 import make_passkey_dataset as pk  # noqa: E402
 import reconcile_swaps as rs  # noqa: E402
 import run_quality_collection as rqc  # noqa: E402
+import sample_dataset as sd  # noqa: E402
 from common import extract_option, match_answer, sanitize_id  # noqa: E402
 
 
@@ -126,6 +127,38 @@ class ConverterTests(unittest.TestCase):
             rows = [json.loads(line) for line in out.read_text().splitlines()]
             self.assertEqual(rows[0]["id"], "niah_1")
             self.assertEqual(rows[1]["reference"], "x")
+
+
+class SamplerTests(unittest.TestCase):
+    def rows(self):
+        rows = []
+        for task, n in (("single", 10), ("multi", 5), ("code", 2)):
+            rows += [dict(id=f"{task}_{i:02d}", task=task, prompt=f"p{i}") for i in range(n)]
+        return rows
+
+    def test_round_robin_covers_every_task(self):
+        picked = sd.pick(self.rows(), 6, "task-round-robin", 2026)
+        tasks = [r["task"] for r in picked]
+        self.assertEqual(len(picked), 6)
+        self.assertEqual(set(tasks), {"single", "multi", "code"})
+        self.assertEqual(tasks, ["code", "multi", "single", "code", "multi", "single"])
+
+    def test_random_is_deterministic_and_subset(self):
+        rows = self.rows()
+        first = sd.pick(rows, 5, "random", 7)
+        second = sd.pick(rows, 5, "random", 7)
+        self.assertEqual([r["id"] for r in first], [r["id"] for r in second])
+        self.assertTrue({r["id"] for r in first} <= {r["id"] for r in rows})
+
+    def test_count_over_dataset_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.jsonl"
+            for row in self.rows():
+                from common import append_jsonl
+                append_jsonl(src, row)
+            with self.assertRaises(SystemExit):
+                sd.main(sd.parser().parse_args(["--input", str(src), "--out",
+                                                str(Path(tmp) / "out.jsonl"), "--count", "99"]))
 
 
 class FakeServer:
