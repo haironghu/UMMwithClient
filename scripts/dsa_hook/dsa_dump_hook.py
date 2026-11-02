@@ -54,6 +54,13 @@ import time
 
 import torch
 
+# Presence banner: printed at import in every process that loads the patched
+# sfa_v1, regardless of the enable switches -- distinguishes "hook not loaded"
+# from "hook loaded but DSA_DUMP_ENABLE missing" at a glance in server logs.
+print(f'[IndexerTrace] dsa_dump_hook loaded in pid {os.getpid()} '
+      f'(DSA_DUMP_ENABLE={os.environ.get("DSA_DUMP_ENABLE")!r}, '
+      f'DSA_DUMP_DIR={os.environ.get("DSA_DUMP_DIR")!r})', flush=True)
+
 LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 SAMPLE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
