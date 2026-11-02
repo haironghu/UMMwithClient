@@ -160,6 +160,25 @@ class SamplerTests(unittest.TestCase):
                 sd.main(sd.parser().parse_args(["--input", str(src), "--out",
                                                 str(Path(tmp) / "out.jsonl"), "--count", "99"]))
 
+    def test_split_batches_cover_all_and_balance_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.jsonl"
+            for row in self.rows():
+                from common import append_jsonl
+                append_jsonl(src, row)
+            sd.main(sd.parser().parse_args(["--input", str(src), "--out-prefix",
+                                            str(Path(tmp) / "b"), "--batch-size", "5"]))
+            files = sorted(Path(tmp).glob("b??.jsonl"))
+            self.assertEqual([f.name for f in files], [f"b{i:02d}.jsonl" for i in range(1, 5)])
+            sizes = [len(f.read_text().splitlines()) for f in files]
+            self.assertEqual(sizes, [5, 5, 5, 2])
+            ids = [json.loads(line)["id"] for f in files for line in f.read_text().splitlines()]
+            self.assertEqual(sorted(ids), sorted(r["id"] for r in self.rows()))
+            # every full batch carries all three tasks
+            for f in files[:3]:
+                tasks = {json.loads(line)["task"] for line in f.read_text().splitlines()}
+                self.assertEqual(tasks, {"single", "multi", "code"})
+
 
 class FakeServer:
     """Minimal vLLM-compatible endpoint recording the marker file on each call."""
