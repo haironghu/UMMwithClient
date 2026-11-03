@@ -174,10 +174,13 @@ class SamplerTests(unittest.TestCase):
             self.assertEqual(sizes, [5, 5, 5, 2])
             ids = [json.loads(line)["id"] for f in files for line in f.read_text().splitlines()]
             self.assertEqual(sorted(ids), sorted(r["id"] for r in self.rows()))
-            # every full batch carries all three tasks
+            # round-robin spreads tasks: the first (fullest) batch carries all
+            # three, and no full batch is single-task once groups deplete.
+            first = {json.loads(line)["task"] for line in files[0].read_text().splitlines()}
+            self.assertEqual(first, {"single", "multi", "code"})
             for f in files[:3]:
                 tasks = {json.loads(line)["task"] for line in f.read_text().splitlines()}
-                self.assertEqual(tasks, {"single", "multi", "code"})
+                self.assertGreaterEqual(len(tasks), 2)
 
 
 class FakeServer:
@@ -186,6 +189,7 @@ class FakeServer:
     def __init__(self, marker_path, fail_first=0):
         self.marker_path = marker_path
         self.seen_markers = []
+        self.payloads = []
         self.requests = 0
         self.fail_first = fail_first
         handler = self._handler()
@@ -213,18 +217,31 @@ class FakeServer:
                     return
                 if self.path.endswith("/completions"):
                     outer.requests += 1
+                    outer.payloads.append(payload)
                     if outer.marker_path.exists():
                         outer.seen_markers.append(outer.marker_path.read_text().strip())
                     if outer.requests <= outer.fail_first:
                         self._send({"error": "boom"}, 500)
                         return
-                    key = payload["prompt"].split()[-1] if payload["prompt"].split() else "?"
+                    text = payload.get("prompt") or "".join(
+                        m.get("content", "") for m in payload.get("messages", []))
+                    key = text.split()[-1] if text.split() else "?"
                     tokens = ["the", "answer", "is", key]
-                    self._send({"choices": [dict(text=" ".join(tokens), finish_reason="stop",
-                                                 logprobs=dict(tokens=tokens,
-                                                               token_logprobs=[-0.1, -0.2, -0.3, -0.4]))],
-                                "usage": dict(prompt_tokens=len(payload["prompt"]) // 4,
-                                              completion_tokens=len(tokens))})
+                    if "messages" in payload:  # chat style
+                        content = [{"token": t, "logprob": lp} for t, lp in
+                                   zip(tokens, [-0.1, -0.2, -0.3, -0.4])]
+                        self._send({"choices": [dict(
+                            finish_reason="stop",
+                            message={"role": "assistant", "content": " ".join(tokens)},
+                            logprobs={"content": content})],
+                            "usage": dict(prompt_tokens=len(text) // 4,
+                                          completion_tokens=len(tokens))})
+                    else:
+                        self._send({"choices": [dict(text=" ".join(tokens), finish_reason="stop",
+                                                     logprobs=dict(tokens=tokens,
+                                                                   token_logprobs=[-0.1, -0.2, -0.3, -0.4]))],
+                                    "usage": dict(prompt_tokens=len(text) // 4,
+                                                  completion_tokens=len(tokens))})
 
             def log_message(self, *args):
                 pass
@@ -308,6 +325,33 @@ class RunnerTests(unittest.TestCase):
                 rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
                 self.assertEqual(rows[0]["attempts"], 2)
                 self.assertTrue(rows[0]["ok"])
+            finally:
+                server.stop()
+
+    def test_chat_style_and_extra_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dump_root = root / "dumps"
+            dump_root.mkdir()
+            dataset = self.dataset(root, [dict(id="chat_1", task="t", prompt="pick one: x",
+                                               reference="is", max_tokens=8)])
+            server = FakeServer(dump_root / "current_sample")
+            try:
+                out = root / "run"
+                code = rqc.main(rqc.parser().parse_args([
+                    "--dataset", str(dataset), "--out-dir", str(out),
+                    "--endpoint", server.endpoint, "--model", "m", "--style", "chat",
+                    "--extra-body", '{"chat_template_kwargs": {"enable_thinking": false}}',
+                    "--dump-root", str(dump_root), "--max-prompt-tokens", "1000"]))
+                self.assertEqual(code, 0)
+                rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+                self.assertTrue(rows[0]["ok"])
+                self.assertEqual(rows[0]["tokens"], ["the", "answer", "is", "x"])
+                self.assertEqual(rows[0]["token_logprobs"], [-0.1, -0.2, -0.3, -0.4])
+                sent = server.payloads[-1]
+                self.assertIn("messages", sent)
+                self.assertEqual(sent["chat_template_kwargs"], {"enable_thinking": False})
+                self.assertTrue(sent["logprobs"])  # chat style uses logprobs+top_logprobs
             finally:
                 server.stop()
 

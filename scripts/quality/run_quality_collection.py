@@ -30,18 +30,37 @@ def prompt_tokens(endpoint, headers, model, prompt, timeout):
     return len(tokens) if tokens is not None else None
 
 
-def completion(endpoint, headers, model, prompt, max_tokens, logprobs, timeout):
-    payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
-               "temperature": 0.0}
-    if logprobs:
-        payload["logprobs"] = logprobs
-    data = http_json(f"{endpoint}/completions", payload, timeout, headers)
+def completion(endpoint, headers, model, prompt, max_tokens, logprobs, timeout,
+               style="completions", extra_body=None):
+    if style == "chat":
+        payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": max_tokens, "temperature": 0.0}
+        if logprobs:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = logprobs
+        path = "/chat/completions"
+    else:
+        payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
+                   "temperature": 0.0}
+        if logprobs:
+            payload["logprobs"] = logprobs
+        path = "/completions"
+    if extra_body:
+        payload.update(extra_body)
+    data = http_json(f"{endpoint}{path}", payload, timeout, headers)
     choice = data["choices"][0]
-    logp = choice.get("logprobs") or {}
+    if style == "chat":
+        entries = (choice.get("logprobs") or {}).get("content") or []
+        output = (choice.get("message") or {}).get("content") or ""
+        tokens = [e.get("token") for e in entries]
+        token_logprobs = [e.get("logprob") for e in entries]
+    else:
+        logp = choice.get("logprobs") or {}
+        output = choice.get("text") or ""
+        tokens = logp.get("tokens") or []
+        token_logprobs = logp.get("token_logprobs") or []
     usage = data.get("usage") or {}
-    return dict(output=choice.get("text") or "",
-                tokens=logp.get("tokens") or [],
-                token_logprobs=logp.get("token_logprobs") or [],
+    return dict(output=output, tokens=tokens, token_logprobs=token_logprobs,
                 finish_reason=choice.get("finish_reason"),
                 prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens"))
@@ -71,7 +90,8 @@ def one_example(args, example, headers):
     for attempt in (1, 2):
         try:
             answer = completion(args.endpoint, headers, args.model, example["prompt"],
-                                max_tokens, args.logprobs, args.timeout)
+                                max_tokens, args.logprobs, args.timeout,
+                                style=args.style, extra_body=args.extra_body)
             result.update(answer, ok=True, seconds=round(time.monotonic() - started, 3),
                           attempts=attempt)
             return result
@@ -89,6 +109,8 @@ def main(args):
         # /tokenize lives on the base URL, one level above /v1.
         import re
         args.tokenize_endpoint = re.sub(r"/v1/?$", "", args.endpoint)
+    if args.extra_body:
+        args.extra_body = json.loads(args.extra_body)
     dataset = load_dataset(args.dataset, args.limit)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +176,12 @@ def parser():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--label", default="run", help="A/B label recorded in the manifest")
     p.add_argument("--endpoint", required=True, help="vLLM base URL, e.g. http://host:8088/v1")
+    p.add_argument("--style", choices=("completions", "chat"), default="completions",
+                   help="chat = /v1/chat/completions with the prompt as a user message; "
+                        "use it for chat/instruct models (raw completions make them "
+                        "continue the document instead of answering)")
+    p.add_argument("--extra-body", help="JSON merged into every request payload, e.g. "
+                   '\'{"chat_template_kwargs": {"enable_thinking": false}}\'')
     p.add_argument("--tokenize-endpoint", help="vLLM base URL for /tokenize pre-filtering; defaults to --endpoint")
     p.add_argument("--model", default="glm-5")
     p.add_argument("--api-key")
