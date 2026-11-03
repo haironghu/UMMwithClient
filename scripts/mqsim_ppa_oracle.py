@@ -308,7 +308,7 @@ def main(args):
     print(f'Validated {manifest["records"]} layer/step records',flush=True)
     if args.applied and not manifest.get('has_applied_selections'):
         raise ValueError('--applied needs a second-generation export with applied selections')
-    if not any(r['step_id']>=args.warmup_steps for r in records(inputs)):
+    if not args.prepare_only and not any(r['step_id']>=args.warmup_steps for r in records(inputs)):
         raise ValueError('Warmup excludes all records; use --warmup-steps 0 for short smoke runs')
     build=json.loads((source/'dsa-oracle-build.json').read_text())
     if (build['upstream_revision']!=REVISION or build['patch_sha256']!=sha(PATCH) or build['binary_sha256']!=sha(source/'MQSim')):
