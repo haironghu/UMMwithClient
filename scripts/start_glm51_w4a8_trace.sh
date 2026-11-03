@@ -2,6 +2,11 @@
 # Reconstructed from the user's successful TP16 / eager launch in this session.
 # Ascend-only; this launcher DOES NOT install the custom sfa_v1.py dump hook.
 set -euo pipefail
+# Never start from a directory that contains a vllm_ascend/ folder (e.g. this
+# repo): without __init__.py it becomes a namespace package and SHADOWS the
+# installed vllm-ascend, killing every platform plugin with
+# "module 'vllm_ascend' has no attribute 'register'".
+cd "$HOME"
 mode="${1:-run}"
 case "$mode" in run|--dry-run|--check-only) ;; *) echo "Usage: bash $0 [--dry-run|--check-only]" >&2; exit 2 ;; esac
 export MODEL_DIR="${MODEL_DIR:-${HOME}/models/GLM-5.1-w4a8}"
