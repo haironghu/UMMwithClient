@@ -40,7 +40,12 @@ def rows_longbench_v2(path):
     letters = ["A", "B", "C", "D"]
     for index, row in enumerate(data):
         answer = str(row.get("answer") or "").strip().upper()[:1]
-        options = [str(row.get(f"choice{i+1}") or "") for i in range(4)]
+        # The official file uses choice_A..choice_D; accept choice1..4 too.
+        options = [str(row.get(f"choice_{letter}") if row.get(f"choice_{letter}") is not None
+                       else row.get(f"choice{i+1}") or "") for i, letter in enumerate(letters)]
+        if not any(option.strip() for option in options):
+            raise SystemExit(f"longbench-v2 row {index}: all four options are empty; "
+                             "check the field names (choice_A..choice_D)")
         prompt = (f"{row['context']}\n\nQuestion: {row['question']}\n"
                   + "\n".join(f"{l}. {o}" for l, o in zip(letters, options))
                   + "\nAnswer with the option's letter only.")

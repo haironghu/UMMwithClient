@@ -88,17 +88,28 @@ class ConverterTests(unittest.TestCase):
     def test_longbench_v2(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "lbv2.json"
+            # Official field names are choice_A..choice_D.
             raw.write_text(json.dumps([dict(context="ctx " * 50, question="q?",
-                                            choice1="one", choice2="two", choice3="tri",
-                                            choice4="fyra", answer="C", domain="metric")]))
+                                            choice_A="one", choice_B="two", choice_C="tri",
+                                            choice_D="fyra", answer="C", domain="metric")]))
             out = Path(tmp) / "n.jsonl"
             args = cd.parser().parse_args(["--format", "longbench-v2", "--input", str(raw),
                                            "--out", str(out)])
             cd.main(args)
             rows = [json.loads(line) for line in out.read_text().splitlines()]
             self.assertEqual(len(rows), 1)
-            self.assertIn("C.", rows[0]["prompt"])
+            self.assertIn("C. tri", rows[0]["prompt"])
+            for line in ("A. one", "B. two", "D. fyra"):
+                self.assertIn(line, rows[0]["prompt"])
             self.assertEqual(rows[0]["reference"], ["C", "(C)"])
+            self.assertEqual(rows[0]["match"], "option")
+            # Empty options must never pass silently.
+            raw.write_text(json.dumps([dict(context="ctx", question="q?",
+                                            choice_A="", choice_B="", choice_C="", choice_D="",
+                                            answer="A")]))
+            with self.assertRaises(SystemExit):
+                cd.main(cd.parser().parse_args(["--format", "longbench-v2", "--input", str(raw),
+                                                "--out", str(Path(tmp) / "n2.jsonl")]))
 
     def test_infinitebench_gold_only_when_verbatim(self):
         with tempfile.TemporaryDirectory() as tmp:
