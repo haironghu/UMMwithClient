@@ -441,12 +441,17 @@ def maybe_dump(impl, layer_name, topk_indices, attn_metadata, kv_cache,
         _warn_once('finite', f'{layer_name} s={seq}: non-finite reference scores; skipping')
         _bump('skip_nonfinite')
         return topk_indices
-    # Sample rotation must happen at the same point on EVERY rank (it resets
-    # the override LRU), so it is checked before the rank-gated dump path.
+    # Sample rotation: only read the marker file at sample boundaries (seq
+    # jump or first dump), never mid-sample. Reading on every step (78 times
+    # per decode step) created a race window at request boundaries where a
+    # late dump from the previous sample could see the new marker and get
+    # routed to the wrong directory.
     root = Path(cfg['dump_dir'])
-    sample = _marker_sample(root)
-    if sample != _state['sample'] and (ocfg is not None or dump_rank):
-        _rotate_sample(sample)
+    is_sample_boundary = last is None or seq != last + 1
+    if is_sample_boundary and (ocfg is not None or dump_rank):
+        sample = _marker_sample(root)
+        if sample != _state['sample']:
+            _rotate_sample(sample)
     override = (_apply_override(impl, layer_name, seq, native, cand_ids, cand_scores)
                 if ocfg is not None else None)
     result_indices = topk_indices
