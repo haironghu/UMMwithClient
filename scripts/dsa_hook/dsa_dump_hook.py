@@ -191,9 +191,11 @@ def _override_mapping(cfg):
 
 
 def _apply_override(impl, layer_name, seq, native, cand_ids, cand_scores):
-    """Run the shared select() online on THIS rank; deterministic inputs make
-    the result identical on every rank. Returns (selected, swaps, lru_digest,
-    layer_rank, override_cfg) or None when the step falls back to native."""
+    """Rank 0 runs select(); the selection is broadcast to every rank so all
+    TP workers attend over the same token set. Non-rank-0 workers skip the
+    (expensive, numerically fragile) selection entirely. Returns (selected,
+    swaps, lru_digest, layer_rank, override_cfg) on rank 0, or (selected, [],
+    digest, rank, cfg) on other ranks; None when every rank falls back."""
     cfg = _override_config()
     if cfg is None:
         return None
@@ -212,21 +214,29 @@ def _apply_override(impl, layer_name, seq, native, cand_ids, cand_scores):
                     f'({len(mapping)} pages); override falls back to native')
         return None
     lru = _override['lrus'].setdefault(layer_name, BatchLRU(cfg['capacity']))
-    scores = dict(zip(cand_ids, cand_scores))
-    # Union the native set in: select() looks up info[] for every selected
-    # native token, and natives absent from the reference ranking get score
-    # None (protected), mirroring export_ppa_candidates.
-    rows = [dict(token=t, score=scores.get(t), offset_bytes=base + t * SLOT)
-            for t in sorted(set(native) | set(cand_ids))]
-    selected, swaps, _, _ = select(set(native), rows, mapping, current=seq - 1,
-                                   budget=cfg['budget'], protect_top=cfg['protect_top'],
-                                   cached=set(lru.rows))
-    if len(selected) != len(set(native)):
-        _warn_once('ovr-invariant', 'select() changed the selection size; '
-                    'override falls back to native')
+    swaps = []
+    selected = None
+    if impl.tp_rank == 0:
+        scores = dict(zip(cand_ids, cand_scores))
+        # Union the native set in: select() looks up info[] for every selected
+        # native token, and natives absent from the reference ranking get score
+        # None (protected), mirroring export_ppa_candidates.
+        rows = [dict(token=t, score=scores.get(t), offset_bytes=base + t * SLOT)
+                for t in sorted(set(native) | set(cand_ids))]
+        selected, swaps, _, _ = select(set(native), rows, mapping, current=seq - 1,
+                                       budget=cfg['budget'],
+                                       protect_top=cfg['protect_top'],
+                                       cached=set(lru.rows))
+        if len(selected) != len(set(native)):
+            _warn_once('ovr-invariant', 'select() changed the selection size; '
+                        'override falls back to native')
+            selected = None
+    # Broadcast rank 0's decision (selection or fallback) to every rank.
+    selected = _broadcast_from_rank0(impl, selected, len(native))
+    if selected is None:
         return None
     digest = lru_digest(lru)
-    lru.commit(native)  # shared-baseline semantics: cache advances with native only
+    lru.commit(native)  # shared-baseline: cache advances with native only
     return selected, swaps, digest, rank, cfg
 
 
@@ -265,6 +275,33 @@ def _gather_indexer_keys(kv_cache, block_table, seq, head_dim):
     positions = blocks[:, None] * block_size + offsets[None, :]
     rows = cache.reshape(-1, head_dim)[positions.reshape(-1)][:seq]
     return rows.to(torch.float32)
+
+
+def _broadcast_from_rank0(impl, selected, count):
+    """Rank 0 decides; broadcast selection + fallback flag to all ranks.
+
+    NPU floating-point ops (matmul, topk) are not guaranteed bit-identical
+    across ranks even with replicated inputs, which makes independent select()
+    calls diverge and crashes the cross-rank consistency check. Broadcasting
+    count+1 int64 (~16KB) once per layer-step removes the dependency on
+    cross-rank numerics entirely. Returns the set, or None when rank 0
+    signalled a fallback (every rank falls back together).
+    """
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        return selected
+    if not dist.is_initialized():
+        return selected
+    payload = torch.zeros(count + 1, dtype=torch.int64, device='npu')
+    if impl.tp_rank == 0 and selected is not None:
+        payload[0] = 1                                    # 1 = selection ok
+        payload[1:] = torch.tensor(sorted(selected), dtype=torch.int64,
+                                   device='npu')
+    dist.broadcast(payload, src=0)
+    if int(payload[0].item()) == 0:
+        return None
+    return set(payload[1:].cpu().tolist())
 
 
 def _verify_rank_consistency(reference_tensor, sorted_ids):
