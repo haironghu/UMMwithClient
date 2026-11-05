@@ -57,6 +57,18 @@ import torch
 # Presence banner: printed at import in every process that loads the patched
 # sfa_v1, regardless of the enable switches -- distinguishes "hook not loaded"
 # from "hook loaded but DSA_DUMP_ENABLE missing" at a glance in server logs.
+# Also ensure this module's directory is importable for ppa_selection: a
+# plain "import ppa_selection" relies on sys.path containing the attention
+# package directory, which is not guaranteed in vLLM worker processes.
+import sys
+if __package__:
+    # Imported as part of the vllm_ascend.attention package; use relative import.
+    _SELECTION_IMPORT = 'from . import ppa_selection'
+else:
+    # Imported as a top-level module; add our directory to sys.path.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    _SELECTION_IMPORT = 'import ppa_selection'
+
 print(f'[IndexerTrace] dsa_dump_hook loaded in pid {os.getpid()} '
       f'(DSA_DUMP_ENABLE={os.environ.get("DSA_DUMP_ENABLE")!r}, '
       f'DSA_DUMP_DIR={os.environ.get("DSA_DUMP_DIR")!r})', flush=True)
@@ -146,7 +158,10 @@ def _override_config():
             _override['cfg'] = False
             return None
         try:
-            import ppa_selection
+            if __package__:
+                from . import ppa_selection
+            else:
+                import ppa_selection
         except ImportError:
             _warn_once('ovr-import', 'DSA_OVERRIDE_ENABLE=1 but ppa_selection.py is not '
                         'importable next to dsa_dump_hook; override disabled')
@@ -182,7 +197,10 @@ def _override_mapping(cfg):
     if _override['mapping'] is None:
         path = Path(cfg['mapping_path'])
         started = time.time()
-        from ppa_selection import load_mapping
+        if __package__:
+            from .ppa_selection import load_mapping
+        else:
+            from ppa_selection import load_mapping
         _override['mapping'] = load_mapping(path)
         _override['mapping_sha'] = hashlib.sha256(path.read_bytes()).hexdigest()
         print(f'[IndexerTrace] override mapping loaded: {len(_override["mapping"])} pages, '
@@ -206,7 +224,10 @@ def _apply_override(impl, layer_name, seq, native, cand_ids, cand_scores):
         return None
     layer_id = int(match.group(1))
     rank = cfg['rank_map'][str(layer_id)] if cfg['rank_map'] else layer_id
-    from ppa_selection import BatchLRU, SLOT, select, lru_digest
+    if __package__:
+        from .ppa_selection import BatchLRU, SLOT, select, lru_digest
+    else:
+        from ppa_selection import BatchLRU, SLOT, select, lru_digest
     mapping = _override_mapping(cfg)
     base = rank * cfg['stride'] * SLOT
     if (base + (seq - 1) * SLOT) // 16384 >= len(mapping):
