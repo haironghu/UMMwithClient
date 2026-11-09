@@ -300,7 +300,7 @@ class RunnerTests(unittest.TestCase):
             try:
                 out = root / "run"
                 self.assertEqual(self.run_main(dataset, out, server,
-                                               ("--dump-root", str(dump_root))), 0)
+                                               ("--dump-root", str(dump_root), "--logprobs", "1")), 0)
                 rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
                 by_id = {r["id"]: r for r in rows}
                 self.assertTrue(by_id["short_1"]["ok"])
@@ -353,7 +353,8 @@ class RunnerTests(unittest.TestCase):
                     "--dataset", str(dataset), "--out-dir", str(out),
                     "--endpoint", server.endpoint, "--model", "m", "--style", "chat",
                     "--extra-body", '{"chat_template_kwargs": {"enable_thinking": false}}',
-                    "--dump-root", str(dump_root), "--max-prompt-tokens", "1000"]))
+                    "--dump-root", str(dump_root), "--max-prompt-tokens", "1000",
+                    "--logprobs", "1"]))
                 self.assertEqual(code, 0)
                 rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
                 self.assertTrue(rows[0]["ok"])
