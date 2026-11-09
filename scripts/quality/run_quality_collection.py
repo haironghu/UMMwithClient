@@ -92,6 +92,9 @@ def one_example(args, example, headers):
             answer = completion(args.endpoint, headers, args.model, example["prompt"],
                                 max_tokens, args.logprobs, args.timeout,
                                 style=args.style, extra_body=args.extra_body)
+            if not args.logprobs:
+                answer.pop("tokens", None)
+                answer.pop("token_logprobs", None)
             result.update(answer, ok=True, seconds=round(time.monotonic() - started, 3),
                           attempts=attempt)
             return result
