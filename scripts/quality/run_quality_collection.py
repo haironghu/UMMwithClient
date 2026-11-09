@@ -189,8 +189,9 @@ def parser():
     p.add_argument("--model", default="glm-5")
     p.add_argument("--api-key")
     p.add_argument("--max-tokens", type=int, default=32)
-    p.add_argument("--logprobs", type=int, default=1,
-                   help="top-k logprobs to request; chosen-token logprobs need >=1")
+    p.add_argument("--logprobs", type=int, default=0,
+                   help="top-k logprobs to request; 0 (default) strips tokens and "
+                        "token_logprobs from results; >=1 keeps them for A/B analysis")
     p.add_argument("--max-prompt-tokens", type=int, default=190000)
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--dump-root", help="the server's DSA_DUMP_DIR (shared mount); omit to skip markers")
